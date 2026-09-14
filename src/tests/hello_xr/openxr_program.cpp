@@ -16,6 +16,7 @@
 #include "xr_gun.h"
 #include "ray_plane_mapping.h"
 #include "virtual_screen.h"
+#include "space_debug.h"
 #include <array>
 #include <cmath>
 #include <set>
@@ -345,6 +346,11 @@ struct OpenXrProgram : IOpenXrProgram {
             std::vector<XrEnvironmentBlendMode> blendModes(count);
             CHECK_XRCMD(
                 xrEnumerateEnvironmentBlendModes(m_instance, m_systemId, m_viewConfigType, count, &count, blendModes.data()));
+            m_blendModesAvailable.clear();
+            for (XrEnvironmentBlendMode mode : blendModes) {
+                if (!m_blendModesAvailable.empty()) m_blendModesAvailable += ",";
+                m_blendModesAvailable += to_string(mode);
+            }
             if (ebmOverride) {
                 if (std::find(blendModes.begin(), blendModes.end(), ebm) == blendModes.end()) {
                     THROW("Selected blendmode is not available from runtime");
@@ -374,8 +380,11 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrEnumerateReferenceSpaces(m_session, spaceCount, &spaceCount, spaces.data()));
 
         Log::Write(Log::Level::Info, Fmt("Available reference spaces: %d", spaceCount));
+        m_referenceSpacesAvailable.clear();
         for (XrReferenceSpaceType space : spaces) {
             Log::Write(Log::Level::Verbose, Fmt("  Name: %s", to_string(space)));
+            if (!m_referenceSpacesAvailable.empty()) m_referenceSpacesAvailable += ",";
+            m_referenceSpacesAvailable += to_string(space);
         }
     }
 
@@ -674,6 +683,8 @@ struct OpenXrProgram : IOpenXrProgram {
         {
             XrReferenceSpaceCreateInfo referenceSpaceCreateInfo = GetXrReferenceSpaceCreateInfo(appSpace);
             CHECK_XRCMD(xrCreateReferenceSpace(m_session, &referenceSpaceCreateInfo, &m_appSpace));
+            m_appSpaceRequested = appSpace;
+            m_appSpaceType = to_string(referenceSpaceCreateInfo.referenceSpaceType);
         }
     }
 
@@ -869,10 +880,15 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.startAction, "Start");
                     LogActionSourceName(m_input.coinAction, "Coin");
                     break;
-                case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-                    m_recenterTime = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(event)->changeTime;
+                case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
+                    const auto& change = *reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(event);
+                    arcadexr::debug::LogRecenterEvent(to_string(change.referenceSpaceType), m_appSpaceType.c_str(),
+                                                      (long long)change.changeTime, (long long)m_lastDisplayTime,
+                                                      change.poseValid == XR_TRUE, change.poseInPreviousSpace);
+                    m_recenterTime = change.changeTime;
                     Log::Write(Log::Level::Info, "TCVR_M7 reference space recenter scheduled");
                     break;
+                }
                 default: {
                     Log::Write(Log::Level::Verbose, Fmt("Ignoring event type %d", event->type));
                     break;
@@ -1074,6 +1090,7 @@ struct OpenXrProgram : IOpenXrProgram {
             }
         }
 
+        m_lastDisplayTime = frameState.predictedDisplayTime;
         XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
         frameEndInfo.environmentBlendMode = m_blendMode;
@@ -1121,8 +1138,10 @@ struct OpenXrProgram : IOpenXrProgram {
             head.position.z += view.pose.position.z / viewCountOutput;
         }
         if (m_recenterTime && predictedDisplayTime >= m_recenterTime) {
+            arcadexr::debug::LogRecenterApplied((long long)m_recenterTime, (long long)predictedDisplayTime);
             m_virtualScreenInitialized = false;
             m_recenterTime = 0;
+            m_screenPlacementReason = "recenter";
         }
         if (!m_virtualScreenInitialized) {
             const XrVector3f localForward{0, 0, -1};
@@ -1136,14 +1155,33 @@ struct OpenXrProgram : IOpenXrProgram {
                 {-forward.z,0,forward.x}, {0,1,0}, {-forward.x,0,-forward.z}, 3,2.25f};
             arcadexr::video::SetVirtualScreen(plane);
             m_virtualScreenInitialized = true;
+            arcadexr::debug::LogScreenPlaced(plane, head, m_screenPlacementReason);
+            m_screenPlacementReason = "startup";
             Log::Write(Log::Level::Info, "TCVR_M8 screen recentered vertical distance=2m");
         }
         arcadexr::gun::ScreenPlane screen;
         arcadexr::video::GetVirtualScreen(screen);
         // Keep at least one metre between the eyes and the screen. Apply before
         // raycasting so the model, both eyes, and inputs share the same plane.
-        if (arcadexr::video::KeepScreenInFront(screen, {head.position.x,head.position.y,head.position.z}, 1.0f))
+        const float signedBefore = (head.position.x - screen.center.x) * screen.normal.x +
+                                   (head.position.y - screen.center.y) * screen.normal.y +
+                                   (head.position.z - screen.center.z) * screen.normal.z;
+        if (arcadexr::video::KeepScreenInFront(screen, {head.position.x,head.position.y,head.position.z}, 1.0f)) {
             arcadexr::video::SetVirtualScreen(screen);
+            arcadexr::debug::LogKeepInFront(signedBefore, 1.0f - signedBefore, screen);
+        }
+        if (!m_loggedSpaceConfig) {
+            m_loggedSpaceConfig = true;
+            const auto clear = GetBackgroundClearColor();
+            arcadexr::debug::LogConfig(m_appSpaceRequested.c_str(), m_appSpaceType.c_str(), to_string(m_blendMode),
+                                       m_blendModesAvailable, m_referenceSpacesAvailable, clear.data(),
+                                       (unsigned long long)(m_blendMode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                                                                ? (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                                                   XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
+                                                                : 0),
+                                       0);
+        }
+        arcadexr::debug::LogFrameThrottled((long long)predictedDisplayTime, head, screen);
 
         projectionLayerViews.resize(viewCountOutput);
         if (m_supportsDepthLayer) depthInfos.resize(viewCountOutput);
@@ -1297,6 +1335,13 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
     XrTime m_recenterTime{0};
+    XrTime m_lastDisplayTime{0};
+    std::string m_appSpaceRequested;
+    std::string m_appSpaceType{"<unset>"};
+    std::string m_blendModesAvailable;
+    std::string m_referenceSpacesAvailable;
+    const char* m_screenPlacementReason{"startup"};
+    bool m_loggedSpaceConfig{false};
     bool m_calibrating{false};
     bool m_captureCalibration{false};
     bool m_triggerHeld{false};
