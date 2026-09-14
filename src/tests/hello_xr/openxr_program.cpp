@@ -1442,8 +1442,21 @@ struct OpenXrProgram : IOpenXrProgram {
             const XrVector3f forward{0,0,-1};
             XrVector3f direction;
             XrQuaternionf_RotateVector3f(&direction, &pose.orientation, &forward);
-            const auto hit = arcadexr::gun::IntersectScreen(
+            auto hit = arcadexr::gun::IntersectScreen(
                 {{muzzle.x,muzzle.y,muzzle.z},{direction.x,direction.y,direction.z}}, screen);
+            // Immersive presentation: the scene is not on the plane, so the plane
+            // hit is not what the player points at. Ask the renderer where the
+            // ray meets the rendered scene and give the game that position.
+            if (auto sceneAim = arcadexr::gun::GetSceneAim()) {
+                float nx = 0.5f, ny = 0.5f;
+                XrVector3f hitWorld{};
+                if (sceneAim({muzzle.x, muzzle.y, muzzle.z}, direction, nx, ny, hitWorld)) {
+                    hit.intersects = true;
+                    hit.on_screen = nx >= 0.0f && nx <= 1.0f && ny >= 0.0f && ny <= 1.0f;
+                    hit.normalized_x = nx;
+                    hit.normalized_y = ny;
+                }
+            }
             const bool onScreen = hit.intersects && hit.on_screen;
             arcadexr::input::SetAnalog("gun_x", onScreen ? hit.normalized_x : 0.0f);
             arcadexr::input::SetAnalog("gun_y", onScreen ? hit.normalized_y : 0.0f);

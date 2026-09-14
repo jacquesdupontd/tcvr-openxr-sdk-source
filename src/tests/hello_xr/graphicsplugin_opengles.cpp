@@ -477,6 +477,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void InitializeResources() {
+        s_self = this;
+        arcadexr::gun::SetSceneAim(&SceneAimTrampoline);
         glGenFramebuffers(1, &m_swapchainFramebuffer);
 
         GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
@@ -1101,12 +1103,21 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         arcadeToWorld.m[14] = camera.z;
         arcadeToWorld.m[15] = 1.0f;
 
+        m_anchorCamera = camera;
+        m_anchorRight = screen.right;
+        m_anchorUp = screen.up;
+        m_anchorNormal = screen.normal;
+        m_anchorScale = worldScale;
+        m_anchorValid = true;
         XrMatrix4x4f projection;
         // The board draws its backdrops up to two million units away; at
         // immersive.depth units per screen distance that is kilometres. A 100 m
         // far plane clipped the whole back of the scene (sky, far buildings).
         const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
-        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, 0.05f, farMetres);
+        // The board draws from z ~ 0: foreground plants, the title logo. At 5000
+        // units per screen distance a 5 cm near plane is 125 units and cut them.
+        const float nearMetres = std::max(0.001f, std::min(0.05f, arcadexr::config::GetFloat("immersive.near", 0.005f)));
+        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, nearMetres, farMetres);
         XrMatrix4x4f eyeToWorld;
         XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
         XrMatrix4x4f worldToEye;
@@ -1209,6 +1220,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_immersiveDrawMs += std::chrono::duration<double, std::milli>(end - begin).count();
         ++m_immersiveViews;
         m_sceneActive = rendered;
+        m_immersiveActive = rendered;
 
         // Restore the framebuffer state expected by the gun/cube renderer.
         glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
@@ -1234,7 +1246,30 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         return rendered;
     }
 
+    // The aim, immersive: the gun ray walks the rendered scene (board camera
+    // space) and the game receives the screen position of what it meets.
+    bool SceneAim(const XrVector3f& origin, const XrVector3f& direction, float& nx, float& ny, XrVector3f& hitWorld) {
+        if (!m_immersiveActive || !m_anchorValid || !m_immersiveFrame) return false;
+        const auto dot = [](const XrVector3f& a, const arcadexr::gun::Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+        const XrVector3f rel{origin.x - m_anchorCamera.x, origin.y - m_anchorCamera.y, origin.z - m_anchorCamera.z};
+        const float o[3] = {dot(rel, m_anchorRight) / m_anchorScale, dot(rel, m_anchorUp) / m_anchorScale, -dot(rel, m_anchorNormal) / m_anchorScale};
+        const float d[3] = {dot(direction, m_anchorRight), dot(direction, m_anchorUp), -dot(direction, m_anchorNormal)};
+        float sx = 0, sy = 0, hit[3] = {0, 0, 0};
+        if (!m_scene.RayCast(o, d, m_immersiveFrame->width, m_immersiveFrame->height, sx, sy, hit)) return false;
+        nx = sx / float(m_immersiveFrame->width);
+        ny = sy / float(m_immersiveFrame->height);
+        hitWorld = {m_anchorCamera.x + (m_anchorRight.x * hit[0] + m_anchorUp.x * hit[1] - m_anchorNormal.x * hit[2]) * m_anchorScale,
+                    m_anchorCamera.y + (m_anchorRight.y * hit[0] + m_anchorUp.y * hit[1] - m_anchorNormal.y * hit[2]) * m_anchorScale,
+                    m_anchorCamera.z + (m_anchorRight.z * hit[0] + m_anchorUp.z * hit[1] - m_anchorNormal.z * hit[2]) * m_anchorScale};
+        return true;
+    }
+    static OpenGLESGraphicsPlugin* s_self;
+    static bool SceneAimTrampoline(const XrVector3f& origin, const XrVector3f& direction, float& nx, float& ny, XrVector3f& hitWorld) {
+        return s_self && s_self->SceneAim(origin, direction, nx, ny, hitWorld);
+    }
+
     void RenderArcadeScreen(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView) {
+        m_immersiveActive = false;
         CHECK(viewIndex < 2);
         // render=gpu: the true-3D path. Recording in the emulator is switched
         // on only while someone reads the scene.
@@ -1724,6 +1759,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     std::string m_sceneSignature;
     std::string m_sceneDumpTag;
     const tcvr_scene_frame* m_immersiveFrame{nullptr};
+    bool m_immersiveActive{false};
+    bool m_anchorValid{false};
+    arcadexr::gun::Vec3 m_anchorCamera{}, m_anchorRight{}, m_anchorUp{}, m_anchorNormal{};
+    float m_anchorScale{1.0f};
     GLuint m_immersiveTex[2]{0, 0};
     GLuint m_immersiveBlitFbo{0};
     std::uint64_t m_immersiveRenderedSeq[2]{0, 0};
@@ -1750,6 +1789,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLint m_contextApiMajorVersion{0};
     std::array<float, 4> m_clearColor;
 };
+OpenGLESGraphicsPlugin* OpenGLESGraphicsPlugin::s_self = nullptr;
 }  // namespace
 
 std::shared_ptr<IGraphicsPlugin> CreateGraphicsPlugin_OpenGLES() { return std::make_shared<OpenGLESGraphicsPlugin>(); }
