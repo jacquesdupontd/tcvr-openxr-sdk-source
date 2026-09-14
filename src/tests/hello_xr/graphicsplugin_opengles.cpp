@@ -1117,9 +1117,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // The board draws from z ~ 0: foreground plants, the title logo. At 5000
         // units per screen distance a 5 cm near plane is 125 units and cut them.
         const float nearMetres = std::max(0.001f, std::min(0.05f, arcadexr::config::GetFloat("immersive.near", 0.005f)));
-        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, nearMetres, farMetres);
+        // immersive.freezePose=1: render from the first pose seen and keep it, so
+        // dumps of different settings are comparable whatever the head does.
+        const bool freeze = arcadexr::config::GetInt("immersive.freezePose", 0) != 0;
+        if (freeze && !m_frozenValid[viewIndex]) { m_frozenPose[viewIndex] = layerView.pose; m_frozenFov[viewIndex] = layerView.fov; m_frozenValid[viewIndex] = true; }
+        if (!freeze) m_frozenValid[viewIndex] = false;
+        const XrPosef renderPose = freeze ? m_frozenPose[viewIndex] : layerView.pose;
+        const XrFovf renderFov = freeze ? m_frozenFov[viewIndex] : layerView.fov;
+        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, renderFov, nearMetres, farMetres);
         XrMatrix4x4f eyeToWorld;
-        XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
+        XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &renderPose);
         XrMatrix4x4f worldToEye;
         XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
         XrMatrix4x4f viewProjection;
@@ -1168,8 +1175,13 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // with; the compositor reprojects the rotation from that pose.
         float renderScale = arcadexr::config::GetFloat("immersive.scale", 1.0f);
         const bool fxaa = arcadexr::config::GetInt("immersive.fxaa", 1) != 0 && m_edgeProgram != 0;
-        m_scene.SetTextureSamples(arcadexr::config::GetInt("immersive.texAA", 1) ? 4 : 1);
-        renderScale = std::max(0.3f, std::min(1.0f, renderScale));
+        {
+            const int texAa = arcadexr::config::GetInt("immersive.texAA", 1);
+            m_scene.SetTextureSamples(texAa <= 0 ? 1 : (texAa == 1 ? 4 : 16));
+            const int msaa = arcadexr::config::GetInt("immersive.msaa", 0);
+            m_scene.SetMsaa(msaa >= 4 ? 4 : (msaa >= 2 ? 2 : 1));
+        }
+        renderScale = std::max(0.3f, std::min(2.0f, renderScale));   // > 1 = supersampling, box-reduced by the linear blit at 2.0
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
         if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
@@ -1226,8 +1238,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             }
             if (rendered) {
                 m_immersiveRenderedSeq[viewIndex] = frame->sequence;
-                m_immersivePose[viewIndex] = layerView.pose;
-                m_immersiveFov[viewIndex] = layerView.fov;
+                m_immersivePose[viewIndex] = renderPose;
+                m_immersiveFov[viewIndex] = renderFov;
                 m_immersiveHasImage[viewIndex] = true;
                 ++m_immersiveRenders;
             }
@@ -1239,6 +1251,29 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             submitted.pose = m_immersivePose[viewIndex];
             submitted.fov = m_immersiveFov[viewIndex];
             rendered = true;
+        }
+        {
+            // debug.tcvr.dump=<tag>: the eye texture before the compositor, one PPM per eye.
+            const std::string tag = arcadexr::config::GetString("dump", "");
+            if (rendered && !tag.empty() && tag != m_immersiveDumpTag[viewIndex]) {
+                m_immersiveDumpTag[viewIndex] = tag;
+                const GLuint src = (fxaa && m_immersiveAa[viewIndex]) ? m_immersiveAa[viewIndex] : m_immersiveTex[viewIndex];
+                std::vector<unsigned char> rgba;
+                if (m_scene.ReadBack(src, rw, rh, rgba)) {
+                    const std::string path = arcadexr::config::ExternalDirectory() + "/dump-" + tag + (viewIndex == 0 ? "-imm-L.ppm" : "-imm-R.ppm");
+                    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                        std::fprintf(f, "P6\n%d %d\n255\n", rw, rh);
+                        std::vector<unsigned char> row(size_t(rw) * 3);
+                        for (int y = rh - 1; y >= 0; --y) {
+                            const unsigned char* s = rgba.data() + size_t(y) * size_t(rw) * 4;
+                            for (int x = 0; x < rw; ++x) { row[x*3] = s[x*4]; row[x*3+1] = s[x*4+1]; row[x*3+2] = s[x*4+2]; }
+                            std::fwrite(row.data(), 1, row.size(), f);
+                        }
+                        std::fclose(f);
+                        Log::Write(Log::Level::Info, Fmt("TCVR_M15 dumped %s (%dx%d)", path.c_str(), rw, rh));
+                    }
+                }
+            }
         }
         if (rendered) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
@@ -1806,6 +1841,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     XrPosef m_immersivePose[2]{};
     XrFovf m_immersiveFov[2]{};
     bool m_immersiveHasImage[2]{false, false};
+    bool m_frozenValid[2]{false, false};
+    XrPosef m_frozenPose[2]{};
+    XrFovf m_frozenFov[2]{};
+    std::string m_immersiveDumpTag[2];
     unsigned m_immersiveRenders{0};
     int m_immersiveTexW{0};
     int m_immersiveTexH{0};
