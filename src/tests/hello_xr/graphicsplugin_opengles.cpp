@@ -13,6 +13,10 @@
 #include "common/gfxwrapper_opengl.h"
 #include <common/xr_linear.h>
 #include "framebuffer_bridge.h"
+#include "scene_bridge.h"
+#include "stereo_renderer.h"
+#include <chrono>
+#include <cmath>
 #include "virtual_screen.h"
 #include "settings.h"
 #include "aim_state.h"
@@ -1020,6 +1024,17 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void RenderArcadeScreen(const XrCompositionLayerProjectionView& layerView) {
+        // render=gpu: the true-3D path. Recording in the emulator is switched
+        // on only while someone reads the scene.
+        const bool gpuRender = arcadexr::config::GetString("render", "cpu") == "gpu";
+        if ((gpuRender ? 1 : 0) != m_sceneEnabled) {
+            m_sceneEnabled = gpuRender ? 1 : 0;
+            const int mode = gpuRender ? (arcadexr::config::GetInt("scene.cpuRaster", 1) ? 1 : 2) : 0;
+            arcadexr::hardware::namco_system22::EnableScene(mode);
+            m_sceneActive = false;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M12 render=%s scene recording mode %d", gpuRender ? "gpu" : "cpu", mode));
+        }
+        if (gpuRender) RenderSceneIfNew(layerView); else m_sceneActive = false;
         // The XR presentation clock runs far faster than the arcade clock, and
         // is deliberately not tied to it: between two emulated frames the screen
         // simply keeps the texture it already has. Asking what the latest frame
@@ -1144,7 +1159,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUseProgram(m_screenProgram);
         glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture);
+        glBindTexture(GL_TEXTURE_2D, m_sceneActive ? m_sceneTex[EyeIndex(layerView)] : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
         glUniform1i(m_screenTextureUniformLocation, 0);
         const auto aim = arcadexr::gun::GetAimState();
         glUniform2f(m_screenAimPointUniformLocation, aim.normalized_x, aim.normalized_y);
@@ -1156,6 +1171,122 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
         glFrontFace(GL_CW);
+    }
+
+    // Left eye: the outer edge of the field of view is on the left.
+    static int EyeIndex(const XrCompositionLayerProjectionView& layerView) {
+        return (std::fabs(layerView.fov.angleLeft) > std::fabs(layerView.fov.angleRight)) ? 0 : 1;
+    }
+
+    // render=gpu: rasterise the recorded scene on the GPU, once per emulated
+    // frame, for both eyes at once so they always show the same frame. The
+    // CPU frame keeps being uploaded underneath as the fallback.
+    bool RenderSceneIfNew(const XrCompositionLayerProjectionView& layerView) {
+        if (!m_sceneInit) {
+            m_sceneInit = true;
+            if (!m_scene.Initialize()) {
+                Log::Write(Log::Level::Error, Fmt("TCVR_M12 scene renderer failed: %s", m_scene.LastError().c_str()));
+            }
+            glGenTextures(2, m_sceneTex);
+        }
+        if (!m_scene.Ready()) return false;
+        const tcvr_scene_frame* frame = arcadexr::hardware::namco_system22::AcquireScene();
+        if (!frame || frame->width <= 0 || frame->height <= 0) return false;
+        if (!m_scene.AssetsReady()) {
+            tcvr_scene_assets assets{};
+            if (!arcadexr::hardware::namco_system22::SceneAssets(assets)) return false;
+            if (!m_scene.UploadAssets(assets)) {
+                Log::Write(Log::Level::Error, Fmt("TCVR_M12 assets failed: %s", m_scene.LastError().c_str()));
+                return false;
+            }
+        }
+        int scale = arcadexr::config::GetInt("scene.scale", 2);
+        scale = std::max(1, std::min(4, scale));
+        const float strength = arcadexr::config::GetFloat("stereo.strength", 0.0f);
+        const float convergence = arcadexr::config::GetFloat("stereo.convergence", 0.0f);
+        const std::string tag = arcadexr::config::GetString("dump", "");
+        const std::string signature = Fmt("%d|%.4f|%.2f|%s", scale, strength, convergence, tag.c_str());
+        if (frame->sequence == m_sceneSequence && signature == m_sceneSignature) {
+            m_sceneActive = true;
+            return true;
+        }
+        m_sceneSequence = frame->sequence;
+        m_sceneSignature = signature;
+        const int width = frame->width * scale, height = frame->height * scale;
+        if (width != m_sceneW || height != m_sceneH) {
+            for (int e = 0; e < 2; ++e) {
+                glBindTexture(GL_TEXTURE_2D, m_sceneTex[e]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_sceneW = width;
+            m_sceneH = height;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool prepared = m_scene.PrepareFrame(*frame);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (prepared) {
+            for (int e = 0; e < 2; ++e) {
+                const float offset = (e == 0 ? -0.5f : 0.5f) * strength;
+                m_scene.RenderEye(*frame, offset, convergence, m_sceneTex[e], width, height);
+            }
+        }
+        const auto t2 = std::chrono::steady_clock::now();
+        // The first published scene can legitimately contain no primitives
+        // while the System 22 video devices finish starting. Do not consume a
+        // one-shot proof tag on that empty bootstrap frame: both eyes would be
+        // background-only and could falsely "prove" zero or non-zero stereo.
+        if (prepared && m_scene.LastStereoPrimCount() > 0 && !tag.empty() && tag != m_sceneDumpTag) {
+            m_sceneDumpTag = tag;
+            std::vector<unsigned char> rgba;
+            for (int e = 0; e < 2; ++e) {
+                if (!m_scene.ReadBack(m_sceneTex[e], width, height, rgba)) continue;
+                const std::string path = arcadexr::config::ExternalDirectory() + "/dump-" + tag + (e == 0 ? "-L.ppm" : "-R.ppm");
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fprintf(f, "P6\n%d %d\n255\n", width, height);
+                    std::vector<unsigned char> row(size_t(width) * 3);
+                    // The scene shader deliberately writes arcade row zero to
+                    // GL texture row zero so the existing virtual-screen UVs
+                    // show it upright. glReadPixels therefore already returns
+                    // rows in the file order we want; reversing them made only
+                    // the diagnostic dump appear upside down.
+                    for (int y = 0; y < height; ++y) {
+                        const unsigned char* src = rgba.data() + size_t(y) * size_t(width) * 4;
+                        for (int x = 0; x < width; ++x) { row[x*3] = src[x*4]; row[x*3+1] = src[x*4+1]; row[x*3+2] = src[x*4+2]; }
+                        std::fwrite(row.data(), 1, row.size(), f);
+                    }
+                    std::fclose(f);
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M12 dumped %s (%dx%d strength=%.3f conv=%.1f stereo_prims=%u zoom=%.6g..%.6g z=%.6g..%.6g)",
+                        path.c_str(), width, height, strength, convergence, m_scene.LastStereoPrimCount(),
+                        m_scene.LastStereoZoomMin(), m_scene.LastStereoZoomMax(), m_scene.LastStereoDepthMin(),
+                        m_scene.LastStereoDepthMax()));
+                }
+            }
+        }
+        // Hand the eye's framebuffer and viewport back exactly as they were.
+        glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+        glViewport(static_cast<GLint>(layerView.subImage.imageRect.offset.x),
+                   static_cast<GLint>(layerView.subImage.imageRect.offset.y),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.width),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.height));
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glActiveTexture(GL_TEXTURE0);
+        const double prepMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double drawMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        m_scenePrepMs += prepMs; m_sceneDrawMs += drawMs; ++m_sceneFrames;
+        if (m_sceneFrames == 1 || m_sceneFrames % 600 == 0) {
+            Log::Write(Log::Level::Info, Fmt("TCVR_M12 scene seq=%llu %ux%u prims=%u stereo_prims=%u tris=%u prepare=%.2fms submit=%.2fms (avg %.2f/%.2f over %u) scale=%d strength=%.3f",
+                static_cast<unsigned long long>(frame->sequence), width, height, m_scene.LastPrimCount(), m_scene.LastStereoPrimCount(), m_scene.LastIndexCount() / 3,
+                prepMs, drawMs, m_scenePrepMs / m_sceneFrames, m_sceneDrawMs / m_sceneFrames, m_sceneFrames, scale, strength));
+        }
+        m_sceneActive = prepared;
+        return prepared;
     }
 
     // Magnifies the emulated frame into an offscreen texture. Called only when
@@ -1363,6 +1494,19 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLint m_screenAimVisibleUniformLocation{0};
     GLint m_screenCalibratingLocation{-1};
     GLint m_objectTintLocation{-1};
+    arcadexr::hardware::namco_system22::SceneRenderer m_scene;
+    bool m_sceneInit{false};
+    bool m_sceneActive{false};
+    int m_sceneEnabled{-1};
+    GLuint m_sceneTex[2]{0, 0};
+    int m_sceneW{0};
+    int m_sceneH{0};
+    std::uint64_t m_sceneSequence{0};
+    std::string m_sceneSignature;
+    std::string m_sceneDumpTag;
+    double m_scenePrepMs{0};
+    double m_sceneDrawMs{0};
+    unsigned m_sceneFrames{0};
     std::vector<std::uint32_t> m_framePixels;
     std::vector<std::uint8_t> m_frameRgba;
     int m_frameWidth{0};
