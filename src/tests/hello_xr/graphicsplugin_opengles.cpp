@@ -594,7 +594,15 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f mvp;
         XrMatrix4x4f_Multiply(&mvp, &vp, &model);
 
-        glDisable(GL_CULL_FACE);
+        // One-sided cabinet screen. The model matrix maps the quad's local +Z
+        // onto screen.normal, which points at the player, so the player-facing
+        // side is wound counter-clockwise in window space -- the opposite of the
+        // GL_CW convention the cube geometry uses. Flipping the winding for this
+        // draw keeps the front visible and culls the back, so walking behind the
+        // screen shows nothing instead of a mirrored copy of the game.
+        glFrontFace(GL_CCW);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
         glUseProgram(m_screenProgram);
         glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
         glActiveTexture(GL_TEXTURE0);
@@ -609,7 +617,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindVertexArray(0);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
-        glEnable(GL_CULL_FACE);
+        glFrontFace(GL_CW);
     }
 
     uint32_t GetSupportedSwapchainSampleCount(const XrViewConfigurationView&) override { return 1; }

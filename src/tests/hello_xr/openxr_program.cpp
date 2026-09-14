@@ -684,6 +684,7 @@ struct OpenXrProgram : IOpenXrProgram {
             XrReferenceSpaceCreateInfo referenceSpaceCreateInfo = GetXrReferenceSpaceCreateInfo(appSpace);
             CHECK_XRCMD(xrCreateReferenceSpace(m_session, &referenceSpaceCreateInfo, &m_appSpace));
             m_appSpaceRequested = appSpace;
+            m_appSpaceTypeEnum = referenceSpaceCreateInfo.referenceSpaceType;
             m_appSpaceType = to_string(referenceSpaceCreateInfo.referenceSpaceType);
         }
     }
@@ -885,8 +886,20 @@ struct OpenXrProgram : IOpenXrProgram {
                     arcadexr::debug::LogRecenterEvent(to_string(change.referenceSpaceType), m_appSpaceType.c_str(),
                                                       (long long)change.changeTime, (long long)m_lastDisplayTime,
                                                       change.poseValid == XR_TRUE, change.poseInPreviousSpace);
-                    m_recenterTime = change.changeTime;
-                    Log::Write(Log::Level::Info, "TCVR_M7 reference space recenter scheduled");
+                    // The arcade screen is expressed in the application space.
+                    // Only a redefinition of THAT space invalidates it. Meta
+                    // emits STAGE changes when the boundary is drawn, exited or
+                    // re-scanned -- all of which happen while the player simply
+                    // walks around -- and reacting to those moved the cabinet
+                    // under the player's feet.
+                    if (change.referenceSpaceType == m_appSpaceTypeEnum) {
+                        m_recenterTime = change.changeTime;
+                        Log::Write(Log::Level::Info, "TCVR_M9 arcade screen re-anchor scheduled: app space redefined");
+                    } else {
+                        Log::Write(Log::Level::Info,
+                                   Fmt("TCVR_M9 ignoring %s change: the arcade screen lives in %s",
+                                       to_string(change.referenceSpaceType), m_appSpaceType.c_str()));
+                    }
                     break;
                 }
                 default: {
@@ -1161,15 +1174,10 @@ struct OpenXrProgram : IOpenXrProgram {
         }
         arcadexr::gun::ScreenPlane screen;
         arcadexr::video::GetVirtualScreen(screen);
-        // Keep at least one metre between the eyes and the screen. Apply before
-        // raycasting so the model, both eyes, and inputs share the same plane.
-        const float signedBefore = (head.position.x - screen.center.x) * screen.normal.x +
-                                   (head.position.y - screen.center.y) * screen.normal.y +
-                                   (head.position.z - screen.center.z) * screen.normal.z;
-        if (arcadexr::video::KeepScreenInFront(screen, {head.position.x,head.position.y,head.position.z}, 1.0f)) {
-            arcadexr::video::SetVirtualScreen(screen);
-            arcadexr::debug::LogKeepInFront(signedBefore, 1.0f - signedBefore, screen);
-        }
+        // The cabinet is fixed in the world. The render loop reads the plane and
+        // never writes it: walking towards, past or around the screen changes
+        // nothing, exactly as with a real arcade machine. Re-anchoring happens
+        // only when the application space itself is redefined, above.
         if (!m_loggedSpaceConfig) {
             m_loggedSpaceConfig = true;
             const auto clear = GetBackgroundClearColor();
@@ -1335,6 +1343,7 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
     XrTime m_recenterTime{0};
+    XrReferenceSpaceType m_appSpaceTypeEnum{XR_REFERENCE_SPACE_TYPE_MAX_ENUM};
     XrTime m_lastDisplayTime{0};
     std::string m_appSpaceRequested;
     std::string m_appSpaceType{"<unset>"};
