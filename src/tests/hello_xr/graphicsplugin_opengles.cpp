@@ -14,6 +14,7 @@
 #include <common/xr_linear.h>
 #include "framebuffer_bridge.h"
 #include "virtual_screen.h"
+#include "settings.h"
 #include "aim_state.h"
 
 #define GL(glcmd)                                                                                                    \
@@ -104,6 +105,69 @@ static const char* ScreenFragmentShaderGlsl = R"_(#version 320 es
     }
     )_";
 
+// Upscale pass. Runs once per EMULATED frame -- sixty times a second -- not
+// once per presented XR frame, which is what keeps the arcade clock and the
+// presentation clock independent. It magnifies the 640x480 source into an
+// offscreen texture at an integer multiple, with a selectable filter and an
+// optional unsharp mask, and the arcade quad then samples that texture at
+// whatever rate the headset presents.
+//
+// Every filter here is one hardware bilinear tap on a LINEAR-filtered source,
+// with the coordinate remapped beforehand. That is deliberate: a multi-tap
+// reconstruction at 2560x1920 and 60 Hz is gigataps per second on a chip that
+// also has an emulator to run, and the point of this pass is to make the image
+// better without taking anything back from MAME.
+static const char* UpscaleVertexShaderGlsl = R"_(#version 320 es
+    in vec3 VertexPos;
+    out vec2 PSTexCoord;
+    void main() {
+        gl_Position = vec4(VertexPos.xy * 2.0, 0.0, 1.0);
+        PSTexCoord = VertexPos.xy + 0.5;
+    }
+    )_";
+
+static const char* UpscaleFragmentShaderGlsl = R"_(#version 320 es
+    precision highp float;
+    in vec2 PSTexCoord;
+    uniform sampler2D SourceTexture;
+    uniform vec2 SourceSize;      // texels of the emulated framebuffer
+    uniform vec2 TargetSize;      // texels of the upscaled texture
+    uniform int Filter;           // 0 nearest, 1 bilinear, 2 sharp bilinear
+    uniform float Sharpen;        // 0 = off
+    out vec4 FragColor;
+
+    vec3 sampleSource(vec2 uv) { return texture(SourceTexture, uv).rgb; }
+
+    void main() {
+        vec2 uv = PSTexCoord;
+        if (Filter == 0) {
+            // Snap to the texel centre: exact pixels, with the blockiness and
+            // the shimmer that come with them.
+            uv = (floor(uv * SourceSize) + 0.5) / SourceSize;
+        } else if (Filter == 2) {
+            // Sharp bilinear: keep each source texel flat across its own area
+            // and confine the blend to a ramp one target pixel wide, so edges
+            // stay crisp without the stair-stepping of nearest.
+            vec2 texel = uv * SourceSize;
+            vec2 centre = floor(texel) + 0.5;
+            vec2 ramp = SourceSize / TargetSize;   // source texels per target pixel
+            vec2 offset = clamp((texel - centre) / max(ramp, vec2(1e-6)), -0.5, 0.5);
+            uv = (centre + offset * ramp) / SourceSize;
+        }
+        vec3 color = sampleSource(uv);
+
+        if (Sharpen > 0.0) {
+            // Unsharp mask against the four direct neighbours, one source texel
+            // away, so the amount means the same thing at every scale factor.
+            vec2 step = 1.0 / SourceSize;
+            vec3 blur = sampleSource(uv + vec2(step.x, 0.0)) + sampleSource(uv - vec2(step.x, 0.0)) +
+                        sampleSource(uv + vec2(0.0, step.y)) + sampleSource(uv - vec2(0.0, step.y));
+            color = clamp(color + Sharpen * (color - blur * 0.25), 0.0, 1.0);
+        }
+        FragColor = vec4(color, 1.0);
+    }
+    )_";
+
 struct ScreenVertex {
     XrVector3f Position;
     XrVector2f TexCoord;
@@ -144,6 +208,18 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         if (m_cubeIndexBuffer != 0) {
             glDeleteBuffers(1, &m_cubeIndexBuffer);
+        }
+        if (m_upscaleProgram != 0) {
+            glDeleteProgram(m_upscaleProgram);
+        }
+        if (m_upscaleVao != 0) {
+            glDeleteVertexArrays(1, &m_upscaleVao);
+        }
+        if (m_upscaleFramebuffer != 0) {
+            glDeleteFramebuffers(1, &m_upscaleFramebuffer);
+        }
+        if (m_upscaleTexture != 0) {
+            glDeleteTextures(1, &m_upscaleTexture);
         }
         if (m_screenTexture != 0) {
             glDeleteTextures(1, &m_screenTexture);
@@ -306,10 +382,51 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glVertexAttribPointer(screenTexCoord, 2, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex),
                               reinterpret_cast<const void*>(sizeof(XrVector3f)));
         glBindVertexArray(0);
+        GLuint upscaleVertexShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(upscaleVertexShader, 1, &UpscaleVertexShaderGlsl, nullptr);
+        glCompileShader(upscaleVertexShader);
+        CheckShader(upscaleVertexShader);
+        GLuint upscaleFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(upscaleFragmentShader, 1, &UpscaleFragmentShaderGlsl, nullptr);
+        glCompileShader(upscaleFragmentShader);
+        CheckShader(upscaleFragmentShader);
+        m_upscaleProgram = glCreateProgram();
+        glAttachShader(m_upscaleProgram, upscaleVertexShader);
+        glAttachShader(m_upscaleProgram, upscaleFragmentShader);
+        glLinkProgram(m_upscaleProgram);
+        CheckProgram(m_upscaleProgram);
+        glDeleteShader(upscaleVertexShader);
+        glDeleteShader(upscaleFragmentShader);
+        m_upscaleSourceLocation = glGetUniformLocation(m_upscaleProgram, "SourceTexture");
+        m_upscaleSourceSizeLocation = glGetUniformLocation(m_upscaleProgram, "SourceSize");
+        m_upscaleTargetSizeLocation = glGetUniformLocation(m_upscaleProgram, "TargetSize");
+        m_upscaleFilterLocation = glGetUniformLocation(m_upscaleProgram, "Filter");
+        m_upscaleSharpenLocation = glGetUniformLocation(m_upscaleProgram, "Sharpen");
+        {
+            const GLint upscalePosition = glGetAttribLocation(m_upscaleProgram, "VertexPos");
+            glGenVertexArrays(1, &m_upscaleVao);
+            glBindVertexArray(m_upscaleVao);
+            glBindBuffer(GL_ARRAY_BUFFER, m_screenVertexBuffer);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_screenIndexBuffer);
+            glEnableVertexAttribArray(upscalePosition);
+            glVertexAttribPointer(upscalePosition, 3, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex), nullptr);
+            glBindVertexArray(0);
+        }
+        glGenFramebuffers(1, &m_upscaleFramebuffer);
+        glGenTextures(1, &m_upscaleTexture);
+        glBindTexture(GL_TEXTURE_2D, m_upscaleTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
         glGenTextures(1, &m_screenTexture);
         glBindTexture(GL_TEXTURE_2D, m_screenTexture);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -563,6 +680,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, info.width, info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                          m_frameRgba.data());
             glBindTexture(GL_TEXTURE_2D, 0);
+            RunUpscalePass(layerView);
             if (!m_loggedScreenUpload) {
                 Log::Write(Log::Level::Info, Fmt("TCVR_M4 XR screen texture upload seq=%llu size=%dx%d",
                                                  static_cast<unsigned long long>(info.sequence), info.width, info.height));
@@ -617,7 +735,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUseProgram(m_screenProgram);
         glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+        glBindTexture(GL_TEXTURE_2D, m_upscaleFactor > 1 ? m_upscaleTexture : m_screenTexture);
         glUniform1i(m_screenTextureUniformLocation, 0);
         const auto aim = arcadexr::gun::GetAimState();
         glUniform2f(m_screenAimPointUniformLocation, aim.normalized_x, aim.normalized_y);
@@ -629,6 +747,80 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
         glFrontFace(GL_CW);
+    }
+
+    // Magnifies the emulated frame into an offscreen texture. Called only when
+    // a new emulated frame has just been uploaded, so its cost is tied to the
+    // arcade clock -- sixty times a second -- and never to the presentation
+    // clock, which on this headset runs at 207 Hz.
+    void RunUpscalePass(const XrCompositionLayerProjectionView& layerView) {
+        int requested = arcadexr::config::GetInt("upscale", 1);
+        if (requested < 1) requested = 1;
+        if (requested > 4) requested = 4;
+        if (requested == 1 || m_frameWidth <= 0 || m_frameHeight <= 0) {
+            if (m_loggedUpscaleFactor != 1) {
+                m_loggedUpscaleFactor = 1;
+                m_loggedUpscale = true;
+                Log::Write(Log::Level::Info, "TCVR_M11 upscale off: the quad samples the 640x480 source directly");
+            }
+            m_upscaleFactor = 1;
+            return;
+        }
+
+        const int width = m_frameWidth * requested;
+        const int height = m_frameHeight * requested;
+        if (width != m_upscaleWidth || height != m_upscaleHeight) {
+            glBindTexture(GL_TEXTURE_2D, m_upscaleTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_upscaleWidth = width;
+            m_upscaleHeight = height;
+        }
+        m_upscaleFactor = requested;
+
+        const std::string filter = arcadexr::config::GetString("filter", "sharp");
+        const int filterIndex = (filter == "nearest") ? 0 : (filter == "bilinear") ? 1 : 2;
+        float sharpen = arcadexr::config::GetFloat("sharpen", 0.0f);
+        if (sharpen < 0.0f) sharpen = 0.0f;
+        if (sharpen > 2.0f) sharpen = 2.0f;
+
+        glBindFramebuffer(GL_FRAMEBUFFER, m_upscaleFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_upscaleTexture, 0);
+        glViewport(0, 0, width, height);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glUseProgram(m_upscaleProgram);
+        glUniform2f(m_upscaleSourceSizeLocation, float(m_frameWidth), float(m_frameHeight));
+        glUniform2f(m_upscaleTargetSizeLocation, float(width), float(height));
+        glUniform1i(m_upscaleFilterLocation, filterIndex);
+        glUniform1f(m_upscaleSharpenLocation, sharpen);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+        glUniform1i(m_upscaleSourceLocation, 0);
+        glBindVertexArray(m_upscaleVao);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        glBindVertexArray(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+
+        // Hand the eye's framebuffer and viewport back exactly as they were.
+        glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+        glViewport(static_cast<GLint>(layerView.subImage.imageRect.offset.x),
+                   static_cast<GLint>(layerView.subImage.imageRect.offset.y),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.width),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.height));
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+
+        if (!m_loggedUpscale || requested != m_loggedUpscaleFactor || filterIndex != m_loggedFilter ||
+            sharpen != m_loggedSharpen) {
+            m_loggedUpscale = true;
+            m_loggedUpscaleFactor = requested;
+            m_loggedFilter = filterIndex;
+            m_loggedSharpen = sharpen;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M11 upscale x%d -> %dx%d filter=%s sharpen=%.2f", requested, width,
+                                             height, filter.c_str(), sharpen));
+        }
     }
 
     uint32_t GetSupportedSwapchainSampleCount(const XrViewConfigurationView&) override { return 1; }
@@ -650,6 +842,22 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_cubeVertexBuffer{0};
     GLuint m_cubeIndexBuffer{0};
     GLuint m_screenProgram{0};
+    GLuint m_upscaleProgram{0};
+    GLuint m_upscaleVao{0};
+    GLuint m_upscaleFramebuffer{0};
+    GLuint m_upscaleTexture{0};
+    GLint m_upscaleSourceLocation{0};
+    GLint m_upscaleSourceSizeLocation{0};
+    GLint m_upscaleTargetSizeLocation{0};
+    GLint m_upscaleFilterLocation{0};
+    GLint m_upscaleSharpenLocation{0};
+    int m_upscaleFactor{0};
+    int m_upscaleWidth{0};
+    int m_upscaleHeight{0};
+    bool m_loggedUpscale{false};
+    int m_loggedUpscaleFactor{0};
+    int m_loggedFilter{-1};
+    float m_loggedSharpen{-1.0f};
     GLuint m_screenTexture{0};
     GLuint m_screenVao{0};
     GLuint m_screenVertexBuffer{0};
