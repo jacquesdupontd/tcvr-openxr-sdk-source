@@ -13,6 +13,8 @@
 #include "common/gfxwrapper_opengl.h"
 #include <common/xr_linear.h>
 #include "framebuffer_bridge.h"
+#include "virtual_screen.h"
+#include "aim_state.h"
 
 #define GL(glcmd)                                                                                                    \
     {                                                                                                                \
@@ -48,11 +50,15 @@ static const char* VertexShaderGlsl = R"_(#version 320 es
 // The version statement has come on first line.
 static const char* FragmentShaderGlsl = R"_(#version 320 es
 
+    precision mediump float;
+
     in lowp vec3 PSVertexColor;
+    uniform lowp vec3 ObjectTint;
     out lowp vec4 FragColor;
 
     void main() {
-       FragColor = vec4(PSVertexColor, 1);
+       float shade = 0.55 + 0.45 * max(PSVertexColor.r,max(PSVertexColor.g,PSVertexColor.b));
+       FragColor = vec4(ObjectTint * shade, 1);
     }
     )_";
 
@@ -72,9 +78,29 @@ static const char* ScreenFragmentShaderGlsl = R"_(#version 320 es
     precision highp int;
     in vec2 PSTexCoord;
     uniform sampler2D ScreenTexture;
+    uniform vec2 AimPoint;
+    uniform int AimVisible;
+    uniform int Calibrating;
     out lowp vec4 FragColor;
     void main() {
-        FragColor = texture(ScreenTexture, PSTexCoord);
+        vec4 color = texture(ScreenTexture, PSTexCoord);
+        if (AimVisible != 0) {
+            vec2 delta = PSTexCoord - AimPoint;
+            delta.x *= 1.333333;
+            float radial = length(delta);
+            bool ring = radial > 0.011 && radial < 0.015;
+            bool vertical = abs(delta.x) < 0.002 && abs(delta.y) < 0.024;
+            bool horizontal = abs(delta.y) < 0.002 && abs(delta.x) < 0.024;
+            if (ring || vertical || horizontal)
+                color = vec4(1.0, 0.12, 0.08, 1.0);
+        }
+        if (Calibrating != 0) {
+            vec2 d = (PSTexCoord - vec2(0.5)) * vec2(1.333333,1.0);
+            float r = length(d);
+            if ((r > 0.021 && r < 0.029) || (abs(d.x)<0.003 && abs(d.y)<0.04) ||
+                (abs(d.y)<0.003 && abs(d.x)<0.04)) color = vec4(0.1,1.0,1.0,1.0);
+        }
+        FragColor = color;
     }
     )_";
 
@@ -218,6 +244,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glDeleteShader(fragmentShader);
 
         m_modelViewProjectionUniformLocation = glGetUniformLocation(m_program, "ModelViewProjection");
+        m_objectTintLocation = glGetUniformLocation(m_program, "ObjectTint");
 
         m_vertexAttribCoords = glGetAttribLocation(m_program, "VertexPos");
         m_vertexAttribColor = glGetAttribLocation(m_program, "VertexColor");
@@ -257,6 +284,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glDeleteShader(screenFragmentShader);
         m_screenMvpUniformLocation = glGetUniformLocation(m_screenProgram, "ModelViewProjection");
         m_screenTextureUniformLocation = glGetUniformLocation(m_screenProgram, "ScreenTexture");
+        m_screenAimPointUniformLocation = glGetUniformLocation(m_screenProgram, "AimPoint");
+        m_screenAimVisibleUniformLocation = glGetUniformLocation(m_screenProgram, "AimVisible");
+        m_screenCalibratingLocation = glGetUniformLocation(m_screenProgram, "Calibrating");
         const GLint screenPosition = glGetAttribLocation(m_screenProgram, "VertexPos");
         const GLint screenTexCoord = glGetAttribLocation(m_screenProgram, "TexCoord");
 
@@ -481,6 +511,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
 
         // Render each cube
         for (const Cube& cube : cubes) {
+            glUniform3f(m_objectTintLocation,cube.Tint.x,cube.Tint.y,cube.Tint.z);
             // Compute the model-view-projection transform and set it..
             XrMatrix4x4f model;
             XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
@@ -528,11 +559,30 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             }
         }
 
-        XrVector3f offset{0.0f, 0.0f, -2.0f};
-        XrVector3f center;
-        XrPosef_TransformVector3f(&center, &layerView.pose, &offset);
-        XrMatrix4x4f model;
-        XrVector3f scale{3.0f, 3.0f * static_cast<float>(m_frameHeight) / static_cast<float>(m_frameWidth), 1.0f};
+        arcadexr::gun::ScreenPlane screen;
+        if (!arcadexr::video::GetVirtualScreen(screen)) {
+            return;
+        }
+        arcadexr::video::UpdateVirtualScreenAspect(
+            static_cast<float>(m_frameWidth) / static_cast<float>(m_frameHeight));
+        arcadexr::video::GetVirtualScreen(screen);
+
+        // The model is built from the same application-space plane that the
+        // lightgun uses. It is intentionally not recomputed per eye.
+        XrMatrix4x4f model{};
+        model.m[0] = screen.right.x * screen.width;
+        model.m[1] = screen.right.y * screen.width;
+        model.m[2] = screen.right.z * screen.width;
+        model.m[4] = screen.up.x * screen.height;
+        model.m[5] = screen.up.y * screen.height;
+        model.m[6] = screen.up.z * screen.height;
+        model.m[8] = screen.normal.x;
+        model.m[9] = screen.normal.y;
+        model.m[10] = screen.normal.z;
+        model.m[12] = screen.center.x;
+        model.m[13] = screen.center.y;
+        model.m[14] = screen.center.z;
+        model.m[15] = 1.0f;
         XrMatrix4x4f proj;
         XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_OPENGL_ES, layerView.fov, 0.05f, 100.0f);
         XrMatrix4x4f toView;
@@ -541,7 +591,6 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f_InvertRigidBody(&view, &toView);
         XrMatrix4x4f vp;
         XrMatrix4x4f_Multiply(&vp, &proj, &view);
-        XrMatrix4x4f_CreateTranslationRotationScale(&model, &center, &layerView.pose.orientation, &scale);
         XrMatrix4x4f mvp;
         XrMatrix4x4f_Multiply(&mvp, &vp, &model);
 
@@ -551,6 +600,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, m_screenTexture);
         glUniform1i(m_screenTextureUniformLocation, 0);
+        const auto aim = arcadexr::gun::GetAimState();
+        glUniform2f(m_screenAimPointUniformLocation, aim.normalized_x, aim.normalized_y);
+        glUniform1i(m_screenAimVisibleUniformLocation, aim.on_screen ? 1 : 0);
+        glUniform1i(m_screenCalibratingLocation, aim.calibrating ? 1 : 0);
         glBindVertexArray(m_screenVao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
         glBindVertexArray(0);
@@ -584,6 +637,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_screenIndexBuffer{0};
     GLint m_screenMvpUniformLocation{0};
     GLint m_screenTextureUniformLocation{0};
+    GLint m_screenAimPointUniformLocation{0};
+    GLint m_screenAimVisibleUniformLocation{0};
+    GLint m_screenCalibratingLocation{-1};
+    GLint m_objectTintLocation{-1};
     std::vector<std::uint32_t> m_framePixels;
     std::vector<std::uint8_t> m_frameRgba;
     int m_frameWidth{0};

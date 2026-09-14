@@ -58,8 +58,11 @@ if(ANDROID)
     if(DEFINED TCVR_PROJECT_ROOT)
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/emulation/mame/mame_boot_probe.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/video/framebuffer_bridge.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/video/virtual_screen.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/audio/audio_bridge.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/input/input_bridge.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/ray_plane_mapping.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/aim_state.cpp")
     endif()
     add_library(
         hello_xr MODULE
@@ -73,7 +76,7 @@ if(ANDROID)
     )
 
     if(DEFINED TCVR_PROJECT_ROOT)
-        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video" "${TCVR_PROJECT_ROOT}/audio" "${TCVR_PROJECT_ROOT}/input")
+        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video" "${TCVR_PROJECT_ROOT}/audio" "${TCVR_PROJECT_ROOT}/input" "${TCVR_PROJECT_ROOT}/gun")
     endif()
 
     # Only for Android because it lacks a command line

@@ -11,6 +11,7 @@ using nonstd::span;
 struct Cube {
     XrPosef Pose;
     XrVector3f Scale;
+    XrVector3f Tint{1, 1, 1};
 };
 
 // Wraps a graphics API so the main openxr program can be graphics API-independent.

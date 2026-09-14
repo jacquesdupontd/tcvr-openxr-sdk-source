@@ -12,6 +12,10 @@
 #include "openxr_program.h"
 #include <common/xr_linear.h>
 #include "input_bridge.h"
+#include "aim_state.h"
+#include "xr_gun.h"
+#include "ray_plane_mapping.h"
+#include "virtual_screen.h"
 #include <array>
 #include <cmath>
 #include <set>
@@ -97,6 +101,7 @@ struct OpenXrProgram : IOpenXrProgram {
         if (m_input.actionSet != XR_NULL_HANDLE) {
             for (auto hand : {Side::LEFT, Side::RIGHT}) {
                 xrDestroySpace(m_input.handSpace[hand]);
+                if (m_input.aimSpace[hand]) xrDestroySpace(m_input.aimSpace[hand]);
             }
             xrDestroyActionSet(m_input.actionSet);
         }
@@ -378,6 +383,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrActionSet actionSet{XR_NULL_HANDLE};
         XrAction grabAction{XR_NULL_HANDLE};
         XrAction poseAction{XR_NULL_HANDLE};
+        XrAction aimAction{XR_NULL_HANDLE};
         XrAction vibrateAction{XR_NULL_HANDLE};
         XrAction quitAction{XR_NULL_HANDLE};
         XrAction triggerAction{XR_NULL_HANDLE};
@@ -386,6 +392,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction coinAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
+        std::array<XrSpace, Side::COUNT> aimSpace{};
         std::array<float, Side::COUNT> handScale = {{1.0f, 1.0f}};
         std::array<XrBool32, Side::COUNT> handActive;
         bool lastTrigger{false};
@@ -395,6 +402,7 @@ struct OpenXrProgram : IOpenXrProgram {
     };
 
     void InitializeActions() {
+        m_gunCalibration = arcadexr::gun::LoadCalibration();
         // Create an action set.
         {
             XrActionSetCreateInfo actionSetInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
@@ -426,6 +434,9 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.countSubactionPaths = uint32_t(m_input.handSubactionPath.size());
             actionInfo.subactionPaths = m_input.handSubactionPath.data();
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.poseAction));
+            strcpy_s(actionInfo.actionName, "aim_pose");
+            strcpy_s(actionInfo.localizedActionName, "Gun Aim Pose");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.aimAction));
 
             // Create output actions for vibrating the left and right controller.
             actionInfo.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
@@ -439,8 +450,8 @@ struct OpenXrProgram : IOpenXrProgram {
             // Since it doesn't matter which hand did this, we do not specify subaction paths for it.
             // We will just suggest bindings for both hands, where possible.
             actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
-            strcpy_s(actionInfo.actionName, "quit_session");
-            strcpy_s(actionInfo.localizedActionName, "Quit Session");
+            strcpy_s(actionInfo.actionName, "calibrate_gun");
+            strcpy_s(actionInfo.localizedActionName, "Calibrate Gun");
             actionInfo.countSubactionPaths = 0;
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.quitAction));
@@ -509,7 +520,6 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.grabAction, selectPath[Side::RIGHT]},
                                                             {m_input.poseAction, posePath[Side::LEFT]},
                                                             {m_input.poseAction, posePath[Side::RIGHT]},
-                                                            {m_input.quitAction, menuClickPath[Side::LEFT]},
                                                             {m_input.quitAction, menuClickPath[Side::RIGHT]},
                                                             {m_input.vibrateAction, hapticPath[Side::LEFT]},
                                                             {m_input.vibrateAction, hapticPath[Side::RIGHT]}}};
@@ -521,6 +531,9 @@ struct OpenXrProgram : IOpenXrProgram {
         }
         // Suggest bindings for the Oculus Touch.
         {
+            XrPath aimLeft, aimRight;
+            CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/aim/pose", &aimLeft));
+            CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/aim/pose", &aimRight));
             XrPath oculusTouchInteractionProfilePath;
             CHECK_XRCMD(
                 xrStringToPath(m_instance, "/interaction_profiles/oculus/touch_controller", &oculusTouchInteractionProfilePath));
@@ -537,6 +550,8 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.coinAction, xClickPath[Side::LEFT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
+            bindings.push_back({m_input.aimAction, aimLeft});
+            bindings.push_back({m_input.aimAction, aimRight});
             suggestedBindings.suggestedBindings = bindings.data();
             suggestedBindings.countSuggestedBindings = (uint32_t)bindings.size();
             CHECK_XRCMD(xrSuggestInteractionProfileBindings(m_instance, &suggestedBindings));
@@ -607,6 +622,11 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrCreateActionSpace(m_session, &actionSpaceInfo, &m_input.handSpace[Side::LEFT]));
         actionSpaceInfo.subactionPath = m_input.handSubactionPath[Side::RIGHT];
         CHECK_XRCMD(xrCreateActionSpace(m_session, &actionSpaceInfo, &m_input.handSpace[Side::RIGHT]));
+        actionSpaceInfo.action = m_input.aimAction;
+        actionSpaceInfo.subactionPath = m_input.handSubactionPath[Side::LEFT];
+        CHECK_XRCMD(xrCreateActionSpace(m_session, &actionSpaceInfo, &m_input.aimSpace[Side::LEFT]));
+        actionSpaceInfo.subactionPath = m_input.handSubactionPath[Side::RIGHT];
+        CHECK_XRCMD(xrCreateActionSpace(m_session, &actionSpaceInfo, &m_input.aimSpace[Side::RIGHT]));
 
         XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attachInfo.countActionSets = 1;
@@ -850,6 +870,9 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.coinAction, "Coin");
                     break;
                 case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+                    m_recenterTime = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(event)->changeTime;
+                    Log::Write(Log::Level::Info, "TCVR_M7 reference space recenter scheduled");
+                    break;
                 default: {
                     Log::Write(Log::Level::Verbose, Fmt("Ignoring event type %d", event->type));
                     break;
@@ -997,6 +1020,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrActionStateFloat triggerValue{XR_TYPE_ACTION_STATE_FLOAT};
         CHECK_XRCMD(xrGetActionStateFloat(m_session, &triggerInfo, &triggerValue));
         bool const triggerPressed = triggerValue.isActive == XR_TRUE && triggerValue.currentState > 0.5f;
+        if (!triggerPressed) m_blockTriggerUntilRelease = false;
         auto reportDigital = [](const char *id, bool pressed, bool &previous) {
             if (pressed != previous) {
                 Log::Write(Log::Level::Info, Fmt("TCVR_M6 %s=%s", id, pressed ? "pressed" : "released"));
@@ -1004,7 +1028,9 @@ struct OpenXrProgram : IOpenXrProgram {
             }
             arcadexr::input::SetDigital(id, pressed);
         };
-        reportDigital("trigger", triggerPressed, m_input.lastTrigger);
+        m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld;
+        m_triggerHeld = triggerPressed;
+        reportDigital("trigger", triggerPressed && !m_calibrating && !m_blockTriggerUntilRelease, m_input.lastTrigger);
 
         auto readButton = [this](XrAction action, int hand) {
             XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, action, m_input.handSubactionPath[hand]};
@@ -1021,7 +1047,10 @@ struct OpenXrProgram : IOpenXrProgram {
         XrActionStateBoolean quitValue{XR_TYPE_ACTION_STATE_BOOLEAN};
         CHECK_XRCMD(xrGetActionStateBoolean(m_session, &getInfo, &quitValue));
         if ((quitValue.isActive == XR_TRUE) && (quitValue.changedSinceLastSync == XR_TRUE) && (quitValue.currentState == XR_TRUE)) {
-            CHECK_XRCMD(xrRequestExitSession(m_session));
+            m_calibrating = !m_calibrating;
+            m_virtualScreenInitialized = false;
+            arcadexr::input::SetDigital("trigger", false);
+            Log::Write(Log::Level::Info, m_calibrating ? "TCVR_M8 calibration: point at centre then pull trigger" : "TCVR_M8 calibration cancelled");
         }
     }
 
@@ -1081,59 +1110,120 @@ struct OpenXrProgram : IOpenXrProgram {
             m_loggedValidHeadPose = true;
         }
 
-        CHECK(viewCountOutput == viewCapacityInput);
+        CHECK(viewCountOutput > 0 && viewCountOutput == viewCapacityInput);
         CHECK(viewCountOutput == m_configViews.size());
         CHECK(viewCountOutput == m_swapchains.size());
+        XrPosef head = m_views[0].pose;
+        head.position = {};
+        for (const auto& view : m_views) {
+            head.position.x += view.pose.position.x / viewCountOutput;
+            head.position.y += view.pose.position.y / viewCountOutput;
+            head.position.z += view.pose.position.z / viewCountOutput;
+        }
+        if (m_recenterTime && predictedDisplayTime >= m_recenterTime) {
+            m_virtualScreenInitialized = false;
+            m_recenterTime = 0;
+        }
+        if (!m_virtualScreenInitialized) {
+            const XrVector3f localForward{0, 0, -1};
+            XrVector3f forward;
+            XrQuaternionf_RotateVector3f(&forward, &head.orientation, &localForward);
+            forward.y = 0;
+            if (XrVector3f_Length(&forward) < 0.1f) forward = {0,0,-1};
+            XrVector3f_Normalize(&forward);
+            arcadexr::gun::ScreenPlane plane{
+                {head.position.x + forward.x*2, head.position.y, head.position.z + forward.z*2},
+                {-forward.z,0,forward.x}, {0,1,0}, {-forward.x,0,-forward.z}, 3,2.25f};
+            arcadexr::video::SetVirtualScreen(plane);
+            m_virtualScreenInitialized = true;
+            Log::Write(Log::Level::Info, "TCVR_M8 screen recentered vertical distance=2m");
+        }
+        arcadexr::gun::ScreenPlane screen;
+        arcadexr::video::GetVirtualScreen(screen);
+        // Keep at least one metre between the eyes and the screen. Apply before
+        // raycasting so the model, both eyes, and inputs share the same plane.
+        if (arcadexr::video::KeepScreenInFront(screen, {head.position.x,head.position.y,head.position.z}, 1.0f))
+            arcadexr::video::SetVirtualScreen(screen);
 
         projectionLayerViews.resize(viewCountOutput);
-        if (m_supportsDepthLayer) {
-            depthInfos.resize(viewCountOutput);
-        }
-
-        // For each locatable space that we want to visualize, render a 25cm cube.
+        if (m_supportsDepthLayer) depthInfos.resize(viewCountOutput);
         std::vector<Cube> cubes;
-
-        for (XrSpace visualizedSpace : m_visualizedSpaces) {
-            XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
-            res = xrLocateSpace(visualizedSpace, m_appSpace, predictedDisplayTime, &spaceLocation);
-            CHECK_XRRESULT(res, "xrLocateSpace");
-            if (XR_UNQUALIFIED_SUCCESS(res)) {
-                if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
-                    (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
-                    cubes.push_back(Cube{spaceLocation.pose, {0.25f, 0.25f, 0.25f}});
+        cubes.reserve(28);
+        arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating});
+        bool gunTracked = false;
+        for (auto hand : {Side::LEFT, Side::RIGHT}) {
+            XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+            get.action = m_input.aimAction;
+            get.subactionPath = m_input.handSubactionPath[hand];
+            XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
+            CHECK_XRCMD(xrGetActionStatePose(m_session, &get, &state));
+            if (!state.isActive || !IsSessionFocused()) continue;
+            XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+            CHECK_XRCMD(xrLocateSpace(m_input.aimSpace[hand], m_appSpace, predictedDisplayTime, &location));
+            const XrSpaceLocationFlags required = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            if ((location.locationFlags & required) != required) continue;
+            if (!m_loggedValidHandPose[hand]) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_M8 %s aim pose valid; 3D gun active", hand == Side::RIGHT ? "right" : "left"));
+                m_loggedValidHandPose[hand] = true;
+            }
+            if (hand == Side::RIGHT && m_captureCalibration) {
+                m_captureCalibration = false;
+                m_blockTriggerUntilRelease = true;
+                XrQuaternionf offset;
+                if (arcadexr::gun::CalibrationToTarget(location.pose,
+                        {screen.center.x,screen.center.y,screen.center.z}, offset)) {
+                    m_gunCalibration = offset;
+                    bool saved = arcadexr::gun::SaveCalibration(offset);
+                    m_calibrating = false;
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M8 VR calibration captured saved=%d", saved));
+                } else {
+                    Log::Write(Log::Level::Warning, "TCVR_M8 capture rejected: aim nearer to centre");
                 }
-            } else {
-                Log::Write(Log::Level::Verbose, Fmt("Unable to locate a visualized reference space in app space: %d", res));
+            }
+            const XrQuaternionf identity{0,0,0,1};
+            const XrPosef pose = arcadexr::gun::GunPose(location.pose, hand == Side::RIGHT ? m_gunCalibration : identity);
+            for (const auto& part : arcadexr::gun::gunParts) {
+                XrPosef partPose = pose;
+                XrPosef_TransformVector3f(&partPose.position, &pose, &part.center);
+                cubes.push_back(Cube{partPose,part.size,part.color});
+            }
+            if (hand != Side::RIGHT) continue;
+            gunTracked = true;
+            const auto muzzle = arcadexr::gun::Muzzle(pose);
+            const XrVector3f forward{0,0,-1};
+            XrVector3f direction;
+            XrQuaternionf_RotateVector3f(&direction, &pose.orientation, &forward);
+            const auto hit = arcadexr::gun::IntersectScreen(
+                {{muzzle.x,muzzle.y,muzzle.z},{direction.x,direction.y,direction.z}}, screen);
+            const bool onScreen = hit.intersects && hit.on_screen;
+            arcadexr::input::SetAnalog("gun_x", onScreen ? hit.normalized_x : 0.0f);
+            arcadexr::input::SetAnalog("gun_y", onScreen ? hit.normalized_y : 0.0f);
+            arcadexr::input::SetDigital("gun_offscreen", !onScreen);
+            arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating});
+            float beamLength = 1.5f;
+            if (onScreen) {
+                XrVector3f point{
+                    screen.center.x + screen.right.x*(hit.normalized_x-.5f)*screen.width + screen.up.x*(.5f-hit.normalized_y)*screen.height,
+                    screen.center.y + screen.right.y*(hit.normalized_x-.5f)*screen.width + screen.up.y*(.5f-hit.normalized_y)*screen.height,
+                    screen.center.z + screen.right.z*(hit.normalized_x-.5f)*screen.width + screen.up.z*(.5f-hit.normalized_y)*screen.height};
+                XrVector3f delta{point.x-muzzle.x,point.y-muzzle.y,point.z-muzzle.z};
+                beamLength = XrVector3f_Length(&delta);
+            }
+            XrPosef beam = pose;
+            beam.position = {muzzle.x+direction.x*beamLength*.5f,muzzle.y+direction.y*beamLength*.5f,muzzle.z+direction.z*beamLength*.5f};
+            cubes.push_back(Cube{beam,{0.0025f,0.0025f,beamLength},{1.0f,0.15f,0.08f}});
+            if (!m_gunStateKnown || onScreen != m_lastGunOnScreen) {
+                Log::Write(Log::Level::Info,Fmt("TCVR_M7 gun=%s x=%.3f y=%.3f",onScreen?"on_screen":"offscreen",hit.normalized_x,hit.normalized_y));
+                m_gunStateKnown = true;
+                m_lastGunOnScreen = onScreen;
             }
         }
-
-        // Render a 10cm cube scaled by grabAction for each hand. Note renderHand will only be
-        // true when the application has focus.
-        for (auto hand : {Side::LEFT, Side::RIGHT}) {
-            XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
-            res = xrLocateSpace(m_input.handSpace[hand], m_appSpace, predictedDisplayTime, &spaceLocation);
-            CHECK_XRRESULT(res, "xrLocateSpace");
-            if (XR_UNQUALIFIED_SUCCESS(res)) {
-                if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
-                    (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
-                    if (!m_loggedValidHandPose[hand]) {
-                        const char* handName[] = {"left", "right"};
-                        Log::Write(Log::Level::Info,
-                                   Fmt("TCVR_M0 xrLocateSpace returned a valid %s Touch grip pose", handName[hand]));
-                        m_loggedValidHandPose[hand] = true;
-                    }
-                    float scale = 0.1f * m_input.handScale[hand];
-                    cubes.push_back(Cube{spaceLocation.pose, {scale, scale, scale}});
-                }
-            } else {
-                // Tracking loss is expected when the hand is not active so only log a message
-                // if the hand is active.
-                if (m_input.handActive[hand] == XR_TRUE) {
-                    const char* handName[] = {"left", "right"};
-                    Log::Write(Log::Level::Verbose,
-                               Fmt("Unable to locate %s hand action space in app space: %d", handName[hand], res));
-                }
-            }
+        if (!gunTracked) {
+            m_captureCalibration = false;
+            arcadexr::input::SetAnalog("gun_x",0);
+            arcadexr::input::SetAnalog("gun_y",0);
+            arcadexr::input::SetDigital("gun_offscreen",true);
+            arcadexr::input::SetDigital("trigger",false);
         }
 
         // Render view to the appropriate part of the swapchain image.
@@ -1205,6 +1295,15 @@ struct OpenXrProgram : IOpenXrProgram {
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
     bool m_loggedFirstEndFrame{false};
+    bool m_virtualScreenInitialized{false};
+    XrTime m_recenterTime{0};
+    bool m_calibrating{false};
+    bool m_captureCalibration{false};
+    bool m_triggerHeld{false};
+    bool m_blockTriggerUntilRelease{false};
+    XrQuaternionf m_gunCalibration{0, 0, 0, 1};
+    bool m_gunStateKnown{false};
+    bool m_lastGunOnScreen{false};
     bool m_loggedValidHeadPose{false};
     bool m_loggedActionBindings{false};
     std::array<bool, Side::COUNT> m_loggedValidHandPose{{false, false}};
