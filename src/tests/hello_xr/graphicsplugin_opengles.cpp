@@ -1102,7 +1102,11 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         arcadeToWorld.m[15] = 1.0f;
 
         XrMatrix4x4f projection;
-        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, 0.05f, 100.0f);
+        // The board draws its backdrops up to two million units away; at
+        // immersive.depth units per screen distance that is kilometres. A 100 m
+        // far plane clipped the whole back of the scene (sky, far buildings).
+        const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
+        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, 0.05f, farMetres);
         XrMatrix4x4f eyeToWorld;
         XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
         XrMatrix4x4f worldToEye;
@@ -1137,7 +1141,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_scene.SetFogVoid(arcadexr::config::GetInt("immersive.fogVoid", 1) != 0);
         {
             // immersive.void = game | fog | r,g,b ; immersive.hudBand = top,bottom (fractions)
-            const std::string v = arcadexr::config::GetString("immersive.void", "fog");
+            const std::string v = arcadexr::config::GetString("immersive.void", "game");
             unsigned r = 0, g = 0, b = 0;
             if (v == "game") m_scene.SetVoid(0, 0, 0, 0);
             else if (std::sscanf(v.c_str(), "%u,%u,%u", &r, &g, &b) == 3) m_scene.SetVoid(2, r & 255, g & 255, b & 255);
