@@ -57,9 +57,22 @@ static const char* FragmentShaderGlsl = R"_(#version 320 es
     uniform lowp vec3 ObjectTint;
     out lowp vec4 FragColor;
 
+    // The sample encodes which face of the box a fragment belongs to in its
+    // vertex colour: bright primaries for +X/+Y/+Z, quarter-strength ones for
+    // the negatives. Turning that back into a per-face shading factor is what
+    // makes a stack of boxes read as one solid object instead of a flat
+    // silhouette -- top lit, sides stepped, underside dark.
+    float faceShade(vec3 c) {
+        if (c.g > 0.5) return 1.00;   // +Y, top
+        if (c.r > 0.5) return 0.86;   // +X
+        if (c.b > 0.5) return 0.78;   // +Z, towards the player
+        if (c.g > 0.1) return 0.40;   // -Y, underside
+        if (c.r > 0.1) return 0.64;   // -X
+        return 0.54;                  // -Z
+    }
+
     void main() {
-       float shade = 0.55 + 0.45 * max(PSVertexColor.r,max(PSVertexColor.g,PSVertexColor.b));
-       FragColor = vec4(ObjectTint * shade, 1);
+       FragColor = vec4(ObjectTint * faceShade(PSVertexColor), 1);
     }
     )_";
 
@@ -132,14 +145,59 @@ static const char* UpscaleFragmentShaderGlsl = R"_(#version 320 es
     uniform sampler2D SourceTexture;
     uniform vec2 SourceSize;      // texels of the emulated framebuffer
     uniform vec2 TargetSize;      // texels of the upscaled texture
-    uniform int Filter;           // 0 nearest, 1 bilinear, 2 sharp bilinear
+    uniform int Filter;           // 0 nearest, 1 bilinear, 2 sharp bilinear, 3 Catmull-Rom
     uniform float Sharpen;        // 0 = off
     out vec4 FragColor;
 
     vec3 sampleSource(vec2 uv) { return texture(SourceTexture, uv).rgb; }
 
+    // Catmull-Rom bicubic, nine bilinear taps. Time Crisis is rendered 3D, not
+    // pixel art, so the right reconstruction is a smooth interpolating one: it
+    // removes the square edges of magnified texels without the mush of plain
+    // bilinear, because it keeps a mild overshoot at real edges. Nine taps
+    // rather than sixteen by folding each pair of neighbours into one weighted
+    // bilinear fetch.
+    vec3 catmullRom(vec2 uv) {
+        vec2 position = uv * SourceSize;
+        vec2 centre = floor(position - 0.5) + 0.5;
+        vec2 f = position - centre;
+
+        vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+        vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+        vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+        vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+        vec2 w12 = w1 + w2;
+        vec2 middle = (centre + w2 / w12) / SourceSize;
+        vec2 first = (centre - 1.0) / SourceSize;
+        vec2 last = (centre + 2.0) / SourceSize;
+
+        vec3 result = vec3(0.0);
+        result += sampleSource(vec2(first.x,  first.y))  * w0.x  * w0.y;
+        result += sampleSource(vec2(middle.x, first.y))  * w12.x * w0.y;
+        result += sampleSource(vec2(last.x,   first.y))  * w3.x  * w0.y;
+        result += sampleSource(vec2(first.x,  middle.y)) * w0.x  * w12.y;
+        result += sampleSource(vec2(middle.x, middle.y)) * w12.x * w12.y;
+        result += sampleSource(vec2(last.x,   middle.y)) * w3.x  * w12.y;
+        result += sampleSource(vec2(first.x,  last.y))   * w0.x  * w3.y;
+        result += sampleSource(vec2(middle.x, last.y))   * w12.x * w3.y;
+        result += sampleSource(vec2(last.x,   last.y))   * w3.x  * w3.y;
+        return clamp(result, 0.0, 1.0);
+    }
+
     void main() {
         vec2 uv = PSTexCoord;
+        if (Filter == 3) {
+            vec3 smoothed = catmullRom(uv);
+            if (Sharpen > 0.0) {
+                vec2 step = 1.0 / SourceSize;
+                vec3 blur = sampleSource(uv + vec2(step.x, 0.0)) + sampleSource(uv - vec2(step.x, 0.0)) +
+                            sampleSource(uv + vec2(0.0, step.y)) + sampleSource(uv - vec2(0.0, step.y));
+                smoothed = clamp(smoothed + Sharpen * (smoothed - blur * 0.25), 0.0, 1.0);
+            }
+            FragColor = vec4(smoothed, 1.0);
+            return;
+        }
         if (Filter == 0) {
             // Snap to the texel centre: exact pixels, with the blockiness and
             // the shimmer that come with them.
@@ -778,8 +836,14 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         m_upscaleFactor = requested;
 
-        const std::string filter = arcadexr::config::GetString("filter", "sharp");
-        const int filterIndex = (filter == "nearest") ? 0 : (filter == "bilinear") ? 1 : 2;
+        // Default to the smooth reconstruction: the source is rendered 3D, and
+        // sharp-bilinear exists to preserve pixel-art blocks, which is the
+        // opposite of what this content wants.
+        const std::string filter = arcadexr::config::GetString("filter", "catmull");
+        const int filterIndex = (filter == "nearest")    ? 0
+                                : (filter == "bilinear") ? 1
+                                : (filter == "sharp")    ? 2
+                                                         : 3;
         float sharpen = arcadexr::config::GetFloat("sharpen", 0.0f);
         if (sharpen < 0.0f) sharpen = 0.0f;
         if (sharpen > 2.0f) sharpen = 2.0f;

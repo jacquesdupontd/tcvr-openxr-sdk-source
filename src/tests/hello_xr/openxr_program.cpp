@@ -811,8 +811,21 @@ struct OpenXrProgram : IOpenXrProgram {
                 XrSwapchainCreateInfo swapchainCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
                 swapchainCreateInfo.arraySize = 1;
                 swapchainCreateInfo.format = m_colorSwapchainFormat;
-                swapchainCreateInfo.width = vp.recommendedImageRectWidth;
-                swapchainCreateInfo.height = vp.recommendedImageRectHeight;
+                // The emulator's rasteriser is on the CPU, but it competes with
+                // the compositor for memory bandwidth, and at 207 Hz each eye is
+                // cleared and redrawn over two hundred times a second. Measured
+                // on a Quest 3, MAME held 59.3-59.7 fps while the app was
+                // backgrounded and not rendering, and 51-58 in the foreground.
+                // This scale is the lever for that, and it is a setting rather
+                // than a constant because what it costs is a judgement call.
+                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.0f);
+                if (scale < 0.3f) scale = 0.3f;
+                if (scale > 1.0f) scale = 1.0f;
+                swapchainCreateInfo.width = uint32_t(vp.recommendedImageRectWidth * scale);
+                swapchainCreateInfo.height = uint32_t(vp.recommendedImageRectHeight * scale);
+                Log::Write(Log::Level::Info, Fmt("TCVR_M12 eye %u swapchain %ux%u (scale %.2f of %ux%u)", i,
+                                                 swapchainCreateInfo.width, swapchainCreateInfo.height, scale,
+                                                 vp.recommendedImageRectWidth, vp.recommendedImageRectHeight));
                 swapchainCreateInfo.mipCount = 1;
                 swapchainCreateInfo.faceCount = 1;
                 swapchainCreateInfo.sampleCount = m_graphicsPlugin->GetSupportedSwapchainSampleCount(vp);
@@ -832,8 +845,8 @@ struct OpenXrProgram : IOpenXrProgram {
                     XrSwapchainCreateInfo depthSwapchainCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
                     depthSwapchainCreateInfo.arraySize = 1;
                     depthSwapchainCreateInfo.format = m_depthSwapchainFormat;
-                    depthSwapchainCreateInfo.width = vp.recommendedImageRectWidth;
-                    depthSwapchainCreateInfo.height = vp.recommendedImageRectHeight;
+                    depthSwapchainCreateInfo.width = swapchainCreateInfo.width;
+                    depthSwapchainCreateInfo.height = swapchainCreateInfo.height;
                     depthSwapchainCreateInfo.mipCount = 1;
                     depthSwapchainCreateInfo.faceCount = 1;
                     depthSwapchainCreateInfo.sampleCount = m_graphicsPlugin->GetSupportedSwapchainSampleCount(vp);
@@ -1180,7 +1193,7 @@ struct OpenXrProgram : IOpenXrProgram {
         }
 
         m_lastDisplayTime = frameState.predictedDisplayTime;
-        arcadexr::xr::RetryWhileUnknown();
+        arcadexr::xr::RetryWhileUnknown(IsSessionFocused());
         arcadexr::audio::LogStatsPeriodically();
         arcadexr::config::Poll();
         {
