@@ -1038,6 +1038,12 @@ struct OpenXrProgram : IOpenXrProgram {
                 if (const uint32_t emulator = arcadexr::mame::EmulatorThreadId()) {
                     arcadexr::xr::DeclareThread(XR_ANDROID_THREAD_TYPE_APPLICATION_MAIN_KHR, emulator,
                                                 "emulator");
+                    // Measured on play: at frameskip 8 the emulator still sat at
+                    // 92-93% while wandering across the three granted cores and
+                    // being preempted by this loop. A core of its own is the last
+                    // cheap lever before the emulated CPUs themselves are the wall.
+                    arcadexr::xr::PinEmulatorAndRenderer(emulator, (uint32_t)gettid());
+                    m_nextPinTime = 1;  // re-check from the frame loop
                 }
                 break;
             }
@@ -1237,6 +1243,17 @@ struct OpenXrProgram : IOpenXrProgram {
 
         m_lastDisplayTime = frameState.predictedDisplayTime;
         arcadexr::xr::RetryWhileUnknown(IsSessionFocused());
+        // Re-apply the core pin a few times after start: the runtime's thread
+        // settings arrive asynchronously and each cpuset move wipes the mask.
+        if (m_pinRetries < 3 && m_nextPinTime != 0 && (m_nextPinTime == 1 ? true : frameState.predictedDisplayTime >= m_nextPinTime)) {
+            if (m_nextPinTime == 1) { m_nextPinTime = frameState.predictedDisplayTime + 1000000000LL; }
+            else {
+                if (const uint32_t emulator = arcadexr::mame::EmulatorThreadId())
+                    arcadexr::xr::PinEmulatorAndRenderer(emulator, (uint32_t)gettid());
+                ++m_pinRetries;
+                m_nextPinTime = frameState.predictedDisplayTime + (m_pinRetries == 1 ? 2000000000LL : 7000000000LL);
+            }
+        }
         arcadexr::audio::LogStatsPeriodically();
         arcadexr::config::Poll();
         {
@@ -1515,6 +1532,8 @@ struct OpenXrProgram : IOpenXrProgram {
     XrTime m_recenterTime{0};
     XrReferenceSpaceType m_appSpaceTypeEnum{XR_REFERENCE_SPACE_TYPE_MAX_ENUM};
     XrTime m_lastDisplayTime{0};
+    XrTime m_nextPinTime{0};
+    int m_pinRetries{0};
     std::string m_appSpaceRequested;
     std::string m_appSpaceType{"<unset>"};
     std::string m_blendModesAvailable;
