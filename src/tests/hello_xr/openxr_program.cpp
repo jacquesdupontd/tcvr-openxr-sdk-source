@@ -1202,6 +1202,20 @@ struct OpenXrProgram : IOpenXrProgram {
             arcadexr::input::SetDigital(id, pressed);
         };
         m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld;
+        // Recoil: one hard pulse per shot, on the hand that holds the gun.
+        if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease) {
+            const int ms = arcadexr::config::GetInt("haptics.ms", 120);
+            if (ms > 0) {
+                XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+                vibration.amplitude = 1.0f;
+                vibration.duration = XrDuration(ms) * 1000000;
+                vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+                XrHapticActionInfo hapticInfo{XR_TYPE_HAPTIC_ACTION_INFO};
+                hapticInfo.action = m_input.vibrateAction;
+                hapticInfo.subactionPath = m_input.handSubactionPath[Side::RIGHT];
+                xrApplyHapticFeedback(m_session, &hapticInfo, reinterpret_cast<XrHapticBaseHeader*>(&vibration));
+            }
+        }
         m_triggerHeld = triggerPressed;
         reportDigital("trigger", triggerPressed && !m_calibrating && !m_blockTriggerUntilRelease, m_input.lastTrigger);
 

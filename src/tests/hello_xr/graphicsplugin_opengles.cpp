@@ -1166,7 +1166,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // emulator (MAME 53 -> 33 fps, scene rate down to 10/s). Between two
         // emulated frames the eye keeps the image and the pose it was rendered
         // with; the compositor reprojects the rotation from that pose.
-        float renderScale = arcadexr::config::GetFloat("immersive.scale", 0.75f);
+        float renderScale = arcadexr::config::GetFloat("immersive.scale", 1.0f);
+        const bool fxaa = arcadexr::config::GetInt("immersive.fxaa", 1) != 0 && m_edgeProgram != 0;
+        m_scene.SetTextureSamples(arcadexr::config::GetInt("immersive.texAA", 1) ? 4 : 1);
         renderScale = std::max(0.3f, std::min(1.0f, renderScale));
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
@@ -1191,6 +1193,37 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (everyFrame || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
             rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, m_immersiveTex[viewIndex], rw, rh,
                                          reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp));
+            if (rendered && fxaa) {
+                // The same FXAA pass as the screen window's edge filter, on the eye image.
+                if (m_immersiveAaW != rw || m_immersiveAaH != rh) {
+                    for (int e = 0; e < 2; ++e) {
+                        if (!m_immersiveAa[e]) glGenTextures(1, &m_immersiveAa[e]);
+                        glBindTexture(GL_TEXTURE_2D, m_immersiveAa[e]);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    }
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                    m_immersiveAaW = rw;
+                    m_immersiveAaH = rh;
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, m_upscaleFramebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveAa[viewIndex], 0);
+                glViewport(0, 0, rw, rh);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glDisable(GL_BLEND);
+                glUseProgram(m_edgeProgram);
+                glUniform2f(m_edgeTargetSizeLocation, float(rw), float(rh));
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, m_immersiveTex[viewIndex]);
+                glUniform1i(m_edgeSourceLocation, 0);
+                glBindVertexArray(m_upscaleVao);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+                glBindVertexArray(0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glUseProgram(0);
+            }
             if (rendered) {
                 m_immersiveRenderedSeq[viewIndex] = frame->sequence;
                 m_immersivePose[viewIndex] = layerView.pose;
@@ -1209,7 +1242,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         if (rendered) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
-            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveTex[viewIndex], 0);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                   (fxaa && m_immersiveAa[viewIndex]) ? m_immersiveAa[viewIndex] : m_immersiveTex[viewIndex], 0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
             glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
@@ -1764,6 +1798,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     arcadexr::gun::Vec3 m_anchorCamera{}, m_anchorRight{}, m_anchorUp{}, m_anchorNormal{};
     float m_anchorScale{1.0f};
     GLuint m_immersiveTex[2]{0, 0};
+    GLuint m_immersiveAa[2]{0, 0};
+    int m_immersiveAaW{0};
+    int m_immersiveAaH{0};
     GLuint m_immersiveBlitFbo{0};
     std::uint64_t m_immersiveRenderedSeq[2]{0, 0};
     XrPosef m_immersivePose[2]{};
