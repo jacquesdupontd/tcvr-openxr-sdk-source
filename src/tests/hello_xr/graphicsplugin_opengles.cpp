@@ -12,6 +12,7 @@
 
 #include "common/gfxwrapper_opengl.h"
 #include <common/xr_linear.h>
+#include "framebuffer_bridge.h"
 
 #define GL(glcmd)                                                                                                    \
     {                                                                                                                \
@@ -55,6 +56,42 @@ static const char* FragmentShaderGlsl = R"_(#version 320 es
     }
     )_";
 
+static const char* ScreenVertexShaderGlsl = R"_(#version 320 es
+    in vec3 VertexPos;
+    in vec2 TexCoord;
+    out vec2 PSTexCoord;
+    uniform mat4 ModelViewProjection;
+    void main() {
+        gl_Position = ModelViewProjection * vec4(VertexPos, 1.0);
+        PSTexCoord = TexCoord;
+    }
+    )_";
+
+static const char* ScreenFragmentShaderGlsl = R"_(#version 320 es
+    precision highp float;
+    precision highp int;
+    in vec2 PSTexCoord;
+    uniform sampler2D ScreenTexture;
+    out lowp vec4 FragColor;
+    void main() {
+        FragColor = texture(ScreenTexture, PSTexCoord);
+    }
+    )_";
+
+struct ScreenVertex {
+    XrVector3f Position;
+    XrVector2f TexCoord;
+};
+
+constexpr ScreenVertex c_screenVertices[] = {
+    {{-0.5f, -0.5f, 0.0f}, {0.0f, 1.0f}},
+    {{0.5f, -0.5f, 0.0f}, {1.0f, 1.0f}},
+    {{0.5f, 0.5f, 0.0f}, {1.0f, 0.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f}},
+};
+
+constexpr GLushort c_screenIndices[] = {0, 1, 2, 0, 2, 3};
+
 struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     OpenGLESGraphicsPlugin() {}
 
@@ -70,6 +107,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (m_program != 0) {
             glDeleteProgram(m_program);
         }
+        if (m_screenProgram != 0) {
+            glDeleteProgram(m_screenProgram);
+        }
         if (m_vao != 0) {
             glDeleteVertexArrays(1, &m_vao);
         }
@@ -78,6 +118,18 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         if (m_cubeIndexBuffer != 0) {
             glDeleteBuffers(1, &m_cubeIndexBuffer);
+        }
+        if (m_screenTexture != 0) {
+            glDeleteTextures(1, &m_screenTexture);
+        }
+        if (m_screenVao != 0) {
+            glDeleteVertexArrays(1, &m_screenVao);
+        }
+        if (m_screenVertexBuffer != 0) {
+            glDeleteBuffers(1, &m_screenVertexBuffer);
+        }
+        if (m_screenIndexBuffer != 0) {
+            glDeleteBuffers(1, &m_screenIndexBuffer);
         }
 
         ksGpuWindow_Destroy(&window);
@@ -187,6 +239,50 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glVertexAttribPointer(m_vertexAttribCoords, 3, GL_FLOAT, GL_FALSE, sizeof(Geometry::Vertex), nullptr);
         glVertexAttribPointer(m_vertexAttribColor, 3, GL_FLOAT, GL_FALSE, sizeof(Geometry::Vertex),
                               reinterpret_cast<const void*>(sizeof(XrVector3f)));
+
+        GLuint screenVertexShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(screenVertexShader, 1, &ScreenVertexShaderGlsl, nullptr);
+        glCompileShader(screenVertexShader);
+        CheckShader(screenVertexShader);
+        GLuint screenFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(screenFragmentShader, 1, &ScreenFragmentShaderGlsl, nullptr);
+        glCompileShader(screenFragmentShader);
+        CheckShader(screenFragmentShader);
+        m_screenProgram = glCreateProgram();
+        glAttachShader(m_screenProgram, screenVertexShader);
+        glAttachShader(m_screenProgram, screenFragmentShader);
+        glLinkProgram(m_screenProgram);
+        CheckProgram(m_screenProgram);
+        glDeleteShader(screenVertexShader);
+        glDeleteShader(screenFragmentShader);
+        m_screenMvpUniformLocation = glGetUniformLocation(m_screenProgram, "ModelViewProjection");
+        m_screenTextureUniformLocation = glGetUniformLocation(m_screenProgram, "ScreenTexture");
+        const GLint screenPosition = glGetAttribLocation(m_screenProgram, "VertexPos");
+        const GLint screenTexCoord = glGetAttribLocation(m_screenProgram, "TexCoord");
+
+        glGenBuffers(1, &m_screenVertexBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, m_screenVertexBuffer);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(c_screenVertices), c_screenVertices, GL_STATIC_DRAW);
+        glGenBuffers(1, &m_screenIndexBuffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_screenIndexBuffer);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(c_screenIndices), c_screenIndices, GL_STATIC_DRAW);
+        glGenVertexArrays(1, &m_screenVao);
+        glBindVertexArray(m_screenVao);
+        glEnableVertexAttribArray(screenPosition);
+        glEnableVertexAttribArray(screenTexCoord);
+        glBindBuffer(GL_ARRAY_BUFFER, m_screenVertexBuffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_screenIndexBuffer);
+        glVertexAttribPointer(screenPosition, 3, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex), nullptr);
+        glVertexAttribPointer(screenTexCoord, 2, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex),
+                              reinterpret_cast<const void*>(sizeof(XrVector3f)));
+        glBindVertexArray(0);
+        glGenTextures(1, &m_screenTexture);
+        glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     void CheckShader(GLuint shader) {
@@ -365,6 +461,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glClearDepthf(1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
+        RenderArcadeScreen(layerView);
+
         // Set shaders and uniform variables.
         glUseProgram(m_program);
 
@@ -399,6 +497,68 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
+    void RenderArcadeScreen(const XrCompositionLayerProjectionView& layerView) {
+        arcadexr::video::FrameInfo info;
+        if (!arcadexr::video::CopyLatestFrame(m_framePixels, info)) {
+            return;
+        }
+        if (info.sequence != m_lastFrameSequence || info.width != m_frameWidth || info.height != m_frameHeight) {
+            m_frameWidth = info.width;
+            m_frameHeight = info.height;
+            m_lastFrameSequence = info.sequence;
+            m_frameRgba.resize(static_cast<size_t>(info.width) * static_cast<size_t>(info.height) * 4);
+            for (int y = 0; y < info.height; ++y) {
+                for (int x = 0; x < info.width; ++x) {
+                    const std::uint32_t pixel = m_framePixels[static_cast<size_t>(y) * info.stride + x];
+                    const size_t dst = (static_cast<size_t>(y) * info.width + x) * 4;
+                    m_frameRgba[dst + 0] = static_cast<std::uint8_t>((pixel >> 16) & 0xff);
+                    m_frameRgba[dst + 1] = static_cast<std::uint8_t>((pixel >> 8) & 0xff);
+                    m_frameRgba[dst + 2] = static_cast<std::uint8_t>(pixel & 0xff);
+                    m_frameRgba[dst + 3] = 0xff;
+                }
+            }
+            glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, info.width, info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         m_frameRgba.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+            if (!m_loggedScreenUpload) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_M4 XR screen texture upload seq=%llu size=%dx%d",
+                                                 static_cast<unsigned long long>(info.sequence), info.width, info.height));
+                m_loggedScreenUpload = true;
+            }
+        }
+
+        XrVector3f offset{0.0f, 0.0f, -2.0f};
+        XrVector3f center;
+        XrPosef_TransformVector3f(&center, &layerView.pose, &offset);
+        XrMatrix4x4f model;
+        XrVector3f scale{3.0f, 3.0f * static_cast<float>(m_frameHeight) / static_cast<float>(m_frameWidth), 1.0f};
+        XrMatrix4x4f proj;
+        XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_OPENGL_ES, layerView.fov, 0.05f, 100.0f);
+        XrMatrix4x4f toView;
+        XrMatrix4x4f_CreateFromRigidTransform(&toView, &layerView.pose);
+        XrMatrix4x4f view;
+        XrMatrix4x4f_InvertRigidBody(&view, &toView);
+        XrMatrix4x4f vp;
+        XrMatrix4x4f_Multiply(&vp, &proj, &view);
+        XrMatrix4x4f_CreateTranslationRotationScale(&model, &center, &layerView.pose.orientation, &scale);
+        XrMatrix4x4f mvp;
+        XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+
+        glDisable(GL_CULL_FACE);
+        glUseProgram(m_screenProgram);
+        glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+        glUniform1i(m_screenTextureUniformLocation, 0);
+        glBindVertexArray(m_screenVao);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        glBindVertexArray(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+        glEnable(GL_CULL_FACE);
+    }
+
     uint32_t GetSupportedSwapchainSampleCount(const XrViewConfigurationView&) override { return 1; }
 
     void SetClearColor(const std::array<float, 4> clearColor) override { m_clearColor = clearColor; }
@@ -417,6 +577,19 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_vao{0};
     GLuint m_cubeVertexBuffer{0};
     GLuint m_cubeIndexBuffer{0};
+    GLuint m_screenProgram{0};
+    GLuint m_screenTexture{0};
+    GLuint m_screenVao{0};
+    GLuint m_screenVertexBuffer{0};
+    GLuint m_screenIndexBuffer{0};
+    GLint m_screenMvpUniformLocation{0};
+    GLint m_screenTextureUniformLocation{0};
+    std::vector<std::uint32_t> m_framePixels;
+    std::vector<std::uint8_t> m_frameRgba;
+    int m_frameWidth{0};
+    int m_frameHeight{0};
+    std::uint64_t m_lastFrameSequence{0};
+    bool m_loggedScreenUpload{false};
     GLint m_contextApiMajorVersion{0};
     std::array<float, 4> m_clearColor;
 };

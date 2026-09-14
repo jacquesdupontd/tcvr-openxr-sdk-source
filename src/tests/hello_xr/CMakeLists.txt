@@ -57,6 +57,7 @@ set(VULKAN_SHADERS vulkan_shaders/frag.glsl vulkan_shaders/vert.glsl)
 if(ANDROID)
     if(DEFINED TCVR_PROJECT_ROOT)
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/emulation/mame/mame_boot_probe.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/video/framebuffer_bridge.cpp")
     endif()
     add_library(
         hello_xr MODULE
@@ -70,7 +71,7 @@ if(ANDROID)
     )
 
     if(DEFINED TCVR_PROJECT_ROOT)
-        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame")
+        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video")
     endif()
 
     # Only for Android because it lacks a command line
