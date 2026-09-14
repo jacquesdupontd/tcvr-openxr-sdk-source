@@ -1180,6 +1180,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             m_scene.SetTextureSamples(texAa <= 0 ? 1 : (texAa == 1 ? 4 : 16));
             const int msaa = arcadexr::config::GetInt("immersive.msaa", 0);
             m_scene.SetMsaa(msaa >= 4 ? 4 : (msaa >= 2 ? 2 : 1));
+            m_scene.SetSpriteMinDepth(arcadexr::config::GetFloat("immersive.spriteMinDepth", 50.0f));
         }
         renderScale = std::max(0.3f, std::min(2.0f, renderScale));   // > 1 = supersampling, box-reduced by the linear blit at 2.0
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
