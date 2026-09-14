@@ -18,6 +18,7 @@
 #include "virtual_screen.h"
 #include "space_debug.h"
 #include "display_refresh.h"
+#include "audio_bridge.h"
 #include <array>
 #include <cmath>
 #include <set>
@@ -1132,6 +1133,7 @@ struct OpenXrProgram : IOpenXrProgram {
 
         m_lastDisplayTime = frameState.predictedDisplayTime;
         arcadexr::xr::RetryWhileUnknown();
+        arcadexr::audio::LogStatsPeriodically();
         XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
         frameEndInfo.environmentBlendMode = m_blendMode;
