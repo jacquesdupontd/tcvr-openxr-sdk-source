@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "aim_state.h"
 #include "gun_model.h"
+#include "gun_mesh.h"
 #include <cstring>
 #include <cstdio>
 
@@ -292,6 +293,47 @@ static const char* EdgeFragmentShaderGlsl = R"_(#version 320 es
     }
     )_";
 
+// Lit gun: per-face normals, a fixed key light from above and slightly in
+// front, a fill from below so the underside is never black, and a Blinn
+// highlight from the actual eye so the metal reads as metal as the gun turns.
+static const char* GunLitVertexShaderGlsl = R"_(#version 320 es
+    in vec3 VertexPos;
+    in vec3 VertexNormal;
+    in vec3 VertexColor;
+    uniform mat4 ModelViewProjection;
+    uniform mat4 Model;
+    out vec3 WorldPos;
+    out vec3 WorldNormal;
+    out vec3 GunColor;
+    void main() {
+        vec4 world = Model * vec4(VertexPos, 1.0);
+        gl_Position = ModelViewProjection * vec4(VertexPos, 1.0);
+        WorldPos = world.xyz;
+        WorldNormal = mat3(Model) * VertexNormal;
+        GunColor = VertexColor;
+    }
+    )_";
+
+static const char* GunLitFragmentShaderGlsl = R"_(#version 320 es
+    precision mediump float;
+    in vec3 WorldPos;
+    in vec3 WorldNormal;
+    in vec3 GunColor;
+    uniform vec3 EyePos;
+    out vec4 FragColor;
+    void main() {
+        vec3 n = normalize(WorldNormal);
+        vec3 key = normalize(vec3(0.35, 0.85, 0.40));
+        vec3 fill = normalize(vec3(-0.3, -0.6, -0.5));
+        vec3 v = normalize(EyePos - WorldPos);
+        float diff = max(dot(n, key), 0.0) * 0.85 + max(dot(n, fill), 0.0) * 0.20;
+        vec3 h = normalize(key + v);
+        float spec = pow(max(dot(n, h), 0.0), 40.0) * 0.35;
+        vec3 c = GunColor * (0.22 + diff) + vec3(spec);
+        FragColor = vec4(c, 1.0);
+    }
+    )_";
+
 struct ScreenVertex {
     XrVector3f Position;
     XrVector2f TexCoord;
@@ -337,6 +379,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glDeleteProgram(m_upscaleProgram);
         }
         if (m_gunProgram != 0) glDeleteProgram(m_gunProgram);
+        if (m_gunLitProgram != 0) glDeleteProgram(m_gunLitProgram);
+        if (m_gunLitVao != 0) glDeleteVertexArrays(1, &m_gunLitVao);
+        if (m_gunLitVertexBuffer != 0) glDeleteBuffers(1, &m_gunLitVertexBuffer);
+        if (m_gunLitIndexBuffer != 0) glDeleteBuffers(1, &m_gunLitIndexBuffer);
         if (m_edgeProgram != 0) glDeleteProgram(m_edgeProgram);
         if (m_edgeTexture != 0) glDeleteTextures(1, &m_edgeTexture);
         if (m_gunVao != 0) glDeleteVertexArrays(1, &m_gunVao);
@@ -660,6 +706,49 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glBindBuffer(GL_ARRAY_BUFFER, 0);
             Log::Write(Log::Level::Info, Fmt("TCVR_M14 gun mesh: %d vertices, one draw call per eye", (int)m_gunVertexCount));
         }
+        {
+            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, 1, &GunLitVertexShaderGlsl, nullptr);
+            glCompileShader(vs);
+            CheckShader(vs);
+            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, 1, &GunLitFragmentShaderGlsl, nullptr);
+            glCompileShader(fs);
+            CheckShader(fs);
+            m_gunLitProgram = glCreateProgram();
+            glAttachShader(m_gunLitProgram, vs);
+            glAttachShader(m_gunLitProgram, fs);
+            glLinkProgram(m_gunLitProgram);
+            CheckProgram(m_gunLitProgram);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            m_gunLitMvpLocation = glGetUniformLocation(m_gunLitProgram, "ModelViewProjection");
+            m_gunLitModelLocation = glGetUniformLocation(m_gunLitProgram, "Model");
+            m_gunLitEyeLocation = glGetUniformLocation(m_gunLitProgram, "EyePos");
+            const GLint pos = glGetAttribLocation(m_gunLitProgram, "VertexPos");
+            const GLint nrm = glGetAttribLocation(m_gunLitProgram, "VertexNormal");
+            const GLint col = glGetAttribLocation(m_gunLitProgram, "VertexColor");
+            const auto& mesh = arcadexr::gun::GunMesh();
+            m_gunLitIndexCount = static_cast<GLsizei>(mesh.indices.size());
+            glGenBuffers(1, &m_gunLitVertexBuffer);
+            glBindBuffer(GL_ARRAY_BUFFER, m_gunLitVertexBuffer);
+            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(mesh.vertices.size() * sizeof(arcadexr::gun::MeshVertex)), mesh.vertices.data(), GL_STATIC_DRAW);
+            glGenBuffers(1, &m_gunLitIndexBuffer);
+            glGenVertexArrays(1, &m_gunLitVao);
+            glBindVertexArray(m_gunLitVao);
+            glBindBuffer(GL_ARRAY_BUFFER, m_gunLitVertexBuffer);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_gunLitIndexBuffer);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(mesh.indices.size() * sizeof(std::uint16_t)), mesh.indices.data(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(pos);
+            glEnableVertexAttribArray(nrm);
+            glEnableVertexAttribArray(col);
+            glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE, sizeof(arcadexr::gun::MeshVertex), nullptr);
+            glVertexAttribPointer(nrm, 3, GL_FLOAT, GL_FALSE, sizeof(arcadexr::gun::MeshVertex), reinterpret_cast<const void*>(sizeof(XrVector3f)));
+            glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE, sizeof(arcadexr::gun::MeshVertex), reinterpret_cast<const void*>(2 * sizeof(XrVector3f)));
+            glBindVertexArray(0);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            Log::Write(Log::Level::Info, Fmt("TCVR_M14 lit gun mesh: %d vertices, %d triangles", (int)mesh.vertices.size(), (int)(mesh.indices.size() / 3)));
+        }
 
         glGenTextures(1, &m_screenTexture);
         glBindTexture(GL_TEXTURE_2D, m_screenTexture);
@@ -882,20 +971,46 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
 
         glBindVertexArray(0);
 
-        // The gun: one draw call per pose.
+        // The gun: one draw call per pose. Lit mesh by default; the box prototype
+        // stays as a debug fallback (gun.model=boxes). debug.tcvr.gundemo=1 parks
+        // one in front of the head so it can be photographed without a controller.
         {
-            const auto guns = arcadexr::gun::GetGunPoses();
-            if (guns.count > 0 && m_gunVertexCount > 0) {
-                glUseProgram(m_gunProgram);
-                glBindVertexArray(m_gunVao);
+            auto guns = arcadexr::gun::GetGunPoses();
+            if (arcadexr::config::GetInt("gundemo", 0) == 1) {
+                XrPosef demo = pose;   // eye pose of this view
+                const XrVector3f ahead{0.12f, -0.10f, -0.45f};
+                XrPosef_TransformVector3f(&demo.position, &pose, &ahead);
+                XrQuaternionf yaw;
+                const XrVector3f yAxis{0, 1, 0};
+                XrQuaternionf_CreateFromAxisAngle(&yaw, &yAxis, -0.9f);
+                XrQuaternionf_Multiply(&demo.orientation, &pose.orientation, &yaw);
+                guns.count = 1;
+                guns.pose[0] = demo;
+            }
+            const bool boxes = arcadexr::config::GetString("gun.model", "mesh") == "boxes";
+            if (guns.count > 0) {
+                if (boxes && m_gunVertexCount > 0) {
+                    glUseProgram(m_gunProgram);
+                    glBindVertexArray(m_gunVao);
+                } else {
+                    glUseProgram(m_gunLitProgram);
+                    glBindVertexArray(m_gunLitVao);
+                    glUniform3f(m_gunLitEyeLocation, pose.position.x, pose.position.y, pose.position.z);
+                }
                 for (int g = 0; g < guns.count; ++g) {
                     XrMatrix4x4f model;
                     const XrVector3f unit{1, 1, 1};
                     XrMatrix4x4f_CreateTranslationRotationScale(&model, &guns.pose[g].position, &guns.pose[g].orientation, &unit);
                     XrMatrix4x4f mvp;
                     XrMatrix4x4f_Multiply(&mvp, &vp, &model);
-                    glUniformMatrix4fv(m_gunMvpLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
-                    glDrawArrays(GL_TRIANGLES, 0, m_gunVertexCount);
+                    if (boxes) {
+                        glUniformMatrix4fv(m_gunMvpLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
+                        glDrawArrays(GL_TRIANGLES, 0, m_gunVertexCount);
+                    } else {
+                        glUniformMatrix4fv(m_gunLitMvpLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
+                        glUniformMatrix4fv(m_gunLitModelLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&model));
+                        glDrawElements(GL_TRIANGLES, m_gunLitIndexCount, GL_UNSIGNED_SHORT, nullptr);
+                    }
                 }
                 glBindVertexArray(0);
             }
@@ -1210,6 +1325,14 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     std::string m_settingsSignature;
     unsigned m_settingsPoll{0};
     GLuint m_gunProgram{0};
+    GLuint m_gunLitProgram{0};
+    GLuint m_gunLitVao{0};
+    GLuint m_gunLitVertexBuffer{0};
+    GLuint m_gunLitIndexBuffer{0};
+    GLint m_gunLitMvpLocation{0};
+    GLint m_gunLitModelLocation{0};
+    GLint m_gunLitEyeLocation{0};
+    GLsizei m_gunLitIndexCount{0};
     GLuint m_gunVao{0};
     GLuint m_gunVertexBuffer{0};
     GLint m_gunMvpLocation{0};

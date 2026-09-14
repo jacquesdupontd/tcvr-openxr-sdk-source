@@ -66,6 +66,7 @@ if(ANDROID)
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/input/input_bridge.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/ray_plane_mapping.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/aim_state.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/gun_mesh.cpp")
     endif()
     add_library(
         hello_xr MODULE
