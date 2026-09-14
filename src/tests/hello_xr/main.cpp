@@ -12,6 +12,7 @@
 #include "audio_bridge.h"
 #include "xr_gun.h"
 #include "display_refresh.h"
+#include "settings.h"
 #include "openxr_program.h"
 
 #if defined(_WIN32)
@@ -245,6 +246,7 @@ void android_main(struct android_app* app) {
 
         arcadexr::gun::SetCalibrationDirectory(app->activity->internalDataPath);
         arcadexr::xr::SetSettingsDirectory(app->activity->internalDataPath);
+        arcadexr::config::SetDirectory(app->activity->internalDataPath);
         program->InitializeDevice();
         program->InitializeSession(options->AppSpace);
         program->CreateSwapchains();

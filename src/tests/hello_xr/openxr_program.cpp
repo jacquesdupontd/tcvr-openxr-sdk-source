@@ -19,6 +19,7 @@
 #include "space_debug.h"
 #include "display_refresh.h"
 #include "audio_bridge.h"
+#include "settings.h"
 #include <array>
 #include <cmath>
 #include <set>
@@ -417,6 +418,8 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction pedalAction{XR_NULL_HANDLE};
         XrAction startAction{XR_NULL_HANDLE};
         XrAction coinAction{XR_NULL_HANDLE};
+        XrAction recenterScreenAction{XR_NULL_HANDLE};
+        XrAction crosshairAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<XrSpace, Side::COUNT> aimSpace{};
@@ -502,6 +505,17 @@ struct OpenXrProgram : IOpenXrProgram {
             strcpy_s(actionInfo.actionName, "coin");
             strcpy_s(actionInfo.localizedActionName, "Coin");
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.coinAction));
+
+            // Deliberate, explicit placement of the cabinet. Separate from gun
+            // calibration, which used to drag a screen recenter along with it.
+            actionInfo.countSubactionPaths = 0;
+            actionInfo.subactionPaths = nullptr;
+            strcpy_s(actionInfo.actionName, "recenter_screen");
+            strcpy_s(actionInfo.localizedActionName, "Recenter Arcade Screen");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.recenterScreenAction));
+            strcpy_s(actionInfo.actionName, "crosshair_mode");
+            strcpy_s(actionInfo.localizedActionName, "Cycle Crosshair Mode");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.crosshairAction));
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -515,6 +529,8 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> triggerValuePath;
         std::array<XrPath, Side::COUNT> aClickPath;
         std::array<XrPath, Side::COUNT> xClickPath;
+        std::array<XrPath, Side::COUNT> yClickPath;
+        std::array<XrPath, Side::COUNT> thumbstickClickPath;
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/select/click", &selectPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/select/click", &selectPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/squeeze/value", &squeezeValuePath[Side::LEFT]));
@@ -537,6 +553,11 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/a/click", &aClickPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/x/click", &xClickPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/x/click", &xClickPath[Side::RIGHT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/y/click", &yClickPath[Side::LEFT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/y/click", &yClickPath[Side::RIGHT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/click", &thumbstickClickPath[Side::LEFT]));
+        CHECK_XRCMD(
+            xrStringToPath(m_instance, "/user/hand/right/input/thumbstick/click", &thumbstickClickPath[Side::RIGHT]));
         // Suggest bindings for KHR Simple.
         {
             XrPath khrSimpleInteractionProfilePath;
@@ -574,7 +595,9 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.triggerAction, triggerValuePath[Side::RIGHT]},
                                                             {m_input.pedalAction, aClickPath[Side::RIGHT]},
                                                             {m_input.startAction, bClickPath[Side::RIGHT]},
-                                                            {m_input.coinAction, xClickPath[Side::LEFT]}}};
+                                                            {m_input.coinAction, xClickPath[Side::LEFT]},
+                                                            {m_input.recenterScreenAction, yClickPath[Side::LEFT]},
+                                                            {m_input.crosshairAction, thumbstickClickPath[Side::LEFT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             bindings.push_back({m_input.aimAction, aimLeft});
@@ -904,6 +927,8 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.pedalAction, "Pedal");
                     LogActionSourceName(m_input.startAction, "Start");
                     LogActionSourceName(m_input.coinAction, "Coin");
+            LogActionSourceName(m_input.recenterScreenAction, "Recenter Screen");
+            LogActionSourceName(m_input.crosshairAction, "Crosshair Mode");
                     break;
                 case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
                     const auto& change = *reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(event);
@@ -1039,6 +1064,8 @@ struct OpenXrProgram : IOpenXrProgram {
             LogActionSourceName(m_input.pedalAction, "Pedal");
             LogActionSourceName(m_input.startAction, "Start");
             LogActionSourceName(m_input.coinAction, "Coin");
+            LogActionSourceName(m_input.recenterScreenAction, "Recenter Screen");
+            LogActionSourceName(m_input.crosshairAction, "Crosshair Mode");
             m_loggedActionBindings = true;
         }
 
@@ -1105,9 +1132,30 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrGetActionStateBoolean(m_session, &getInfo, &quitValue));
         if ((quitValue.isActive == XR_TRUE) && (quitValue.changedSinceLastSync == XR_TRUE) && (quitValue.currentState == XR_TRUE)) {
             m_calibrating = !m_calibrating;
-            m_virtualScreenInitialized = false;
+            // Calibrating the gun used to reset the screen as well. Those are
+            // two different intentions and now have two different buttons.
             arcadexr::input::SetDigital("trigger", false);
             Log::Write(Log::Level::Info, m_calibrating ? "TCVR_M8 calibration: point at centre then pull trigger" : "TCVR_M8 calibration cancelled");
+        }
+
+        auto pressedOnce = [this](XrAction action) {
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, action, XR_NULL_PATH};
+            XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+            CHECK_XRCMD(xrGetActionStateBoolean(m_session, &info, &state));
+            return state.isActive == XR_TRUE && state.changedSinceLastSync == XR_TRUE && state.currentState == XR_TRUE;
+        };
+
+        if (pressedOnce(m_input.recenterScreenAction)) {
+            m_virtualScreenInitialized = false;
+            m_screenPlacementReason = "explicit";
+            Log::Write(Log::Level::Info, "TCVR_M9 arcade screen re-anchor requested by the player");
+        }
+
+        if (pressedOnce(m_input.crosshairAction)) {
+            const std::string current = arcadexr::config::GetString("crosshair", "visible");
+            const char* next = (current == "visible") ? "calibration" : (current == "calibration" ? "hidden" : "visible");
+            arcadexr::config::Set("crosshair", next);
+            Log::Write(Log::Level::Info, Fmt("TCVR_M10 crosshair mode %s -> %s", current.c_str(), next));
         }
     }
 
@@ -1134,6 +1182,13 @@ struct OpenXrProgram : IOpenXrProgram {
         m_lastDisplayTime = frameState.predictedDisplayTime;
         arcadexr::xr::RetryWhileUnknown();
         arcadexr::audio::LogStatsPeriodically();
+        arcadexr::config::Poll();
+        {
+            const std::string mode = arcadexr::config::GetString("crosshair", "visible");
+            m_crosshairMode = (mode == "hidden")        ? CrosshairMode::Hidden
+                              : (mode == "calibration") ? CrosshairMode::CalibrationOnly
+                                                        : CrosshairMode::Visible;
+        }
         XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
         frameEndInfo.environmentBlendMode = m_blendMode;
@@ -1193,9 +1248,15 @@ struct OpenXrProgram : IOpenXrProgram {
             forward.y = 0;
             if (XrVector3f_Length(&forward) < 0.1f) forward = {0,0,-1};
             XrVector3f_Normalize(&forward);
+            // Size and distance are settings. The lightgun mapping is purely
+            // geometric -- ray against plane, then normalised by the plane's own
+            // width and height -- so changing either never invalidates the gun
+            // calibration, which only describes the barrel's axis.
+            const float distance = arcadexr::config::GetFloat("screen.distance", 2.0f);
+            const float width = arcadexr::config::GetFloat("screen.width", 3.0f);
             arcadexr::gun::ScreenPlane plane{
-                {head.position.x + forward.x*2, head.position.y, head.position.z + forward.z*2},
-                {-forward.z,0,forward.x}, {0,1,0}, {-forward.x,0,-forward.z}, 3,2.25f};
+                {head.position.x + forward.x*distance, head.position.y, head.position.z + forward.z*distance},
+                {-forward.z,0,forward.x}, {0,1,0}, {-forward.x,0,-forward.z}, width, width*0.75f};
             arcadexr::video::SetVirtualScreen(plane);
             m_virtualScreenInitialized = true;
             arcadexr::debug::LogScreenPlaced(plane, head, m_screenPlacementReason);
@@ -1225,7 +1286,7 @@ struct OpenXrProgram : IOpenXrProgram {
         if (m_supportsDepthLayer) depthInfos.resize(viewCountOutput);
         std::vector<Cube> cubes;
         cubes.reserve(28);
-        arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating});
+        arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating,false});
         bool gunTracked = false;
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
             XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -1275,7 +1336,12 @@ struct OpenXrProgram : IOpenXrProgram {
             arcadexr::input::SetAnalog("gun_x", onScreen ? hit.normalized_x : 0.0f);
             arcadexr::input::SetAnalog("gun_y", onScreen ? hit.normalized_y : 0.0f);
             arcadexr::input::SetDigital("gun_offscreen", !onScreen);
-            arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating});
+            // Hiding the reticle is a presentation choice only: the raycast
+            // above has already been computed and sent to the game, so Hidden
+            // mode stays exactly as playable as Visible.
+            const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
+                                                    (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating));
+            arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
             float beamLength = 1.5f;
             if (onScreen) {
                 XrVector3f point{
@@ -1373,6 +1439,8 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_supportsDisplayRefreshRate{false};
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
+    enum class CrosshairMode { Visible, CalibrationOnly, Hidden };
+    CrosshairMode m_crosshairMode{CrosshairMode::Visible};
     XrTime m_recenterTime{0};
     XrReferenceSpaceType m_appSpaceTypeEnum{XR_REFERENCE_SPACE_TYPE_MAX_ENUM};
     XrTime m_lastDisplayTime{0};

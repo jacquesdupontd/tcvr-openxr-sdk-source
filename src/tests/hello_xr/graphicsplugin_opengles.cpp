@@ -621,7 +621,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUniform1i(m_screenTextureUniformLocation, 0);
         const auto aim = arcadexr::gun::GetAimState();
         glUniform2f(m_screenAimPointUniformLocation, aim.normalized_x, aim.normalized_y);
-        glUniform1i(m_screenAimVisibleUniformLocation, aim.on_screen ? 1 : 0);
+        glUniform1i(m_screenAimVisibleUniformLocation, aim.show_crosshair ? 1 : 0);
         glUniform1i(m_screenCalibratingLocation, aim.calibrating ? 1 : 0);
         glBindVertexArray(m_screenVao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
