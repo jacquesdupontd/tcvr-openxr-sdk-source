@@ -1224,7 +1224,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // render=gpu: the true-3D path. Recording in the emulator is switched
         // on only while someone reads the scene.
         const bool gpuRender = arcadexr::config::GetString("render", "cpu") == "gpu";
-        const int mode = gpuRender ? (arcadexr::config::GetInt("scene.cpuRaster", 1) ? 1 : 2) : 0;
+        // Measured 21:50 on the same scene, toggling live: with the CPU rasteriser
+        // kept as a fallback the emulator thread blocked in the saturated
+        // rasteriser queue (dispatch 24-37 ms, MAME 55 fps, 25-75 audio underruns
+        // a second); without it, dispatch 0.5 ms, MAME 59.9, no underruns. The
+        // GPU draws the frame: the CPU rasteriser is off unless asked for.
+        const int mode = gpuRender ? (arcadexr::config::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
         if (mode != m_sceneEnabled) {
             m_sceneEnabled = mode;
             arcadexr::hardware::namco_system22::EnableScene(mode);
