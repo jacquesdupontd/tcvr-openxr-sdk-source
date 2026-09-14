@@ -11,6 +11,7 @@
 #include "swapchain_image_data.h"
 #include "openxr_program.h"
 #include <common/xr_linear.h>
+#include "input_bridge.h"
 #include <array>
 #include <cmath>
 #include <set>
@@ -379,10 +380,18 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction poseAction{XR_NULL_HANDLE};
         XrAction vibrateAction{XR_NULL_HANDLE};
         XrAction quitAction{XR_NULL_HANDLE};
+        XrAction triggerAction{XR_NULL_HANDLE};
+        XrAction pedalAction{XR_NULL_HANDLE};
+        XrAction startAction{XR_NULL_HANDLE};
+        XrAction coinAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<float, Side::COUNT> handScale = {{1.0f, 1.0f}};
         std::array<XrBool32, Side::COUNT> handActive;
+        bool lastTrigger{false};
+        bool lastPedal{false};
+        bool lastStart{false};
+        bool lastCoin{false};
     };
 
     void InitializeActions() {
@@ -435,6 +444,26 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.countSubactionPaths = 0;
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.quitAction));
+
+            actionInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+            strcpy_s(actionInfo.actionName, "gun_trigger");
+            strcpy_s(actionInfo.localizedActionName, "Gun Trigger");
+            actionInfo.countSubactionPaths = uint32_t(m_input.handSubactionPath.size());
+            actionInfo.subactionPaths = m_input.handSubactionPath.data();
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.triggerAction));
+
+            actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+            strcpy_s(actionInfo.actionName, "pedal");
+            strcpy_s(actionInfo.localizedActionName, "Pedal");
+            actionInfo.countSubactionPaths = uint32_t(m_input.handSubactionPath.size());
+            actionInfo.subactionPaths = m_input.handSubactionPath.data();
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.pedalAction));
+            strcpy_s(actionInfo.actionName, "start");
+            strcpy_s(actionInfo.localizedActionName, "Start");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.startAction));
+            strcpy_s(actionInfo.actionName, "coin");
+            strcpy_s(actionInfo.localizedActionName, "Coin");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.coinAction));
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -446,6 +475,8 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> menuClickPath;
         std::array<XrPath, Side::COUNT> bClickPath;
         std::array<XrPath, Side::COUNT> triggerValuePath;
+        std::array<XrPath, Side::COUNT> aClickPath;
+        std::array<XrPath, Side::COUNT> xClickPath;
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/select/click", &selectPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/select/click", &selectPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/squeeze/value", &squeezeValuePath[Side::LEFT]));
@@ -464,6 +495,10 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/b/click", &bClickPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/trigger/value", &triggerValuePath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/trigger/value", &triggerValuePath[Side::RIGHT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/a/click", &aClickPath[Side::LEFT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/a/click", &aClickPath[Side::RIGHT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/x/click", &xClickPath[Side::LEFT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/x/click", &xClickPath[Side::RIGHT]));
         // Suggest bindings for KHR Simple.
         {
             XrPath khrSimpleInteractionProfilePath;
@@ -495,7 +530,11 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.poseAction, posePath[Side::RIGHT]},
                                                             {m_input.quitAction, menuClickPath[Side::LEFT]},
                                                             {m_input.vibrateAction, hapticPath[Side::LEFT]},
-                                                            {m_input.vibrateAction, hapticPath[Side::RIGHT]}}};
+                                                            {m_input.vibrateAction, hapticPath[Side::RIGHT]},
+                                                            {m_input.triggerAction, triggerValuePath[Side::RIGHT]},
+                                                            {m_input.pedalAction, aClickPath[Side::RIGHT]},
+                                                            {m_input.startAction, bClickPath[Side::RIGHT]},
+                                                            {m_input.coinAction, xClickPath[Side::LEFT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             suggestedBindings.suggestedBindings = bindings.data();
@@ -805,6 +844,10 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.quitAction, "Quit");
                     LogActionSourceName(m_input.poseAction, "Pose");
                     LogActionSourceName(m_input.vibrateAction, "Vibrate");
+                    LogActionSourceName(m_input.triggerAction, "Trigger");
+                    LogActionSourceName(m_input.pedalAction, "Pedal");
+                    LogActionSourceName(m_input.startAction, "Start");
+                    LogActionSourceName(m_input.coinAction, "Coin");
                     break;
                 case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
                 default: {
@@ -911,6 +954,14 @@ struct OpenXrProgram : IOpenXrProgram {
         syncInfo.activeActionSets = &activeActionSet;
         CHECK_XRCMD(xrSyncActions(m_session, &syncInfo));
 
+        if (!m_loggedActionBindings && IsSessionFocused()) {
+            LogActionSourceName(m_input.triggerAction, "Trigger");
+            LogActionSourceName(m_input.pedalAction, "Pedal");
+            LogActionSourceName(m_input.startAction, "Start");
+            LogActionSourceName(m_input.coinAction, "Coin");
+            m_loggedActionBindings = true;
+        }
+
         // Get pose and grab action state and start haptic vibrate when hand is 90% squeezed.
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
             XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -940,6 +991,30 @@ struct OpenXrProgram : IOpenXrProgram {
             CHECK_XRCMD(xrGetActionStatePose(m_session, &getInfo, &poseState));
             m_input.handActive[hand] = poseState.isActive;
         }
+
+        XrActionStateGetInfo triggerInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.triggerAction,
+                                         m_input.handSubactionPath[Side::RIGHT]};
+        XrActionStateFloat triggerValue{XR_TYPE_ACTION_STATE_FLOAT};
+        CHECK_XRCMD(xrGetActionStateFloat(m_session, &triggerInfo, &triggerValue));
+        bool const triggerPressed = triggerValue.isActive == XR_TRUE && triggerValue.currentState > 0.5f;
+        auto reportDigital = [](const char *id, bool pressed, bool &previous) {
+            if (pressed != previous) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_M6 %s=%s", id, pressed ? "pressed" : "released"));
+                previous = pressed;
+            }
+            arcadexr::input::SetDigital(id, pressed);
+        };
+        reportDigital("trigger", triggerPressed, m_input.lastTrigger);
+
+        auto readButton = [this](XrAction action, int hand) {
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, action, m_input.handSubactionPath[hand]};
+            XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+            CHECK_XRCMD(xrGetActionStateBoolean(m_session, &info, &state));
+            return state.isActive == XR_TRUE && state.currentState == XR_TRUE;
+        };
+        reportDigital("pedal", readButton(m_input.pedalAction, Side::RIGHT), m_input.lastPedal);
+        reportDigital("start", readButton(m_input.startAction, Side::RIGHT), m_input.lastStart);
+        reportDigital("coin", readButton(m_input.coinAction, Side::LEFT), m_input.lastCoin);
 
         // There were no subaction paths specified for the quit action, because we don't care which hand did it.
         XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.quitAction, XR_NULL_PATH};
@@ -1131,6 +1206,7 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_supportsDepthLayer{false};
     bool m_loggedFirstEndFrame{false};
     bool m_loggedValidHeadPose{false};
+    bool m_loggedActionBindings{false};
     std::array<bool, Side::COUNT> m_loggedValidHandPose{{false, false}};
 
     std::vector<XrViewConfigurationView> m_configViews;
