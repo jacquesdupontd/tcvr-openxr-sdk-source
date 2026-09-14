@@ -1135,6 +1135,17 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_scene.SetImmersiveDepth(arcadexr::config::GetInt("immersive.depthTest", 1) != 0,
                                   arcadexr::config::GetFloat("immersive.depthBias", 4e-8f));
         m_scene.SetFogVoid(arcadexr::config::GetInt("immersive.fogVoid", 1) != 0);
+        {
+            // immersive.void = game | fog | r,g,b ; immersive.hudBand = top,bottom (fractions)
+            const std::string v = arcadexr::config::GetString("immersive.void", "fog");
+            unsigned r = 0, g = 0, b = 0;
+            if (v == "game") m_scene.SetVoid(0, 0, 0, 0);
+            else if (std::sscanf(v.c_str(), "%u,%u,%u", &r, &g, &b) == 3) m_scene.SetVoid(2, r & 255, g & 255, b & 255);
+            else m_scene.SetVoid(1, 0, 0, 0);
+            float top = 0.16f, bottom = 0.84f;
+            const std::string band = arcadexr::config::GetString("immersive.hudBand", "0.16,0.84");
+            if (std::sscanf(band.c_str(), "%f,%f", &top, &bottom) == 2) m_scene.SetHudBand(top, bottom);
+        }
         // Render once per emulated frame, not once per XR frame: at 120 Hz x 2
         // eyes x 1680x1760 x 3 passes the full-rate rendering starved the
         // emulator (MAME 53 -> 33 fps, scene rate down to 10/s). Between two
