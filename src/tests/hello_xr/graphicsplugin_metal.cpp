@@ -306,7 +306,7 @@ struct MetalGraphicsPlugin : public IGraphicsPlugin {
         return ret;
     }
 
-    void RenderView(const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
+    void RenderView(uint32_t /*viewIndex*/, const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
                     int64_t swapchainFormat, const std::vector<Cube>& cubes) override {
         auto pAutoReleasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 

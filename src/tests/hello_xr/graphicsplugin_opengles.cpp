@@ -909,7 +909,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         return ret;
     }
 
-    void RenderView(const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
+    void RenderView(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
                     int64_t swapchainFormat, const std::vector<Cube>& cubes) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
         UNUSED_PARM(swapchainFormat);                    // Not used in this function for now.
@@ -941,7 +941,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glClearDepthf(1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
-        RenderArcadeScreen(layerView);
+        RenderArcadeScreen(viewIndex, layerView);
 
         // Set shaders and uniform variables.
         glUseProgram(m_program);
@@ -1023,7 +1023,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    void RenderArcadeScreen(const XrCompositionLayerProjectionView& layerView) {
+    void RenderArcadeScreen(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView) {
+        CHECK(viewIndex < 2);
         // render=gpu: the true-3D path. Recording in the emulator is switched
         // on only while someone reads the scene.
         const bool gpuRender = arcadexr::config::GetString("render", "cpu") == "gpu";
@@ -1159,7 +1160,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUseProgram(m_screenProgram);
         glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_sceneActive ? m_sceneTex[EyeIndex(layerView)] : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
+        glBindTexture(GL_TEXTURE_2D, m_sceneActive ? m_sceneTex[viewIndex] : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
+        if (m_sceneActive && !m_loggedEyeRoute[viewIndex]) {
+            m_loggedEyeRoute[viewIndex] = true;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M14 projection view %u samples scene eye %u texture=%u",
+                viewIndex, viewIndex, m_sceneTex[viewIndex]));
+        }
         glUniform1i(m_screenTextureUniformLocation, 0);
         const auto aim = arcadexr::gun::GetAimState();
         glUniform2f(m_screenAimPointUniformLocation, aim.normalized_x, aim.normalized_y);
@@ -1171,11 +1177,6 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
         glFrontFace(GL_CW);
-    }
-
-    // Left eye: the outer edge of the field of view is on the left.
-    static int EyeIndex(const XrCompositionLayerProjectionView& layerView) {
-        return (std::fabs(layerView.fov.angleLeft) > std::fabs(layerView.fov.angleRight)) ? 0 : 1;
     }
 
     // render=gpu: rasterise the recorded scene on the GPU, once per emulated
@@ -1497,6 +1498,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     arcadexr::hardware::namco_system22::SceneRenderer m_scene;
     bool m_sceneInit{false};
     bool m_sceneActive{false};
+    bool m_loggedEyeRoute[2]{false, false};
     int m_sceneEnabled{-1};
     GLuint m_sceneTex[2]{0, 0};
     int m_sceneW{0};

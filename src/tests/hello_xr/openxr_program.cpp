@@ -1496,7 +1496,10 @@ struct OpenXrProgram : IOpenXrProgram {
 
             const XrSwapchainImageBaseHeader* const swapchainImage =
                 m_swapchainImages[viewSwapchain.handle]->GetGenericColorImage(swapchainImageIndex);
-            m_graphicsPlugin->RenderView(projectionLayerViews[i], swapchainImage, m_colorSwapchainFormat, cubes);
+            // Keep the projection-view identity explicit all the way into the
+            // graphics backend. FOV asymmetry is not an eye identifier: on a
+            // symmetric headset it can select the same eye texture twice.
+            m_graphicsPlugin->RenderView(i, projectionLayerViews[i], swapchainImage, m_colorSwapchainFormat, cubes);
 
             XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             CHECK_XRCMD(xrReleaseSwapchainImage(viewSwapchain.handle, &releaseInfo));

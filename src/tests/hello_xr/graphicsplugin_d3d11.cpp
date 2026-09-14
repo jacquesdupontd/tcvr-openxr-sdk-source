@@ -270,7 +270,7 @@ struct D3D11GraphicsPlugin : public IGraphicsPlugin {
         return depthStencilView;
     }
 
-    void RenderView(const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
+    void RenderView(uint32_t /*viewIndex*/, const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
                     int64_t /* swapchainFormat */, const std::vector<Cube>& cubes) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
 
