@@ -14,6 +14,7 @@
 #include <common/xr_linear.h>
 #include "framebuffer_bridge.h"
 #include "scene_bridge.h"
+#include "menu.h"
 #include "stereo_renderer.h"
 #include <chrono>
 #include <cmath>
@@ -479,6 +480,27 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     void InitializeResources() {
         s_self = this;
         arcadexr::gun::SetSceneAim(&SceneAimTrampoline);
+        {
+            static const char* vs = R"_(#version 320 es
+                in vec3 VertexPos; in vec2 TexCoord; out vec2 uv; uniform mat4 Mvp;
+                void main() { gl_Position = Mvp * vec4(VertexPos, 1.0); uv = TexCoord; })_";
+            static const char* fs = R"_(#version 320 es
+                precision mediump float; in vec2 uv; uniform sampler2D Tex; out vec4 color;
+                void main() { color = texture(Tex, uv); })_";
+            GLuint v = glCreateShader(GL_VERTEX_SHADER); glShaderSource(v, 1, &vs, nullptr); glCompileShader(v); CheckShader(v);
+            GLuint f = glCreateShader(GL_FRAGMENT_SHADER); glShaderSource(f, 1, &fs, nullptr); glCompileShader(f); CheckShader(f);
+            m_menuProgram = glCreateProgram(); glAttachShader(m_menuProgram, v); glAttachShader(m_menuProgram, f); glLinkProgram(m_menuProgram); CheckProgram(m_menuProgram);
+            glDeleteShader(v); glDeleteShader(f);
+            m_menuMvpLocation = glGetUniformLocation(m_menuProgram, "Mvp");
+            m_menuTexLocation = glGetUniformLocation(m_menuProgram, "Tex");
+            glGenTextures(1, &m_menuTexture);
+            glBindTexture(GL_TEXTURE_2D, m_menuTexture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
         glGenFramebuffers(1, &m_swapchainFramebuffer);
 
         GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
@@ -1026,8 +1048,53 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
                 glBindVertexArray(0);
             }
         }
+        RenderMenu(pose, vp);
         glUseProgram(0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    // The menu panel: world-locked 1.3 m in front of where the head was when it
+    // opened, drawn last, over everything, with the screen quad's geometry.
+    void RenderMenu(const XrPosef& eyePose, const XrMatrix4x4f& vp) {
+        auto& menu = arcadexr::ui::Menu::Get();
+        if (!menu.IsOpen()) { m_menuPoseValid = false; return; }
+        if (!m_menuPoseValid) {
+            const XrVector3f ahead{0.0f, 0.0f, -1.3f};
+            XrVector3f offset;
+            XrQuaternionf_RotateVector3f(&offset, &eyePose.orientation, &ahead);
+            m_menuPose.orientation = eyePose.orientation;
+            m_menuPose.position = {eyePose.position.x + offset.x, eyePose.position.y + offset.y, eyePose.position.z + offset.z};
+            m_menuPoseValid = true;
+        }
+        std::vector<unsigned char> rgba;
+        int w = 0, h = 0;
+        if (menu.Render(rgba, w, h)) {
+            glBindTexture(GL_TEXTURE_2D, m_menuTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_menuAspect = float(w) / float(h);
+        }
+        XrMatrix4x4f model;
+        const XrVector3f scale{0.9f, 0.9f / m_menuAspect, 1.0f};
+        XrMatrix4x4f_CreateTranslationRotationScale(&model, &m_menuPose.position, &m_menuPose.orientation, &scale);
+        XrMatrix4x4f mvp;
+        XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(m_menuProgram);
+        glUniformMatrix4fv(m_menuMvpLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_menuTexture);
+        glUniform1i(m_menuTexLocation, 0);
+        glBindVertexArray(m_screenVao);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        glBindVertexArray(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
     }
 
     bool RenderImmersiveArcadeScene(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
@@ -1834,6 +1901,13 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     arcadexr::gun::Vec3 m_anchorCamera{}, m_anchorRight{}, m_anchorUp{}, m_anchorNormal{};
     float m_anchorScale{1.0f};
     GLuint m_immersiveTex[2]{0, 0};
+    GLuint m_menuProgram{0};
+    GLuint m_menuTexture{0};
+    GLint m_menuMvpLocation{-1};
+    GLint m_menuTexLocation{-1};
+    bool m_menuPoseValid{false};
+    XrPosef m_menuPose{};
+    float m_menuAspect{1.6f};
     GLuint m_immersiveAa[2]{0, 0};
     int m_immersiveAaW{0};
     int m_immersiveAaH{0};

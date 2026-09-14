@@ -68,6 +68,7 @@ if(ANDROID)
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/input/input_bridge.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/ray_plane_mapping.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/aim_state.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/ui/menu.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/gun/gun_mesh.cpp")
     endif()
     add_library(
@@ -82,7 +83,7 @@ if(ANDROID)
     )
 
     if(DEFINED TCVR_PROJECT_ROOT)
-        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video" "${TCVR_PROJECT_ROOT}/audio" "${TCVR_PROJECT_ROOT}/input" "${TCVR_PROJECT_ROOT}/gun" "${TCVR_PROJECT_ROOT}/config" "${TCVR_PROJECT_ROOT}/hardware/namco_system22")
+        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video" "${TCVR_PROJECT_ROOT}/audio" "${TCVR_PROJECT_ROOT}/input" "${TCVR_PROJECT_ROOT}/gun" "${TCVR_PROJECT_ROOT}/config" "${TCVR_PROJECT_ROOT}/hardware/namco_system22" "${TCVR_PROJECT_ROOT}/ui")
     endif()
 
     # Only for Android because it lacks a command line

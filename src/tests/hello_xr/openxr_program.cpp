@@ -13,6 +13,7 @@
 #include <common/xr_linear.h>
 #include "input_bridge.h"
 #include "aim_state.h"
+#include "menu.h"
 #include "xr_gun.h"
 #include "ray_plane_mapping.h"
 #include "virtual_screen.h"
@@ -479,6 +480,8 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction coinAction{XR_NULL_HANDLE};
         XrAction recenterScreenAction{XR_NULL_HANDLE};
         XrAction crosshairAction{XR_NULL_HANDLE};
+        XrAction menuToggleAction{XR_NULL_HANDLE};
+        XrAction menuNavAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<XrSpace, Side::COUNT> aimSpace{};
@@ -575,6 +578,14 @@ struct OpenXrProgram : IOpenXrProgram {
             strcpy_s(actionInfo.actionName, "crosshair_mode");
             strcpy_s(actionInfo.localizedActionName, "Cycle Crosshair Mode");
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.crosshairAction));
+            strcpy_s(actionInfo.actionName, "menu_toggle");
+            strcpy_s(actionInfo.localizedActionName, "Open Menu");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.menuToggleAction));
+            actionInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
+            strcpy_s(actionInfo.actionName, "menu_nav");
+            strcpy_s(actionInfo.localizedActionName, "Menu Navigation");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.menuNavAction));
+            actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -644,6 +655,9 @@ struct OpenXrProgram : IOpenXrProgram {
             XrPath oculusTouchInteractionProfilePath;
             CHECK_XRCMD(
                 xrStringToPath(m_instance, "/interaction_profiles/oculus/touch_controller", &oculusTouchInteractionProfilePath));
+            XrPath menuClickLeft = XR_NULL_PATH, thumbstickLeft = XR_NULL_PATH;
+            CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/menu/click", &menuClickLeft));
+            CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick", &thumbstickLeft));
             std::vector<XrActionSuggestedBinding> bindings{{{m_input.grabAction, squeezeValuePath[Side::LEFT]},
                                                             {m_input.grabAction, squeezeValuePath[Side::RIGHT]},
                                                             {m_input.poseAction, posePath[Side::LEFT]},
@@ -656,7 +670,9 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.startAction, bClickPath[Side::RIGHT]},
                                                             {m_input.coinAction, xClickPath[Side::LEFT]},
                                                             {m_input.recenterScreenAction, yClickPath[Side::LEFT]},
-                                                            {m_input.crosshairAction, thumbstickClickPath[Side::LEFT]}}};
+                                                            {m_input.crosshairAction, thumbstickClickPath[Side::LEFT]},
+                                                            {m_input.menuToggleAction, menuClickLeft},
+                                                            {m_input.menuNavAction, thumbstickLeft}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             bindings.push_back({m_input.aimAction, aimLeft});
@@ -1201,9 +1217,11 @@ struct OpenXrProgram : IOpenXrProgram {
             }
             arcadexr::input::SetDigital(id, pressed);
         };
-        m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld;
+        const bool menuOpen = arcadexr::ui::Menu::Get().IsOpen();
+        const bool triggerEdge = triggerPressed && !m_triggerHeld;
+        m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld && !menuOpen;
         // Recoil: one hard pulse per shot, on the hand that holds the gun.
-        if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease) {
+        if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen) {
             const int ms = arcadexr::config::GetInt("haptics.ms", 120);
             if (ms > 0) {
                 XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
@@ -1217,7 +1235,34 @@ struct OpenXrProgram : IOpenXrProgram {
             }
         }
         m_triggerHeld = triggerPressed;
-        reportDigital("trigger", triggerPressed && !m_calibrating && !m_blockTriggerUntilRelease, m_input.lastTrigger);
+        reportDigital("trigger", triggerPressed && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen, m_input.lastTrigger);
+        // The menu: left menu button opens and closes it, the left thumbstick
+        // moves and cycles, the trigger validates. Opened once at startup.
+        {
+            auto& menu = arcadexr::ui::Menu::Get();
+            menu.OpenAtStartupOnce();
+            {
+                XrActionStateGetInfo tgl{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuToggleAction, XR_NULL_PATH};
+                XrActionStateBoolean tglState{XR_TYPE_ACTION_STATE_BOOLEAN};
+                if (XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &tgl, &tglState)) && tglState.isActive && tglState.changedSinceLastSync && tglState.currentState) menu.Toggle();
+            }
+            if (menu.IsOpen()) {
+                XrActionStateGetInfo navInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuNavAction, XR_NULL_PATH};
+                XrActionStateVector2f nav{XR_TYPE_ACTION_STATE_VECTOR2F};
+                if (XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &navInfo, &nav)) && nav.isActive) {
+                    const float x = nav.currentState.x, y = nav.currentState.y;
+                    if (!m_menuNavHeld) {
+                        if (y > 0.6f) { menu.MoveRow(-1); m_menuNavHeld = true; }
+                        else if (y < -0.6f) { menu.MoveRow(1); m_menuNavHeld = true; }
+                        else if (x > 0.6f) { menu.CycleValue(1); m_menuNavHeld = true; }
+                        else if (x < -0.6f) { menu.CycleValue(-1); m_menuNavHeld = true; }
+                    } else if (std::fabs(x) < 0.3f && std::fabs(y) < 0.3f) {
+                        m_menuNavHeld = false;
+                    }
+                }
+                if (triggerEdge) menu.Activate();
+            }
+        }
 
         auto readButton = [this](XrAction action, int hand) {
             XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, action, m_input.handSubactionPath[hand]};
@@ -1626,6 +1671,7 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_captureCalibration{false};
     bool m_triggerHeld{false};
     bool m_blockTriggerUntilRelease{false};
+    bool m_menuNavHeld{false};
     XrQuaternionf m_gunCalibration{0, 0, 0, 1};
     bool m_gunStateKnown{false};
     bool m_lastGunOnScreen{false};
