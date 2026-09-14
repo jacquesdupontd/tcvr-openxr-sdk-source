@@ -1132,14 +1132,64 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f hudMvp;
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
 
-        const auto begin = std::chrono::steady_clock::now();
         m_scene.SetImmersiveDepth(arcadexr::config::GetInt("immersive.depthTest", 1) != 0,
                                   arcadexr::config::GetFloat("immersive.depthBias", 4e-8f));
-        const bool rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, colorTexture,
-                                                layerView.subImage.imageRect.extent.width,
-                                                layerView.subImage.imageRect.extent.height,
-                                                reinterpret_cast<const float*>(&mvp),
-                                                reinterpret_cast<const float*>(&hudMvp));
+        m_scene.SetFogVoid(arcadexr::config::GetInt("immersive.fogVoid", 1) != 0);
+        // Render once per emulated frame, not once per XR frame: at 120 Hz x 2
+        // eyes x 1680x1760 x 3 passes the full-rate rendering starved the
+        // emulator (MAME 53 -> 33 fps, scene rate down to 10/s). Between two
+        // emulated frames the eye keeps the image and the pose it was rendered
+        // with; the compositor reprojects the rotation from that pose.
+        float renderScale = arcadexr::config::GetFloat("immersive.scale", 0.75f);
+        renderScale = std::max(0.3f, std::min(1.0f, renderScale));
+        const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
+        const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
+        if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
+            for (int e = 0; e < 2; ++e) {
+                if (!m_immersiveTex[e]) glGenTextures(1, &m_immersiveTex[e]);
+                glBindTexture(GL_TEXTURE_2D, m_immersiveTex[e]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                m_immersiveHasImage[e] = false;
+            }
+            glBindTexture(GL_TEXTURE_2D, 0);
+            if (!m_immersiveBlitFbo) glGenFramebuffers(1, &m_immersiveBlitFbo);
+            m_immersiveTexW = rw;
+            m_immersiveTexH = rh;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M15 immersive render scale %.2f -> %dx%d per eye", renderScale, rw, rh));
+        }
+        const bool everyFrame = arcadexr::config::GetInt("immersive.everyFrame", 0) != 0;
+        bool rendered = false;
+        const auto begin = std::chrono::steady_clock::now();
+        if (everyFrame || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
+            rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, m_immersiveTex[viewIndex], rw, rh,
+                                         reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp));
+            if (rendered) {
+                m_immersiveRenderedSeq[viewIndex] = frame->sequence;
+                m_immersivePose[viewIndex] = layerView.pose;
+                m_immersiveFov[viewIndex] = layerView.fov;
+                m_immersiveHasImage[viewIndex] = true;
+                ++m_immersiveRenders;
+            }
+        } else {
+            // Same image as last time: tell the compositor which pose it was made
+            // for, so its reprojection is right. The struct we were handed is the
+            // one the program submits after this call.
+            auto& submitted = const_cast<XrCompositionLayerProjectionView&>(layerView);
+            submitted.pose = m_immersivePose[viewIndex];
+            submitted.fov = m_immersiveFov[viewIndex];
+            rendered = true;
+        }
+        if (rendered) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveTex[viewIndex], 0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+            glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
+                              layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH,
+                              GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
         const auto end = std::chrono::steady_clock::now();
         m_immersiveDrawMs += std::chrono::duration<double, std::milli>(end - begin).count();
         ++m_immersiveViews;
@@ -1159,8 +1209,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (rendered && (!m_loggedImmersiveRoute[viewIndex] || m_immersiveViews % 1200 == 0)) {
             m_loggedImmersiveRoute[viewIndex] = true;
             Log::Write(Log::Level::Info, Fmt(
-                "TCVR_M15 immersive view=%u seq=%llu target=%ux%u depth=%.1f scale=%.8f prep_avg=%.2fms submit_avg=%.2fms",
-                viewIndex, static_cast<unsigned long long>(frame->sequence),
+                "TCVR_M15 immersive view=%u seq=%llu renders=%u target=%ux%u depth=%.1f scale=%.8f prep_avg=%.2fms submit_avg=%.2fms",
+                viewIndex, static_cast<unsigned long long>(frame->sequence), m_immersiveRenders,
                 layerView.subImage.imageRect.extent.width, layerView.subImage.imageRect.extent.height,
                 depthUnits, worldScale,
                 m_immersivePreparedFrames ? m_immersivePrepMs / m_immersivePreparedFrames : 0.0,
@@ -1654,6 +1704,15 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     std::string m_sceneSignature;
     std::string m_sceneDumpTag;
     const tcvr_scene_frame* m_immersiveFrame{nullptr};
+    GLuint m_immersiveTex[2]{0, 0};
+    GLuint m_immersiveBlitFbo{0};
+    std::uint64_t m_immersiveRenderedSeq[2]{0, 0};
+    XrPosef m_immersivePose[2]{};
+    XrFovf m_immersiveFov[2]{};
+    bool m_immersiveHasImage[2]{false, false};
+    unsigned m_immersiveRenders{0};
+    int m_immersiveTexW{0};
+    int m_immersiveTexH{0};
     std::uint64_t m_immersivePreparedSequence{0};
     double m_immersivePrepMs{0};
     double m_immersiveDrawMs{0};
