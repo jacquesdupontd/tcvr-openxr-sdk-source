@@ -482,6 +482,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction crosshairAction{XR_NULL_HANDLE};
         XrAction menuToggleAction{XR_NULL_HANDLE};
         XrAction menuNavAction{XR_NULL_HANDLE};
+        XrAction driveShiftAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<XrSpace, Side::COUNT> aimSpace{};
@@ -585,6 +586,9 @@ struct OpenXrProgram : IOpenXrProgram {
             strcpy_s(actionInfo.actionName, "menu_nav");
             strcpy_s(actionInfo.localizedActionName, "Menu Navigation");
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.menuNavAction));
+            strcpy_s(actionInfo.actionName, "drive_shift");
+            strcpy_s(actionInfo.localizedActionName, "Gear Shift");
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.driveShiftAction));
             actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
         }
 
@@ -658,6 +662,8 @@ struct OpenXrProgram : IOpenXrProgram {
             XrPath menuClickLeft = XR_NULL_PATH, thumbstickLeft = XR_NULL_PATH;
             CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/menu/click", &menuClickLeft));
             CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick", &thumbstickLeft));
+            XrPath thumbstickRight = XR_NULL_PATH;
+            CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/thumbstick", &thumbstickRight));
             std::vector<XrActionSuggestedBinding> bindings{{{m_input.grabAction, squeezeValuePath[Side::LEFT]},
                                                             {m_input.grabAction, squeezeValuePath[Side::RIGHT]},
                                                             {m_input.poseAction, posePath[Side::LEFT]},
@@ -672,7 +678,8 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.recenterScreenAction, yClickPath[Side::LEFT]},
                                                             {m_input.crosshairAction, thumbstickClickPath[Side::LEFT]},
                                                             {m_input.menuToggleAction, menuClickLeft},
-                                                            {m_input.menuNavAction, thumbstickLeft}}};
+                                                            {m_input.menuNavAction, thumbstickLeft},
+                                                            {m_input.driveShiftAction, thumbstickRight}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             bindings.push_back({m_input.aimAction, aimLeft});
@@ -1240,7 +1247,7 @@ struct OpenXrProgram : IOpenXrProgram {
         // moves and cycles, the trigger validates. Opened once at startup.
         {
             auto& menu = arcadexr::ui::Menu::Get();
-            menu.OpenAtStartupOnce();
+            menu.OpenSelectorOnce(!arcadexr::mame::EmulatorStarted());
             {
                 XrActionStateGetInfo tgl{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuToggleAction, XR_NULL_PATH};
                 XrActionStateBoolean tglState{XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -1457,6 +1464,7 @@ struct OpenXrProgram : IOpenXrProgram {
         arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating,false});
         arcadexr::gun::GunPoses gunPoses;
         bool gunTracked = false;
+        m_handValid[Side::LEFT] = m_handValid[Side::RIGHT] = false;
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
             XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
             get.action = m_input.aimAction;
@@ -1488,6 +1496,8 @@ struct OpenXrProgram : IOpenXrProgram {
             }
             const XrQuaternionf identity{0,0,0,1};
             const XrPosef pose = arcadexr::gun::GunPose(location.pose, hand == Side::RIGHT ? m_gunCalibration : identity);
+            m_handPose[hand] = location.pose;
+            m_handValid[hand] = true;
             // Time Crisis has one gun. Drawing a second in the off hand was
             // wrong, and it is the aiming hand that carries it.
             const bool drawThisHand = (hand == Side::RIGHT) || m_gunBothHands;
@@ -1526,6 +1536,52 @@ struct OpenXrProgram : IOpenXrProgram {
             const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
                                                     (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating));
             arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
+            // Driving profile (System 22 racers): the wheel is the angle between
+            // the two hands, or the roll of the right hand alone; gas is the
+            // trigger, brake the grip, gears the right thumbstick.
+            {
+                const std::string profile = arcadexr::config::GetString("input.profile", "auto");
+                const bool wheel = profile == "wheel" || (profile == "auto" && arcadexr::config::GetString("game", "timecris") == "dirtdash");
+                if (wheel) {
+                    const float maxDeg = std::max(10.0f, arcadexr::config::GetFloat("driving.maxAngle", 60.0f));
+                    const float invert = arcadexr::config::GetInt("driving.invert", 0) ? -1.0f : 1.0f;
+                    float angle = 0.0f;
+                    if (m_handValid[Side::LEFT]) {
+                        const float dx = m_handPose[Side::RIGHT].position.x - m_handPose[Side::LEFT].position.x;
+                        const float dy = m_handPose[Side::RIGHT].position.y - m_handPose[Side::LEFT].position.y;
+                        const float dz = m_handPose[Side::RIGHT].position.z - m_handPose[Side::LEFT].position.z;
+                        angle = std::atan2(dy, std::sqrt(dx * dx + dz * dz));   // right hand higher = turning left
+                    } else {
+                        const XrVector3f xAxis{1.0f, 0.0f, 0.0f};
+                        XrVector3f r;
+                        XrQuaternionf_RotateVector3f(&r, &m_handPose[Side::RIGHT].orientation, &xAxis);
+                        angle = std::asin(std::max(-1.0f, std::min(1.0f, r.y)));
+                    }
+                    const float steer = 0.5f - invert * (angle / (maxDeg * 3.14159265f / 180.0f)) * 0.5f;
+                    arcadexr::input::SetAnalog("steer", std::max(0.0f, std::min(1.0f, steer)));
+                    XrActionStateGetInfo gasInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.triggerAction, m_input.handSubactionPath[Side::RIGHT]};
+                    XrActionStateFloat gas{XR_TYPE_ACTION_STATE_FLOAT};
+                    float gasValue = 0.0f;
+                    if (XR_SUCCEEDED(xrGetActionStateFloat(m_session, &gasInfo, &gas)) && gas.isActive == XR_TRUE && !arcadexr::ui::Menu::Get().IsOpen()) gasValue = gas.currentState;
+                    arcadexr::input::SetAnalog("gas", gasValue);
+                    XrActionStateGetInfo grabInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.grabAction, m_input.handSubactionPath[Side::RIGHT]};
+                    XrActionStateFloat grab{XR_TYPE_ACTION_STATE_FLOAT};
+                    float brake = 0.0f;
+                    if (XR_SUCCEEDED(xrGetActionStateFloat(m_session, &grabInfo, &grab)) && grab.isActive == XR_TRUE) brake = grab.currentState;
+                    arcadexr::input::SetAnalog("brake", brake);
+                    XrActionStateGetInfo shiftInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.driveShiftAction, XR_NULL_PATH};
+                    XrActionStateVector2f shift{XR_TYPE_ACTION_STATE_VECTOR2F};
+                    if (XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &shiftInfo, &shift)) && shift.isActive == XR_TRUE) {
+                        const float y = shift.currentState.y;
+                        if (!m_shiftHeld && std::fabs(y) > 0.6f) { m_shiftHeld = true; m_shiftPulse = 8; m_shiftDir = (y > 0.0f) ? 1 : -1; }
+                        else if (m_shiftHeld && std::fabs(y) < 0.3f) m_shiftHeld = false;
+                    }
+                    arcadexr::input::SetDigital("shift_up", m_shiftPulse > 0 && m_shiftDir > 0);
+                    arcadexr::input::SetDigital("shift_down", m_shiftPulse > 0 && m_shiftDir < 0);
+                    if (m_shiftPulse > 0) --m_shiftPulse;
+                    if (!m_loggedWheel) { m_loggedWheel = true; Log::Write(Log::Level::Info, Fmt("TCVR_M17 driving profile active (%s hands)", m_handValid[Side::LEFT] ? "two" : "one")); }
+                }
+            }
             // Arcade Screen draws the reticle in its quad shader. Immersive
             // presentation has no quad, so put the same aiming truth on the
             // invisible game projection plane as a small world-space marker.
@@ -1672,6 +1728,12 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_triggerHeld{false};
     bool m_blockTriggerUntilRelease{false};
     bool m_menuNavHeld{false};
+    XrPosef m_handPose[Side::COUNT]{};
+    bool m_handValid[Side::COUNT]{false, false};
+    int m_shiftPulse{0};
+    int m_shiftDir{0};
+    bool m_shiftHeld{false};
+    bool m_loggedWheel{false};
     XrQuaternionf m_gunCalibration{0, 0, 0, 1};
     bool m_gunStateKnown{false};
     bool m_lastGunOnScreen{false};
