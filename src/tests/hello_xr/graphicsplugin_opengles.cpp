@@ -529,11 +529,22 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void RenderArcadeScreen(const XrCompositionLayerProjectionView& layerView) {
+        // The XR presentation clock runs far faster than the arcade clock, and
+        // is deliberately not tied to it: between two emulated frames the screen
+        // simply keeps the texture it already has. Asking what the latest frame
+        // IS costs nothing; copying it costs a full framebuffer memcpy, under a
+        // mutex shared with the emulator thread, once per eye. Paying that on
+        // every XR frame starved the emulator.
         arcadexr::video::FrameInfo info;
-        if (!arcadexr::video::CopyLatestFrame(m_framePixels, info)) {
+        if (!arcadexr::video::PeekLatestFrameInfo(info)) {
             return;
         }
-        if (info.sequence != m_lastFrameSequence || info.width != m_frameWidth || info.height != m_frameHeight) {
+        const bool haveNewFrame =
+            info.sequence != m_lastFrameSequence || info.width != m_frameWidth || info.height != m_frameHeight;
+        if (haveNewFrame && !arcadexr::video::CopyLatestFrame(m_framePixels, info)) {
+            return;
+        }
+        if (haveNewFrame) {
             m_frameWidth = info.width;
             m_frameHeight = info.height;
             m_lastFrameSequence = info.sequence;

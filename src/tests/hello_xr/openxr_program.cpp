@@ -17,6 +17,7 @@
 #include "ray_plane_mapping.h"
 #include "virtual_screen.h"
 #include "space_debug.h"
+#include "display_refresh.h"
 #include <array>
 #include <cmath>
 #include <set>
@@ -207,6 +208,22 @@ struct OpenXrProgram : IOpenXrProgram {
             m_supportsDepthLayer = true;
         } else {
             Log::Write(Log::Level::Info, Fmt("Depth submission NOT supported (%s)", XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME));
+        }
+
+        // Presentation rate control. Optional: without it the runtime simply
+        // keeps whatever rate it chose, and the emulator is unaffected either
+        // way -- the arcade clock never depends on the presentation clock.
+        const char* refreshExtension = arcadexr::xr::RefreshExtensionName();
+        auto refreshProperties =
+            std::find_if(extensionProperties.begin(), extensionProperties.end(), [refreshExtension](const XrExtensionProperties& item) {
+                return 0 == strcmp(item.extensionName, refreshExtension);
+            });
+        if (refreshProperties != extensionProperties.end()) {
+            extensions.push_back(refreshProperties->extensionName);
+            m_supportsDisplayRefreshRate = true;
+            Log::Write(Log::Level::Info, Fmt("Display refresh rate control supported (%s)", refreshExtension));
+        } else {
+            Log::Write(Log::Level::Info, Fmt("Display refresh rate control NOT supported (%s)", refreshExtension));
         }
 
         XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -687,6 +704,8 @@ struct OpenXrProgram : IOpenXrProgram {
             m_appSpaceTypeEnum = referenceSpaceCreateInfo.referenceSpaceType;
             m_appSpaceType = to_string(referenceSpaceCreateInfo.referenceSpaceType);
         }
+
+
     }
 
     void CreateSwapchains() override {
@@ -871,6 +890,10 @@ struct OpenXrProgram : IOpenXrProgram {
                     HandleSessionStateChangedEvent(sessionStateChangedEvent, exitRenderLoop, requestRestart);
                     break;
                 }
+                case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
+                    arcadexr::xr::OnRuntimeRateChanged(
+                        reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(event)->toDisplayRefreshRate);
+                    break;
                 case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
                     LogActionSourceName(m_input.grabAction, "Grab");
                     LogActionSourceName(m_input.quitAction, "Quit");
@@ -930,6 +953,10 @@ struct OpenXrProgram : IOpenXrProgram {
                 sessionBeginInfo.primaryViewConfigurationType = m_viewConfigType;
                 CHECK_XRCMD(xrBeginSession(m_session, &sessionBeginInfo));
                 m_sessionRunning = true;
+                // Only now does the runtime answer xrEnumerateDisplayRefreshRatesFB:
+                // asked before xrBeginSession it reports an empty list and 0 Hz.
+                arcadexr::xr::Initialize(m_instance, m_session, m_supportsDisplayRefreshRate);
+                arcadexr::xr::ApplyConfiguredMode();
                 break;
             }
             case XR_SESSION_STATE_STOPPING: {
@@ -1104,6 +1131,7 @@ struct OpenXrProgram : IOpenXrProgram {
         }
 
         m_lastDisplayTime = frameState.predictedDisplayTime;
+        arcadexr::xr::RetryWhileUnknown();
         XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
         frameEndInfo.environmentBlendMode = m_blendMode;
@@ -1340,6 +1368,7 @@ struct OpenXrProgram : IOpenXrProgram {
 
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
+    bool m_supportsDisplayRefreshRate{false};
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
     XrTime m_recenterTime{0};
