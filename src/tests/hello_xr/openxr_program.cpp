@@ -20,7 +20,10 @@
 #include "display_refresh.h"
 #include "audio_bridge.h"
 #include "settings.h"
+#include "xr_performance.h"
 #include <array>
+#include <unistd.h>
+#include "mame_boot_probe.h"
 #include <cmath>
 #include <set>
 
@@ -211,6 +214,35 @@ struct OpenXrProgram : IOpenXrProgram {
         } else {
             Log::Write(Log::Level::Info, Fmt("Depth submission NOT supported (%s)", XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME));
         }
+
+        // Print what the runtime actually offers. Guessing which extension is
+        // available, and why one is missing, has cost more time on this project
+        // than reading the list ever would.
+        {
+            std::string all;
+            for (const XrExtensionProperties& item : extensionProperties) {
+                if (!all.empty()) all += " ";
+                all += item.extensionName;
+            }
+            Log::Write(Log::Level::Info, Fmt("TCVR_M13 runtime offers %u extensions: %s",
+                                             (unsigned)extensionProperties.size(), all.c_str()));
+        }
+
+        auto enableIfPresent = [&extensionProperties, &extensions](const char* name) {
+            auto found = std::find_if(extensionProperties.begin(), extensionProperties.end(),
+                                      [name](const XrExtensionProperties& item) {
+                                          return 0 == strcmp(item.extensionName, name);
+                                      });
+            if (found == extensionProperties.end()) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_M13 %s NOT offered", name));
+                return false;
+            }
+            extensions.push_back(found->extensionName);
+            Log::Write(Log::Level::Info, Fmt("TCVR_M13 %s enabled", name));
+            return true;
+        };
+        m_supportsPerformanceSettings = enableIfPresent(arcadexr::xr::PerformanceExtensionName());
+        m_supportsThreadSettings = enableIfPresent(arcadexr::xr::ThreadSettingsExtensionName());
 
         // Presentation rate control. Optional: without it the runtime simply
         // keeps whatever rate it chose, and the emulator is unaffected either
@@ -996,6 +1028,17 @@ struct OpenXrProgram : IOpenXrProgram {
                 // asked before xrBeginSession it reports an empty list and 0 Hz.
                 arcadexr::xr::Initialize(m_instance, m_session, m_supportsDisplayRefreshRate);
                 arcadexr::xr::ApplyConfiguredMode();
+                arcadexr::xr::InitializePerformance(m_instance, m_session, m_supportsPerformanceSettings,
+                                                    m_supportsThreadSettings);
+                arcadexr::xr::RequestSustainedPerformance();
+                // This thread runs the frame loop; the runtime should know it.
+                arcadexr::xr::DeclareThread(XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR, (uint32_t)gettid(),
+                                            "xr frame loop");
+                // And the emulator's thread, which is the one whose stalls are heard.
+                if (const uint32_t emulator = arcadexr::mame::EmulatorThreadId()) {
+                    arcadexr::xr::DeclareThread(XR_ANDROID_THREAD_TYPE_APPLICATION_MAIN_KHR, emulator,
+                                                "emulator");
+                }
                 break;
             }
             case XR_SESSION_STATE_STOPPING: {
@@ -1468,6 +1511,8 @@ struct OpenXrProgram : IOpenXrProgram {
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
     bool m_supportsDisplayRefreshRate{false};
+    bool m_supportsPerformanceSettings{false};
+    bool m_supportsThreadSettings{false};
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
     enum class CrosshairMode { Visible, CalibrationOnly, Hidden };
