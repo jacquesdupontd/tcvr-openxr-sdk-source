@@ -18,6 +18,7 @@
 #include "aim_state.h"
 #include "gun_model.h"
 #include <cstring>
+#include <cstdio>
 
 #ifndef GL_BGRA_EXT
 #define GL_BGRA_EXT 0x80E1
@@ -254,6 +255,43 @@ static const char* GunFragmentShaderGlsl = R"_(#version 320 es
     void main() { FragColor = vec4(GunColor, 1.0); }
     )_";
 
+// Edge-aware pass: FXAA over the upscaled image. Bicubic reconstruction turns
+// each source texel into a smooth 4x4 block, but a polygon or glyph edge is
+// still a staircase at that 4-pixel scale. FXAA finds high-contrast edges by
+// luma, walks along them and blends across, so the staircase softens while a
+// textured surface -- low contrast between neighbours -- is left alone. Nine
+// taps; it runs at the arcade rate, not the presentation rate.
+static const char* EdgeFragmentShaderGlsl = R"_(#version 320 es
+    precision highp float;
+    in vec2 PSTexCoord;
+    uniform sampler2D SourceTexture;
+    uniform vec2 TargetSize;
+    out vec4 FragColor;
+    float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+    void main() {
+        vec2 rcp = 1.0 / TargetSize;
+        vec2 uv = PSTexCoord;
+        vec3 rgbNW = texture(SourceTexture, uv + vec2(-1.0, -1.0) * rcp).rgb;
+        vec3 rgbNE = texture(SourceTexture, uv + vec2( 1.0, -1.0) * rcp).rgb;
+        vec3 rgbSW = texture(SourceTexture, uv + vec2(-1.0,  1.0) * rcp).rgb;
+        vec3 rgbSE = texture(SourceTexture, uv + vec2( 1.0,  1.0) * rcp).rgb;
+        vec3 rgbM  = texture(SourceTexture, uv).rgb;
+        float lNW = luma(rgbNW), lNE = luma(rgbNE), lSW = luma(rgbSW), lSE = luma(rgbSE), lM = luma(rgbM);
+        float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+        float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+        vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), ((lNW + lSW) - (lNE + lSE)));
+        float dirReduce = max((lNW + lNE + lSW + lSE) * 0.25 * (1.0 / 8.0), 1.0 / 128.0);
+        float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+        dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * rcp;
+        vec3 rgbA = 0.5 * (texture(SourceTexture, uv + dir * (1.0 / 3.0 - 0.5)).rgb +
+                           texture(SourceTexture, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+        vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(SourceTexture, uv + dir * -0.5).rgb +
+                                         texture(SourceTexture, uv + dir *  0.5).rgb);
+        float lB = luma(rgbB);
+        FragColor = vec4((lB < lMin || lB > lMax) ? rgbA : rgbB, 1.0);
+    }
+    )_";
+
 struct ScreenVertex {
     XrVector3f Position;
     XrVector2f TexCoord;
@@ -299,6 +337,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glDeleteProgram(m_upscaleProgram);
         }
         if (m_gunProgram != 0) glDeleteProgram(m_gunProgram);
+        if (m_edgeProgram != 0) glDeleteProgram(m_edgeProgram);
+        if (m_edgeTexture != 0) glDeleteTextures(1, &m_edgeTexture);
         if (m_gunVao != 0) glDeleteVertexArrays(1, &m_gunVao);
         if (m_gunVertexBuffer != 0) glDeleteBuffers(1, &m_gunVertexBuffer);
         if (m_upscaleVao != 0) {
@@ -509,6 +549,32 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glEnableVertexAttribArray(upscalePosition);
             glVertexAttribPointer(upscalePosition, 3, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex), nullptr);
             glBindVertexArray(0);
+        }
+        {
+            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, 1, &UpscaleVertexShaderGlsl, nullptr);
+            glCompileShader(vs);
+            CheckShader(vs);
+            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, 1, &EdgeFragmentShaderGlsl, nullptr);
+            glCompileShader(fs);
+            CheckShader(fs);
+            m_edgeProgram = glCreateProgram();
+            glAttachShader(m_edgeProgram, vs);
+            glAttachShader(m_edgeProgram, fs);
+            glLinkProgram(m_edgeProgram);
+            CheckProgram(m_edgeProgram);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            m_edgeSourceLocation = glGetUniformLocation(m_edgeProgram, "SourceTexture");
+            m_edgeTargetSizeLocation = glGetUniformLocation(m_edgeProgram, "TargetSize");
+            glGenTextures(1, &m_edgeTexture);
+            glBindTexture(GL_TEXTURE_2D, m_edgeTexture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
         }
         glGenFramebuffers(1, &m_upscaleFramebuffer);
         glGenTextures(1, &m_upscaleTexture);
@@ -851,6 +917,19 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         const bool haveNewFrame =
             info.sequence != m_lastFrameSequence || info.width != m_frameWidth || info.height != m_frameHeight;
+        // With the emulator frozen no new frame ever arrives, yet a filter or a
+        // dump request must still take effect: re-run the pass when the
+        // settings signature changes. Checked once a frame, not once an eye.
+        if (!haveNewFrame && m_frameWidth > 0 && (++m_settingsPoll & 1) == 0) {
+            const std::string signature = arcadexr::config::GetString("filter", "") + "|" +
+                                          arcadexr::config::GetString("sharpen", "") + "|" +
+                                          arcadexr::config::GetString("upscale", "") + "|" +
+                                          arcadexr::config::GetString("dump", "");
+            if (signature != m_settingsSignature) {
+                m_settingsSignature = signature;
+                RunUpscalePass(layerView);
+            }
+        }
         if (haveNewFrame && m_bgraDirect) {
             // Zero-copy path: the emulator's own buffer goes straight to the
             // driver. No memcpy, no conversion loop, no reallocation.
@@ -950,7 +1029,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUseProgram(m_screenProgram);
         glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_upscaleFactor > 1 ? m_upscaleTexture : m_screenTexture);
+        glBindTexture(GL_TEXTURE_2D, m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture);
         glUniform1i(m_screenTextureUniformLocation, 0);
         const auto aim = arcadexr::gun::GetAimState();
         glUniform2f(m_screenAimPointUniformLocation, aim.normalized_x, aim.normalized_y);
@@ -996,11 +1075,17 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // Default to the smooth reconstruction: the source is rendered 3D, and
         // sharp-bilinear exists to preserve pixel-art blocks, which is the
         // opposite of what this content wants.
-        const std::string filter = arcadexr::config::GetString("filter", "catmull");
+        // Default: edge. Judged on the same frozen frame at 1:1 (docs/validation/
+        // filters/comparatif-*.png): bicubic keeps texture definition that
+        // bilinear washes out, and the FXAA pass on top is the only mode that
+        // visibly softens the polygon staircases without touching texture
+        // interiors; text stays readable. +0.06 ms of GPU over bicubic.
+        const std::string filter = arcadexr::config::GetString("filter", "edge");
+        const bool edge = (filter == "edge");
         const int filterIndex = (filter == "nearest")    ? 0
                                 : (filter == "bilinear") ? 1
                                 : (filter == "sharp")    ? 2
-                                                         : 3;
+                                                         : 3;   // bicubic, catmull, edge
         float sharpen = arcadexr::config::GetFloat("sharpen", 0.0f);
         if (sharpen < 0.0f) sharpen = 0.0f;
         if (sharpen > 2.0f) sharpen = 2.0f;
@@ -1023,6 +1108,56 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindVertexArray(0);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
+
+        m_finalTexture = m_upscaleTexture;
+        if (edge) {
+            if (width != m_edgeWidth || height != m_edgeHeight) {
+                glBindTexture(GL_TEXTURE_2D, m_edgeTexture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                m_edgeWidth = width;
+                m_edgeHeight = height;
+            }
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_edgeTexture, 0);
+            glUseProgram(m_edgeProgram);
+            glUniform2f(m_edgeTargetSizeLocation, float(width), float(height));
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, m_upscaleTexture);
+            glUniform1i(m_edgeSourceLocation, 0);
+            glBindVertexArray(m_upscaleVao);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            glBindVertexArray(0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glUseProgram(0);
+            m_finalTexture = m_edgeTexture;
+        }
+
+        // debug.tcvr.dump=<tag>: write the final texture to the external files
+        // directory as a PPM, once per distinct tag. Lets the same frozen frame
+        // be compared across filters at full resolution, outside the headset.
+        {
+            const std::string tag = arcadexr::config::GetString("dump", "");
+            if (!tag.empty() && tag != m_lastDumpTag) {
+                m_lastDumpTag = tag;
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_finalTexture, 0);
+                std::vector<unsigned char> rgba(size_t(width) * size_t(height) * 4);
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                const std::string path = arcadexr::config::ExternalDirectory() + "/dump-" + tag + ".ppm";
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fprintf(f, "P6\n%d %d\n255\n", width, height);
+                    std::vector<unsigned char> row(size_t(width) * 3);
+                    for (int y = height - 1; y >= 0; --y) {   // GL rows are bottom-up
+                        const unsigned char* src = rgba.data() + size_t(y) * size_t(width) * 4;
+                        for (int x = 0; x < width; ++x) { row[x*3] = src[x*4]; row[x*3+1] = src[x*4+1]; row[x*3+2] = src[x*4+2]; }
+                        std::fwrite(row.data(), 1, row.size(), f);
+                    }
+                    std::fclose(f);
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M11 dumped %s (%dx%d, filter=%s sharpen=%.2f)", path.c_str(), width, height, filter.c_str(), sharpen));
+                } else {
+                    Log::Write(Log::Level::Warning, Fmt("TCVR_M11 dump failed: cannot open %s", path.c_str()));
+                }
+            }
+        }
 
         // Hand the eye's framebuffer and viewport back exactly as they were.
         glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
@@ -1064,6 +1199,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_cubeIndexBuffer{0};
     GLuint m_screenProgram{0};
     bool m_bgraDirect{false};
+    GLuint m_edgeProgram{0};
+    GLuint m_edgeTexture{0};
+    GLint m_edgeSourceLocation{0};
+    GLint m_edgeTargetSizeLocation{0};
+    int m_edgeWidth{0};
+    int m_edgeHeight{0};
+    GLuint m_finalTexture{0};
+    std::string m_lastDumpTag;
+    std::string m_settingsSignature;
+    unsigned m_settingsPoll{0};
     GLuint m_gunProgram{0};
     GLuint m_gunVao{0};
     GLuint m_gunVertexBuffer{0};

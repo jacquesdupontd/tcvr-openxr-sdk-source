@@ -247,6 +247,7 @@ void android_main(struct android_app* app) {
         arcadexr::gun::SetCalibrationDirectory(app->activity->internalDataPath);
         arcadexr::xr::SetSettingsDirectory(app->activity->internalDataPath);
         arcadexr::config::SetDirectory(app->activity->internalDataPath);
+        arcadexr::config::SetExternalDirectory(app->activity->externalDataPath);
         program->InitializeDevice();
         program->InitializeSession(options->AppSpace);
         program->CreateSwapchains();

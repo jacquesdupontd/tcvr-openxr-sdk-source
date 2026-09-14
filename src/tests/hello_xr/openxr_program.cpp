@@ -1263,6 +1263,13 @@ struct OpenXrProgram : IOpenXrProgram {
                                                         : CrosshairMode::Visible;
             m_gunLaser = arcadexr::config::GetInt("gun.laser", 0) != 0;
             m_gunBothHands = arcadexr::config::GetString("gun.hands", "right") == "both";
+            // debug.tcvr.recenter=<n>: re-place the screen whenever the number changes,
+            // so a screenshot can be lined up without a controller in hand.
+            const int nonce = arcadexr::config::GetInt("recenter", 0);
+            if (nonce != m_recenterNonce) {
+                m_recenterNonce = nonce;
+                if (nonce != 0) { m_virtualScreenInitialized = false; m_screenPlacementReason = "adb"; }
+            }
         }
         XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
@@ -1533,6 +1540,7 @@ struct OpenXrProgram : IOpenXrProgram {
     XrReferenceSpaceType m_appSpaceTypeEnum{XR_REFERENCE_SPACE_TYPE_MAX_ENUM};
     XrTime m_lastDisplayTime{0};
     XrTime m_nextPinTime{0};
+    int m_recenterNonce{0};
     int m_pinRetries{0};
     std::string m_appSpaceRequested;
     std::string m_appSpaceType{"<unset>"};
