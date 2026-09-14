@@ -16,6 +16,13 @@
 #include "virtual_screen.h"
 #include "settings.h"
 #include "aim_state.h"
+#include "gun_model.h"
+#include <cstring>
+
+#ifndef GL_BGRA_EXT
+#define GL_BGRA_EXT 0x80E1
+#endif
+#include "aim_state.h"
 
 #define GL(glcmd)                                                                                                    \
     {                                                                                                                \
@@ -114,7 +121,7 @@ static const char* ScreenFragmentShaderGlsl = R"_(#version 320 es
             if ((r > 0.021 && r < 0.029) || (abs(d.x)<0.003 && abs(d.y)<0.04) ||
                 (abs(d.y)<0.003 && abs(d.x)<0.04)) color = vec4(0.1,1.0,1.0,1.0);
         }
-        FragColor = color;
+        FragColor = vec4(color.rgb, 1.0);
     }
     )_";
 
@@ -226,6 +233,27 @@ static const char* UpscaleFragmentShaderGlsl = R"_(#version 320 es
     }
     )_";
 
+// The gun: one static mesh in gun-local space, one draw call per eye. Colour
+// and per-face shading are baked into the vertices at build time, so the
+// fragment shader has nothing to compute.
+static const char* GunVertexShaderGlsl = R"_(#version 320 es
+    in vec3 VertexPos;
+    in vec3 VertexColor;
+    uniform mat4 ModelViewProjection;
+    out vec3 GunColor;
+    void main() {
+        gl_Position = ModelViewProjection * vec4(VertexPos, 1.0);
+        GunColor = VertexColor;
+    }
+    )_";
+
+static const char* GunFragmentShaderGlsl = R"_(#version 320 es
+    precision mediump float;
+    in vec3 GunColor;
+    out vec4 FragColor;
+    void main() { FragColor = vec4(GunColor, 1.0); }
+    )_";
+
 struct ScreenVertex {
     XrVector3f Position;
     XrVector2f TexCoord;
@@ -270,6 +298,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (m_upscaleProgram != 0) {
             glDeleteProgram(m_upscaleProgram);
         }
+        if (m_gunProgram != 0) glDeleteProgram(m_gunProgram);
+        if (m_gunVao != 0) glDeleteVertexArrays(1, &m_gunVao);
+        if (m_gunVertexBuffer != 0) glDeleteBuffers(1, &m_gunVertexBuffer);
         if (m_upscaleVao != 0) {
             glDeleteVertexArrays(1, &m_upscaleVao);
         }
@@ -487,6 +518,82 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, 0);
+
+        // Can the driver take MAME's XRGB words as they are? bitmap_rgb32 stores
+        // 0x00RRGGBB, which in little-endian memory is B,G,R,x -- exactly
+        // GL_BGRA_EXT with GL_UNSIGNED_BYTE. With that, the frame goes from the
+        // emulator's buffer to the texture with no per-pixel loop and no copy
+        // on this thread at all.
+        {
+            const char* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+            m_bgraDirect = extensions && std::strstr(extensions, "GL_EXT_texture_format_BGRA8888") != nullptr;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M14 direct BGRA upload %s", m_bgraDirect ? "available" : "NOT available, falling back to CPU conversion"));
+        }
+
+        {
+            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, 1, &GunVertexShaderGlsl, nullptr);
+            glCompileShader(vs);
+            CheckShader(vs);
+            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, 1, &GunFragmentShaderGlsl, nullptr);
+            glCompileShader(fs);
+            CheckShader(fs);
+            m_gunProgram = glCreateProgram();
+            glAttachShader(m_gunProgram, vs);
+            glAttachShader(m_gunProgram, fs);
+            glLinkProgram(m_gunProgram);
+            CheckProgram(m_gunProgram);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            m_gunMvpLocation = glGetUniformLocation(m_gunProgram, "ModelViewProjection");
+            const GLint gunPos = glGetAttribLocation(m_gunProgram, "VertexPos");
+            const GLint gunCol = glGetAttribLocation(m_gunProgram, "VertexColor");
+
+            // Bake every part into one vertex array in gun-local space. The
+            // sample's cube keeps its winding (GL_CW front faces), so the gun
+            // culls correctly under the same state as the other cubes.
+            std::vector<Geometry::Vertex> mesh;
+            mesh.reserve(ArraySize(arcadexr::gun::gunParts) * ArraySize(Geometry::c_cubeVertices));
+            auto faceShade = [](const XrVector3f& c) {
+                if (c.y > 0.5f) return 1.00f;
+                if (c.x > 0.5f) return 0.86f;
+                if (c.z > 0.5f) return 0.78f;
+                if (c.y > 0.1f) return 0.40f;
+                if (c.x > 0.1f) return 0.64f;
+                return 0.54f;
+            };
+            for (const auto& part : arcadexr::gun::gunParts) {
+                const float c = std::cos(part.pitch), s = std::sin(part.pitch);
+                const float shadeScale = 1.0f;
+                (void)shadeScale;
+                for (const auto& v : Geometry::c_cubeVertices) {
+                    float x = v.Position.x * part.size.x;
+                    float y = v.Position.y * part.size.y;
+                    float z = v.Position.z * part.size.z;
+                    // pitch about X: positive tilts the top backwards (+Z)
+                    const float y2 = y * c - z * s;
+                    const float z2 = y * s + z * c;
+                    const float k = faceShade(v.Color);
+                    mesh.push_back({{x + part.center.x, y2 + part.center.y, z2 + part.center.z},
+                                    {part.color.x * k, part.color.y * k, part.color.z * k}});
+                }
+            }
+            m_gunVertexCount = static_cast<GLsizei>(mesh.size());
+            glGenBuffers(1, &m_gunVertexBuffer);
+            glBindBuffer(GL_ARRAY_BUFFER, m_gunVertexBuffer);
+            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(mesh.size() * sizeof(Geometry::Vertex)), mesh.data(), GL_STATIC_DRAW);
+            glGenVertexArrays(1, &m_gunVao);
+            glBindVertexArray(m_gunVao);
+            glEnableVertexAttribArray(gunPos);
+            glEnableVertexAttribArray(gunCol);
+            glVertexAttribPointer(gunPos, 3, GL_FLOAT, GL_FALSE, sizeof(Geometry::Vertex), nullptr);
+            glVertexAttribPointer(gunCol, 3, GL_FLOAT, GL_FALSE, sizeof(Geometry::Vertex),
+                                  reinterpret_cast<const void*>(sizeof(XrVector3f)));
+            glBindVertexArray(0);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            Log::Write(Log::Level::Info, Fmt("TCVR_M14 gun mesh: %d vertices, one draw call per eye", (int)m_gunVertexCount));
+        }
 
         glGenTextures(1, &m_screenTexture);
         glBindTexture(GL_TEXTURE_2D, m_screenTexture);
@@ -708,6 +815,25 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
 
         glBindVertexArray(0);
+
+        // The gun: one draw call per pose.
+        {
+            const auto guns = arcadexr::gun::GetGunPoses();
+            if (guns.count > 0 && m_gunVertexCount > 0) {
+                glUseProgram(m_gunProgram);
+                glBindVertexArray(m_gunVao);
+                for (int g = 0; g < guns.count; ++g) {
+                    XrMatrix4x4f model;
+                    const XrVector3f unit{1, 1, 1};
+                    XrMatrix4x4f_CreateTranslationRotationScale(&model, &guns.pose[g].position, &guns.pose[g].orientation, &unit);
+                    XrMatrix4x4f mvp;
+                    XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+                    glUniformMatrix4fv(m_gunMvpLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
+                    glDrawArrays(GL_TRIANGLES, 0, m_gunVertexCount);
+                }
+                glBindVertexArray(0);
+            }
+        }
         glUseProgram(0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
@@ -725,10 +851,32 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         const bool haveNewFrame =
             info.sequence != m_lastFrameSequence || info.width != m_frameWidth || info.height != m_frameHeight;
-        if (haveNewFrame && !arcadexr::video::CopyLatestFrame(m_framePixels, info)) {
+        if (haveNewFrame && m_bgraDirect) {
+            // Zero-copy path: the emulator's own buffer goes straight to the
+            // driver. No memcpy, no conversion loop, no reallocation.
+            arcadexr::video::FrameInfo got;
+            const std::uint32_t* pixels = arcadexr::video::AcquireLatestFrame(got);
+            if (!pixels) return;
+            glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+            if (got.width != m_frameWidth || got.height != m_frameHeight) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, got.width, got.height, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, nullptr);
+                m_frameWidth = got.width;
+                m_frameHeight = got.height;
+            }
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, got.stride);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, got.width, got.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_lastFrameSequence = got.sequence;
+            RunUpscalePass(layerView);
+            if (!m_loggedScreenUpload) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_M4 XR screen texture upload seq=%llu size=%dx%d (direct BGRA)",
+                                                 static_cast<unsigned long long>(got.sequence), got.width, got.height));
+                m_loggedScreenUpload = true;
+            }
+        } else if (haveNewFrame && !arcadexr::video::CopyLatestFrame(m_framePixels, info)) {
             return;
-        }
-        if (haveNewFrame) {
+        } else if (haveNewFrame) {
             m_frameWidth = info.width;
             m_frameHeight = info.height;
             m_lastFrameSequence = info.sequence;
@@ -915,6 +1063,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_cubeVertexBuffer{0};
     GLuint m_cubeIndexBuffer{0};
     GLuint m_screenProgram{0};
+    bool m_bgraDirect{false};
+    GLuint m_gunProgram{0};
+    GLuint m_gunVao{0};
+    GLuint m_gunVertexBuffer{0};
+    GLint m_gunMvpLocation{0};
+    GLsizei m_gunVertexCount{0};
     GLuint m_upscaleProgram{0};
     GLuint m_upscaleVao{0};
     GLuint m_upscaleFramebuffer{0};

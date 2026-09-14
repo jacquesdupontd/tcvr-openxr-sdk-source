@@ -1345,6 +1345,7 @@ struct OpenXrProgram : IOpenXrProgram {
         std::vector<Cube> cubes;
         cubes.reserve(64);
         arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating,false});
+        arcadexr::gun::GunPoses gunPoses;
         bool gunTracked = false;
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
             XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -1380,19 +1381,10 @@ struct OpenXrProgram : IOpenXrProgram {
             // Time Crisis has one gun. Drawing a second in the off hand was
             // wrong, and it is the aiming hand that carries it.
             const bool drawThisHand = (hand == Side::RIGHT) || m_gunBothHands;
-            if (drawThisHand) {
-                const XrVector3f xAxis{1, 0, 0};
-                for (const auto& part : arcadexr::gun::gunParts) {
-                    XrPosef partPose = pose;
-                    if (part.pitch != 0.0f) {
-                        XrQuaternionf tilt;
-                        XrQuaternionf_CreateFromAxisAngle(&tilt, &xAxis, part.pitch);
-                        XrQuaternionf_Multiply(&partPose.orientation, &pose.orientation, &tilt);
-                    }
-                    XrPosef_TransformVector3f(&partPose.position, &pose, &part.center);
-                    cubes.push_back(Cube{partPose,part.size,part.color});
-                }
-            }
+            // One pose per gun; the renderer draws the whole mesh in a single
+            // call. Twenty-six boxes through the cube path was six thousand
+            // draw calls a second on the thread that competes with MAME.
+            if (drawThisHand && gunPoses.count < 2) gunPoses.pose[gunPoses.count++] = pose;
             if (hand != Side::RIGHT) continue;
             gunTracked = true;
             const auto muzzle = arcadexr::gun::Muzzle(pose);
@@ -1434,6 +1426,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 m_lastGunOnScreen = onScreen;
             }
         }
+        arcadexr::gun::SetGunPoses(gunPoses);
         if (!gunTracked) {
             m_captureCalibration = false;
             arcadexr::input::SetAnalog("gun_x",0);
