@@ -8,6 +8,7 @@
 #include "platformdata.h"
 #include "platformplugin.h"
 #include "graphicsplugin.h"
+#include "mame_boot_probe.h"
 #include "openxr_program.h"
 
 #if defined(_WIN32)
@@ -242,6 +243,7 @@ void android_main(struct android_app* app) {
         program->InitializeDevice();
         program->InitializeSession(options->AppSpace);
         program->CreateSwapchains();
+        arcadexr::mame::StartBootProbeFromAndroidDebugProperties();
 
         while (app->destroyRequested == 0) {
             // Read all pending events.

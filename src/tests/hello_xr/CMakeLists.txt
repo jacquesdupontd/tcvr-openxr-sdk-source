@@ -55,6 +55,9 @@ set(LOCAL_SOURCE
 set(VULKAN_SHADERS vulkan_shaders/frag.glsl vulkan_shaders/vert.glsl)
 
 if(ANDROID)
+    if(DEFINED TCVR_PROJECT_ROOT)
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/emulation/mame/mame_boot_probe.cpp")
+    endif()
     add_library(
         hello_xr MODULE
         ${LOCAL_SOURCE}
@@ -63,8 +66,12 @@ if(ANDROID)
         $<TARGET_OBJECTS:android_native_app_glue>
     )
     target_link_libraries(
-        hello_xr PRIVATE ${ANDROID_LIBRARY} ${ANDROID_LOG_LIBRARY}
+        hello_xr PRIVATE ${ANDROID_LIBRARY} ${ANDROID_LOG_LIBRARY} dl
     )
+
+    if(DEFINED TCVR_PROJECT_ROOT)
+        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame")
+    endif()
 
     # Only for Android because it lacks a command line
     set(HELLOXR_DEFAULT_GRAPHICS_PLUGIN
