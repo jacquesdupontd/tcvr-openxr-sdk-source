@@ -1035,14 +1035,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             return false;
         }
 
-        if (m_sceneEnabled != 1) {
-            m_sceneEnabled = 1;
-            // Keep the CPU rasteriser alive as a hot fallback. Removing it is
-            // a separate measured optimisation, never an immersive-mode side
-            // effect.
-            arcadexr::hardware::namco_system22::EnableScene(1);
+        const int sceneMode = arcadexr::config::GetInt("scene.cpuRaster", 0) ? 1 : 2;
+        if (m_sceneEnabled != sceneMode) {
+            m_sceneEnabled = sceneMode;
+            arcadexr::hardware::namco_system22::EnableScene(sceneMode);
             m_sceneActive = false;
-            Log::Write(Log::Level::Info, "TCVR_M15 presentation=immersive scene recording mode 1");
+            Log::Write(Log::Level::Info, Fmt("TCVR_M15 presentation=immersive scene recording mode %d", sceneMode));
         }
         if (!m_sceneInit) {
             m_sceneInit = true;
@@ -1114,11 +1112,34 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f mvp;
         XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
 
+        // The game's 2D sprites/HUD belong to its original projection plane,
+        // not to the player's face. One model matrix per eye gives them the
+        // comfortable disparity of the virtual arcade screen.
+        XrMatrix4x4f hudToWorld{};
+        hudToWorld.m[0] = screen.right.x * screen.width;
+        hudToWorld.m[1] = screen.right.y * screen.width;
+        hudToWorld.m[2] = screen.right.z * screen.width;
+        hudToWorld.m[4] = screen.up.x * screen.height;
+        hudToWorld.m[5] = screen.up.y * screen.height;
+        hudToWorld.m[6] = screen.up.z * screen.height;
+        hudToWorld.m[8] = screen.normal.x;
+        hudToWorld.m[9] = screen.normal.y;
+        hudToWorld.m[10] = screen.normal.z;
+        hudToWorld.m[12] = screen.center.x;
+        hudToWorld.m[13] = screen.center.y;
+        hudToWorld.m[14] = screen.center.z;
+        hudToWorld.m[15] = 1.0f;
+        XrMatrix4x4f hudMvp;
+        XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
+
         const auto begin = std::chrono::steady_clock::now();
+        m_scene.SetImmersiveDepth(arcadexr::config::GetInt("immersive.depthTest", 1) != 0,
+                                  arcadexr::config::GetFloat("immersive.depthBias", 4e-8f));
         const bool rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, colorTexture,
                                                 layerView.subImage.imageRect.extent.width,
                                                 layerView.subImage.imageRect.extent.height,
-                                                reinterpret_cast<const float*>(&mvp));
+                                                reinterpret_cast<const float*>(&mvp),
+                                                reinterpret_cast<const float*>(&hudMvp));
         const auto end = std::chrono::steady_clock::now();
         m_immersiveDrawMs += std::chrono::duration<double, std::milli>(end - begin).count();
         ++m_immersiveViews;
@@ -1153,9 +1174,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // render=gpu: the true-3D path. Recording in the emulator is switched
         // on only while someone reads the scene.
         const bool gpuRender = arcadexr::config::GetString("render", "cpu") == "gpu";
-        if ((gpuRender ? 1 : 0) != m_sceneEnabled) {
-            m_sceneEnabled = gpuRender ? 1 : 0;
-            const int mode = gpuRender ? (arcadexr::config::GetInt("scene.cpuRaster", 1) ? 1 : 2) : 0;
+        const int mode = gpuRender ? (arcadexr::config::GetInt("scene.cpuRaster", 1) ? 1 : 2) : 0;
+        if (mode != m_sceneEnabled) {
+            m_sceneEnabled = mode;
             arcadexr::hardware::namco_system22::EnableScene(mode);
             m_sceneActive = false;
             Log::Write(Log::Level::Info, Fmt("TCVR_M12 render=%s scene recording mode %d", gpuRender ? "gpu" : "cpu", mode));

@@ -244,6 +244,19 @@ struct OpenXrProgram : IOpenXrProgram {
         m_supportsPerformanceSettings = enableIfPresent(arcadexr::xr::PerformanceExtensionName());
         m_supportsThreadSettings = enableIfPresent(arcadexr::xr::ThreadSettingsExtensionName());
 
+        // AppSW is deliberately opt-in. Enabling XR_FB_space_warp makes the
+        // Quest runtime reserve additional resources even before an app starts
+        // submitting motion/depth images, so Arcade Screen and the proven
+        // full-rate immersive path must not pay for an experiment they do not
+        // use.  The first hardware gate is only capability discovery; actual
+        // frame synthesis is enabled later, once its buffers are valid.
+        m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 0) != 0;
+        if (m_spaceWarpRequested) {
+            m_supportsSpaceWarp = enableIfPresent(XR_FB_SPACE_WARP_EXTENSION_NAME);
+        } else {
+            Log::Write(Log::Level::Info, "TCVR_M16 AppSW not requested (appsw=0)");
+        }
+
         // Presentation rate control. Optional: without it the runtime simply
         // keeps whatever rate it chose, and the emulator is unaffected either
         // way -- the arcade clock never depends on the presentation clock.
@@ -375,6 +388,20 @@ struct OpenXrProgram : IOpenXrProgram {
         systemInfo.formFactor = formFactor;
         CHECK_XRCMD(xrGetSystem(m_instance, &systemInfo, &m_systemId));
         Log::Write(Log::Level::Info, Fmt("TCVR_M0 xrGetSystem succeeded: system=%d", m_systemId));
+
+        if (m_supportsSpaceWarp) {
+            XrSystemSpaceWarpPropertiesFB spaceWarpProperties{XR_TYPE_SYSTEM_SPACE_WARP_PROPERTIES_FB};
+            XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+            properties.next = &spaceWarpProperties;
+            CHECK_XRCMD(xrGetSystemProperties(m_instance, m_systemId, &properties));
+            m_spaceWarpWidth = spaceWarpProperties.recommendedMotionVectorImageRectWidth;
+            m_spaceWarpHeight = spaceWarpProperties.recommendedMotionVectorImageRectHeight;
+            Log::Write(Log::Level::Info,
+                       Fmt("TCVR_M16 XR_FB_space_warp supported recommended=%ux%u submission=disabled",
+                           m_spaceWarpWidth, m_spaceWarpHeight));
+        } else if (m_spaceWarpRequested) {
+            Log::Write(Log::Level::Warning, "TCVR_M16 AppSW requested but XR_FB_space_warp is unavailable");
+        }
 
         Log::Write(Log::Level::Verbose, Fmt("Using system %d for form factor %s", m_systemId, to_string(formFactor)));
         CHECK(m_instance != XR_NULL_HANDLE);
@@ -1546,6 +1573,10 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_supportsDisplayRefreshRate{false};
     bool m_supportsPerformanceSettings{false};
     bool m_supportsThreadSettings{false};
+    bool m_spaceWarpRequested{false};
+    bool m_supportsSpaceWarp{false};
+    uint32_t m_spaceWarpWidth{0};
+    uint32_t m_spaceWarpHeight{0};
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
     enum class CrosshairMode { Visible, CalibrationOnly, Hidden };
