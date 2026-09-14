@@ -400,6 +400,15 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glVertexAttribPointer(m_vertexAttribCoords, 3, GL_FLOAT, GL_FALSE, sizeof(Geometry::Vertex), nullptr);
         glVertexAttribPointer(m_vertexAttribColor, 3, GL_FLOAT, GL_FALSE, sizeof(Geometry::Vertex),
                               reinterpret_cast<const void*>(sizeof(XrVector3f)));
+        // Unbind before anything else touches a buffer binding.
+        //
+        // The element array binding is part of vertex array object state, not
+        // global state. Leaving this one bound meant that creating the screen's
+        // index buffer below silently replaced the cube's -- so every cube then
+        // drew from a six-index buffer instead of its own thirty-six, which
+        // renders exactly one face of each box. That is what "you only see the
+        // left of the gun, nothing in the middle, nothing on its right" was.
+        glBindVertexArray(0);
 
         GLuint screenVertexShader = glCreateShader(GL_VERTEX_SHADER);
         glShaderSource(screenVertexShader, 1, &ScreenVertexShaderGlsl, nullptr);

@@ -1201,6 +1201,8 @@ struct OpenXrProgram : IOpenXrProgram {
             m_crosshairMode = (mode == "hidden")        ? CrosshairMode::Hidden
                               : (mode == "calibration") ? CrosshairMode::CalibrationOnly
                                                         : CrosshairMode::Visible;
+            m_gunLaser = arcadexr::config::GetInt("gun.laser", 0) != 0;
+            m_gunBothHands = arcadexr::config::GetString("gun.hands", "right") == "both";
         }
         XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO};
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
@@ -1298,7 +1300,7 @@ struct OpenXrProgram : IOpenXrProgram {
         projectionLayerViews.resize(viewCountOutput);
         if (m_supportsDepthLayer) depthInfos.resize(viewCountOutput);
         std::vector<Cube> cubes;
-        cubes.reserve(28);
+        cubes.reserve(64);
         arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating,false});
         bool gunTracked = false;
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
@@ -1332,10 +1334,21 @@ struct OpenXrProgram : IOpenXrProgram {
             }
             const XrQuaternionf identity{0,0,0,1};
             const XrPosef pose = arcadexr::gun::GunPose(location.pose, hand == Side::RIGHT ? m_gunCalibration : identity);
-            for (const auto& part : arcadexr::gun::gunParts) {
-                XrPosef partPose = pose;
-                XrPosef_TransformVector3f(&partPose.position, &pose, &part.center);
-                cubes.push_back(Cube{partPose,part.size,part.color});
+            // Time Crisis has one gun. Drawing a second in the off hand was
+            // wrong, and it is the aiming hand that carries it.
+            const bool drawThisHand = (hand == Side::RIGHT) || m_gunBothHands;
+            if (drawThisHand) {
+                const XrVector3f xAxis{1, 0, 0};
+                for (const auto& part : arcadexr::gun::gunParts) {
+                    XrPosef partPose = pose;
+                    if (part.pitch != 0.0f) {
+                        XrQuaternionf tilt;
+                        XrQuaternionf_CreateFromAxisAngle(&tilt, &xAxis, part.pitch);
+                        XrQuaternionf_Multiply(&partPose.orientation, &pose.orientation, &tilt);
+                    }
+                    XrPosef_TransformVector3f(&partPose.position, &pose, &part.center);
+                    cubes.push_back(Cube{partPose,part.size,part.color});
+                }
             }
             if (hand != Side::RIGHT) continue;
             gunTracked = true;
@@ -1355,18 +1368,23 @@ struct OpenXrProgram : IOpenXrProgram {
             const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
                                                     (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating));
             arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
-            float beamLength = 1.5f;
-            if (onScreen) {
-                XrVector3f point{
-                    screen.center.x + screen.right.x*(hit.normalized_x-.5f)*screen.width + screen.up.x*(.5f-hit.normalized_y)*screen.height,
-                    screen.center.y + screen.right.y*(hit.normalized_x-.5f)*screen.width + screen.up.y*(.5f-hit.normalized_y)*screen.height,
-                    screen.center.z + screen.right.z*(hit.normalized_x-.5f)*screen.width + screen.up.z*(.5f-hit.normalized_y)*screen.height};
-                XrVector3f delta{point.x-muzzle.x,point.y-muzzle.y,point.z-muzzle.z};
-                beamLength = XrVector3f_Length(&delta);
+            // No laser by default: the 1995 cabinet's gun has none, and adding
+            // one is a modern affectation the player noticed immediately. Kept
+            // as an aid that can be switched on while calibrating.
+            if (m_gunLaser) {
+                float beamLength = 1.5f;
+                if (onScreen) {
+                    XrVector3f point{
+                        screen.center.x + screen.right.x*(hit.normalized_x-.5f)*screen.width + screen.up.x*(.5f-hit.normalized_y)*screen.height,
+                        screen.center.y + screen.right.y*(hit.normalized_x-.5f)*screen.width + screen.up.y*(.5f-hit.normalized_y)*screen.height,
+                        screen.center.z + screen.right.z*(hit.normalized_x-.5f)*screen.width + screen.up.z*(.5f-hit.normalized_y)*screen.height};
+                    XrVector3f delta{point.x-muzzle.x,point.y-muzzle.y,point.z-muzzle.z};
+                    beamLength = XrVector3f_Length(&delta);
+                }
+                XrPosef beam = pose;
+                beam.position = {muzzle.x+direction.x*beamLength*.5f,muzzle.y+direction.y*beamLength*.5f,muzzle.z+direction.z*beamLength*.5f};
+                cubes.push_back(Cube{beam,{0.0025f,0.0025f,beamLength},{1.0f,0.15f,0.08f}});
             }
-            XrPosef beam = pose;
-            beam.position = {muzzle.x+direction.x*beamLength*.5f,muzzle.y+direction.y*beamLength*.5f,muzzle.z+direction.z*beamLength*.5f};
-            cubes.push_back(Cube{beam,{0.0025f,0.0025f,beamLength},{1.0f,0.15f,0.08f}});
             if (!m_gunStateKnown || onScreen != m_lastGunOnScreen) {
                 Log::Write(Log::Level::Info,Fmt("TCVR_M7 gun=%s x=%.3f y=%.3f",onScreen?"on_screen":"offscreen",hit.normalized_x,hit.normalized_y));
                 m_gunStateKnown = true;
@@ -1454,6 +1472,8 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_virtualScreenInitialized{false};
     enum class CrosshairMode { Visible, CalibrationOnly, Hidden };
     CrosshairMode m_crosshairMode{CrosshairMode::Visible};
+    bool m_gunLaser{false};
+    bool m_gunBothHands{false};
     XrTime m_recenterTime{0};
     XrReferenceSpaceType m_appSpaceTypeEnum{XR_REFERENCE_SPACE_TYPE_MAX_ENUM};
     XrTime m_lastDisplayTime{0};
