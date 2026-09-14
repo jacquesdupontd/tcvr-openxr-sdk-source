@@ -58,6 +58,7 @@ if(ANDROID)
     if(DEFINED TCVR_PROJECT_ROOT)
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/emulation/mame/mame_boot_probe.cpp")
         list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/video/framebuffer_bridge.cpp")
+        list(APPEND LOCAL_SOURCE "${TCVR_PROJECT_ROOT}/audio/audio_bridge.cpp")
     endif()
     add_library(
         hello_xr MODULE
@@ -67,11 +68,11 @@ if(ANDROID)
         $<TARGET_OBJECTS:android_native_app_glue>
     )
     target_link_libraries(
-        hello_xr PRIVATE ${ANDROID_LIBRARY} ${ANDROID_LOG_LIBRARY} dl
+        hello_xr PRIVATE ${ANDROID_LIBRARY} ${ANDROID_LOG_LIBRARY} aaudio dl
     )
 
     if(DEFINED TCVR_PROJECT_ROOT)
-        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video")
+        target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video" "${TCVR_PROJECT_ROOT}/audio")
     endif()
 
     # Only for Android because it lacks a command line
