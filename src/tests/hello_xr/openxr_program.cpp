@@ -213,6 +213,7 @@ struct OpenXrProgram : IOpenXrProgram {
         createInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
 
         CHECK_XRCMD(xrCreateInstance(&createInfo, &m_instance));
+        Log::Write(Log::Level::Info, "TCVR_M0 xrCreateInstance succeeded");
     }
 
     void CreateInstance() override {
@@ -315,6 +316,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
         systemInfo.formFactor = formFactor;
         CHECK_XRCMD(xrGetSystem(m_instance, &systemInfo, &m_systemId));
+        Log::Write(Log::Level::Info, Fmt("TCVR_M0 xrGetSystem succeeded: system=%d", m_systemId));
 
         Log::Write(Log::Level::Verbose, Fmt("Using system %d for form factor %s", m_systemId, to_string(formFactor)));
         CHECK(m_instance != XR_NULL_HANDLE);
@@ -603,6 +605,7 @@ struct OpenXrProgram : IOpenXrProgram {
             createInfo.next = m_graphicsPlugin->GetGraphicsBinding();
             createInfo.systemId = m_systemId;
             CHECK_XRCMD(xrCreateSession(m_instance, &createInfo, &m_session));
+            Log::Write(Log::Level::Info, "TCVR_M0 xrCreateSession succeeded");
         }
 
         LogReferenceSpaces();
@@ -704,6 +707,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 swapchain.width = swapchainCreateInfo.width;
                 swapchain.height = swapchainCreateInfo.height;
                 CHECK_XRCMD(xrCreateSwapchain(m_session, &swapchainCreateInfo, &swapchain.handle));
+                Log::Write(Log::Level::Info, Fmt("TCVR_M0 xrCreateSwapchain succeeded: view=%d", i));
 
                 m_swapchains.push_back(swapchain);
 
@@ -972,6 +976,10 @@ struct OpenXrProgram : IOpenXrProgram {
         frameEndInfo.layerCount = (uint32_t)layers.size();
         frameEndInfo.layers = layers.data();
         CHECK_XRCMD(xrEndFrame(m_session, &frameEndInfo));
+        if (!m_loggedFirstEndFrame) {
+            Log::Write(Log::Level::Info, "TCVR_M0 xrEndFrame succeeded");
+            m_loggedFirstEndFrame = true;
+        }
     }
 
     bool RenderLayer(XrTime predictedDisplayTime, std::vector<XrCompositionLayerProjectionView>& projectionLayerViews,
@@ -992,6 +1000,10 @@ struct OpenXrProgram : IOpenXrProgram {
         if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
             (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
             return false;  // There is no valid tracking poses for the views.
+        }
+        if (!m_loggedValidHeadPose) {
+            Log::Write(Log::Level::Info, "TCVR_M0 xrLocateViews returned a valid 6DoF head pose");
+            m_loggedValidHeadPose = true;
         }
 
         CHECK(viewCountOutput == viewCapacityInput);
@@ -1029,6 +1041,12 @@ struct OpenXrProgram : IOpenXrProgram {
             if (XR_UNQUALIFIED_SUCCESS(res)) {
                 if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
                     (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
+                    if (!m_loggedValidHandPose[hand]) {
+                        const char* handName[] = {"left", "right"};
+                        Log::Write(Log::Level::Info,
+                                   Fmt("TCVR_M0 xrLocateSpace returned a valid %s Touch grip pose", handName[hand]));
+                        m_loggedValidHandPose[hand] = true;
+                    }
                     float scale = 0.1f * m_input.handScale[hand];
                     cubes.push_back(Cube{spaceLocation.pose, {scale, scale, scale}});
                 }
@@ -1111,6 +1129,9 @@ struct OpenXrProgram : IOpenXrProgram {
 
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
+    bool m_loggedFirstEndFrame{false};
+    bool m_loggedValidHeadPose{false};
+    std::array<bool, Side::COUNT> m_loggedValidHandPose{{false, false}};
 
     std::vector<XrViewConfigurationView> m_configViews;
     std::vector<Swapchain> m_swapchains;
