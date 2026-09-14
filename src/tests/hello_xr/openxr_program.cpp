@@ -1427,6 +1427,19 @@ struct OpenXrProgram : IOpenXrProgram {
             const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
                                                     (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating));
             arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
+            // Arcade Screen draws the reticle in its quad shader. Immersive
+            // presentation has no quad, so put the same aiming truth on the
+            // invisible game projection plane as a small world-space marker.
+            // Input remains the ray/plane result above; this is cosmetic only.
+            if (showCrosshair && arcadexr::config::GetString("presentation", "screen") == "immersive") {
+                const XrVector3f point{
+                    screen.center.x + screen.right.x*(hit.normalized_x-.5f)*screen.width + screen.up.x*(.5f-hit.normalized_y)*screen.height,
+                    screen.center.y + screen.right.y*(hit.normalized_x-.5f)*screen.width + screen.up.y*(.5f-hit.normalized_y)*screen.height,
+                    screen.center.z + screen.right.z*(hit.normalized_x-.5f)*screen.width + screen.up.z*(.5f-hit.normalized_y)*screen.height};
+                const XrPosef marker{{0,0,0,1}, point};
+                cubes.push_back(Cube{marker, {0.012f,0.012f,0.012f}, m_calibrating ? XrVector3f{0.2f,1.0f,0.2f}
+                                                                                  : XrVector3f{1.0f,0.15f,0.08f}});
+            }
             // No laser by default: the 1995 cabinet's gun has none, and adding
             // one is a modern affectation the player noticed immediately. Kept
             // as an aid that can be switched on while calibrating.

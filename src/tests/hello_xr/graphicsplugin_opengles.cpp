@@ -941,7 +941,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glClearDepthf(1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
-        RenderArcadeScreen(viewIndex, layerView);
+        // The immersive backend consumes the System 22 camera-space vertices
+        // directly. If it is unavailable during cold start, fall back to the
+        // proven Arcade Screen path instead of presenting a blank view.
+        if (!RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
+            RenderArcadeScreen(viewIndex, layerView);
+        }
 
         // Set shaders and uniform variables.
         glUseProgram(m_program);
@@ -1021,6 +1026,126 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         glUseProgram(0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    bool RenderImmersiveArcadeScene(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
+                                    uint32_t colorTexture) {
+        if (viewIndex >= 2 || arcadexr::config::GetString("render", "cpu") != "gpu" ||
+            arcadexr::config::GetString("presentation", "screen") != "immersive") {
+            return false;
+        }
+
+        if (m_sceneEnabled != 1) {
+            m_sceneEnabled = 1;
+            // Keep the CPU rasteriser alive as a hot fallback. Removing it is
+            // a separate measured optimisation, never an immersive-mode side
+            // effect.
+            arcadexr::hardware::namco_system22::EnableScene(1);
+            m_sceneActive = false;
+            Log::Write(Log::Level::Info, "TCVR_M15 presentation=immersive scene recording mode 1");
+        }
+        if (!m_sceneInit) {
+            m_sceneInit = true;
+            if (!m_scene.Initialize()) {
+                Log::Write(Log::Level::Error, Fmt("TCVR_M15 scene renderer failed: %s", m_scene.LastError().c_str()));
+            }
+            glGenTextures(2, m_sceneTex);
+        }
+        if (!m_scene.Ready()) return false;
+
+        // Acquire only for view zero. The MAME bridge pins that triple-buffer
+        // slot until the next AcquireScene call, so both eyes necessarily use
+        // the same emulated state even if MAME publishes between them.
+        if (viewIndex == 0 || !m_immersiveFrame) {
+            m_immersiveFrame = arcadexr::hardware::namco_system22::AcquireScene();
+        }
+        const tcvr_scene_frame* frame = m_immersiveFrame;
+        if (!frame || frame->width <= 0 || frame->height <= 0) return false;
+        if (!m_scene.AssetsReady()) {
+            tcvr_scene_assets assets{};
+            if (!arcadexr::hardware::namco_system22::SceneAssets(assets) || !m_scene.UploadAssets(assets)) return false;
+        }
+
+        if (frame->sequence != m_immersivePreparedSequence) {
+            const auto begin = std::chrono::steady_clock::now();
+            if (!m_scene.PrepareFrame(*frame)) return false;
+            const auto end = std::chrono::steady_clock::now();
+            m_immersivePreparedSequence = frame->sequence;
+            m_immersivePrepMs += std::chrono::duration<double, std::milli>(end - begin).count();
+            ++m_immersivePreparedFrames;
+        }
+
+        arcadexr::gun::ScreenPlane screen;
+        if (!arcadexr::video::GetVirtualScreen(screen)) return false;
+        const float distance = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
+        const float depthUnits = std::max(100.0f, arcadexr::config::GetFloat("immersive.depth", 5000.0f));
+        const float worldScale = distance / depthUnits;
+        const arcadexr::gun::Vec3 camera{
+            screen.center.x + screen.normal.x * distance,
+            screen.center.y + screen.normal.y * distance,
+            screen.center.z + screen.normal.z * distance};
+
+        // System 22 camera coordinates are +X right, +Y up, +Z forward.
+        // screen.normal points back at the player, hence the negative third
+        // basis vector. This anchor recovers the HMD pose used by recentering.
+        XrMatrix4x4f arcadeToWorld{};
+        arcadeToWorld.m[0] = screen.right.x * worldScale;
+        arcadeToWorld.m[1] = screen.right.y * worldScale;
+        arcadeToWorld.m[2] = screen.right.z * worldScale;
+        arcadeToWorld.m[4] = screen.up.x * worldScale;
+        arcadeToWorld.m[5] = screen.up.y * worldScale;
+        arcadeToWorld.m[6] = screen.up.z * worldScale;
+        arcadeToWorld.m[8] = -screen.normal.x * worldScale;
+        arcadeToWorld.m[9] = -screen.normal.y * worldScale;
+        arcadeToWorld.m[10] = -screen.normal.z * worldScale;
+        arcadeToWorld.m[12] = camera.x;
+        arcadeToWorld.m[13] = camera.y;
+        arcadeToWorld.m[14] = camera.z;
+        arcadeToWorld.m[15] = 1.0f;
+
+        XrMatrix4x4f projection;
+        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, 0.05f, 100.0f);
+        XrMatrix4x4f eyeToWorld;
+        XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
+        XrMatrix4x4f worldToEye;
+        XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
+        XrMatrix4x4f viewProjection;
+        XrMatrix4x4f_Multiply(&viewProjection, &projection, &worldToEye);
+        XrMatrix4x4f mvp;
+        XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
+
+        const auto begin = std::chrono::steady_clock::now();
+        const bool rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, colorTexture,
+                                                layerView.subImage.imageRect.extent.width,
+                                                layerView.subImage.imageRect.extent.height,
+                                                reinterpret_cast<const float*>(&mvp));
+        const auto end = std::chrono::steady_clock::now();
+        m_immersiveDrawMs += std::chrono::duration<double, std::milli>(end - begin).count();
+        ++m_immersiveViews;
+        m_sceneActive = rendered;
+
+        // Restore the framebuffer state expected by the gun/cube renderer.
+        glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+        glViewport(static_cast<GLint>(layerView.subImage.imageRect.offset.x),
+                   static_cast<GLint>(layerView.subImage.imageRect.offset.y),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.width),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.height));
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glActiveTexture(GL_TEXTURE0);
+
+        if (rendered && (!m_loggedImmersiveRoute[viewIndex] || m_immersiveViews % 1200 == 0)) {
+            m_loggedImmersiveRoute[viewIndex] = true;
+            Log::Write(Log::Level::Info, Fmt(
+                "TCVR_M15 immersive view=%u seq=%llu target=%ux%u depth=%.1f scale=%.8f prep_avg=%.2fms submit_avg=%.2fms",
+                viewIndex, static_cast<unsigned long long>(frame->sequence),
+                layerView.subImage.imageRect.extent.width, layerView.subImage.imageRect.extent.height,
+                depthUnits, worldScale,
+                m_immersivePreparedFrames ? m_immersivePrepMs / m_immersivePreparedFrames : 0.0,
+                m_immersiveViews ? m_immersiveDrawMs / m_immersiveViews : 0.0));
+        }
+        return rendered;
     }
 
     void RenderArcadeScreen(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView) {
@@ -1499,6 +1624,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     bool m_sceneInit{false};
     bool m_sceneActive{false};
     bool m_loggedEyeRoute[2]{false, false};
+    bool m_loggedImmersiveRoute[2]{false, false};
     int m_sceneEnabled{-1};
     GLuint m_sceneTex[2]{0, 0};
     int m_sceneW{0};
@@ -1506,6 +1632,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     std::uint64_t m_sceneSequence{0};
     std::string m_sceneSignature;
     std::string m_sceneDumpTag;
+    const tcvr_scene_frame* m_immersiveFrame{nullptr};
+    std::uint64_t m_immersivePreparedSequence{0};
+    double m_immersivePrepMs{0};
+    double m_immersiveDrawMs{0};
+    unsigned m_immersivePreparedFrames{0};
+    unsigned m_immersiveViews{0};
     double m_scenePrepMs{0};
     double m_sceneDrawMs{0};
     unsigned m_sceneFrames{0};
