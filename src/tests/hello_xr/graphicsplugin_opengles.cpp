@@ -1956,6 +1956,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             bool blend = arcadexr::config::GetInt("m2.stipple", 1) != 0;
             if (__system_property_get("debug.tcvr.m2.stipple", stipple) > 0) blend = (stipple[0] == '1');
             m_m2Gpu.SetStippleBlend(blend);
+            m_m2Gpu.SetLayerSmooth(arcadexr::config::GetInt("m2.layerSmooth", 2));
         }
         if (!m_m2Gpu.PrepareFrame(*frame)) return;
         if (!m_m2Gpu.RenderTo(m_m2Texture, width, height, requested, m_screenTexture,
