@@ -1949,6 +1949,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             m_m2Height = height;
         }
 
+        {
+            char stipple[PROP_VALUE_MAX] = {};
+            m_m2Gpu.SetStippleBlend(__system_property_get("debug.tcvr.m2.stipple", stipple) > 0 && stipple[0] == '1');
+        }
         if (!m_m2Gpu.PrepareFrame(*frame)) return;
         if (!m_m2Gpu.RenderTo(m_m2Texture, width, height, requested, m_screenTexture,
                               m_frameWidth, m_frameHeight)) {
