@@ -13,6 +13,7 @@
 #include "xr_gun.h"
 #include "display_refresh.h"
 #include "settings.h"
+#include <cstdlib>
 #include "openxr_program.h"
 
 #if defined(_WIN32)
@@ -176,6 +177,9 @@ static void app_handle_cmd(struct android_app* app, int32_t cmd) {
             Log::Write(Log::Level::Info, "onDestroy()");
             Log::Write(Log::Level::Info, "    APP_CMD_DESTROY");
             appState->NativeWindow = NULL;
+            arcadexr::audio::Stop();
+            arcadexr::mame::StopGame();
+            std::_Exit(0);
             break;
         }
         case APP_CMD_INIT_WINDOW: {
@@ -278,9 +282,25 @@ void android_main(struct android_app* app) {
                 }
             }
 
+            static bool s_hasSessionRun = false;
+            if (program->IsSessionRunning()) {
+                s_hasSessionRun = true;
+            }
+
             program->PollEvents(&exitRenderLoop, &requestRestart);
-            if (exitRenderLoop) {
+            if (exitRenderLoop || (s_hasSessionRun && !program->IsSessionRunning())) {
+                // Quitting from the Meta menu ends the XR session but leaves this
+                // process alive, with MAME and the AAudio callback still on their
+                // own threads: the game kept playing and a relaunch resumed where
+                // it left off. Stop both, finish the activity, and end the process
+                // for real so the next launch starts clean.
+                arcadexr::audio::Stop();
+                arcadexr::mame::StopGame();
                 ANativeActivity_finish(app->activity);
+                if (!requestRestart) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                    std::_Exit(0);
+                }
                 continue;
             }
 
@@ -294,7 +314,9 @@ void android_main(struct android_app* app) {
             program->RenderFrame();
         }
 
-        app->activity->vm->DetachCurrentThread();
+        arcadexr::audio::Stop();
+        arcadexr::mame::StopGame();
+        std::_Exit(0);
     } catch (const std::exception& ex) {
         Log::Write(Log::Level::Error, ex.what());
     } catch (...) {
