@@ -1319,12 +1319,11 @@ struct OpenXrProgram : IOpenXrProgram {
         XrActionStateBoolean clickState{XR_TYPE_ACTION_STATE_BOOLEAN};
         const bool leftStickClick = XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &clickInfo, &clickState)) &&
                                     clickState.isActive == XR_TRUE && clickState.currentState == XR_TRUE;
+        const bool faceA = readButton(m_input.pedalAction, Side::RIGHT);
         reportDigital("pedal", (!driving || arcadexr::profiles::GetInt("driving.handBrakeOnA", 0)) &&
-                               readButton(m_input.pedalAction, Side::RIGHT) && !menuOpen, m_input.lastPedal);
-        reportDigital("start", (!driving && faceB) ||
-                               (driving && arcadexr::profiles::GetInt("driving.stickClickStart", 0) &&
-                                leftStickClick && !menuOpen), m_input.lastStart);
-        reportDigital("view", driving && faceB && !menuOpen, m_input.lastView);
+                               faceA && !menuOpen, m_input.lastPedal);
+        reportDigital("start", (faceB || (driving && leftStickClick)) && !menuOpen, m_input.lastStart);
+        reportDigital("view", driving && (faceB || faceA) && !menuOpen, m_input.lastView);
         reportDigital("coin", readButton(m_input.coinAction, Side::LEFT), m_input.lastCoin);
 
         // There were no subaction paths specified for the quit action, because we don't care which hand did it.
