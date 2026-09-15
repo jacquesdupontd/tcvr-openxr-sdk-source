@@ -1928,6 +1928,18 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (viewIndex == 0 || !m_m2ImmFrame) m_m2ImmFrame = arcadexr::hardware::sega_model2::AcquireScene();
         const tcvr_m2_frame* frame = m_m2ImmFrame;
         if (!frame) return false;
+        // The geometry engine's focal length is zero until the game programs
+        // it. Undoing the projection then divides by 1e-6 and the scene
+        // explodes, so fall back on the flat window until it is real.
+        if (!(frame->focus_x > 1.0f) || !(frame->focus_y > 1.0f)) {
+            if (!m_m2ImmLoggedFocus) {
+                m_m2ImmLoggedFocus = true;
+                __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU",
+                                    "immersive: waiting for a real focal length (focus=%.1f,%.1f)",
+                                    frame->focus_x, frame->focus_y);
+            }
+            return false;
+        }
         if (frame->sequence != m_m2ImmPrepared) {
             if (!m_m2Gpu.PrepareFrame(*frame)) return false;
             m_m2ImmPrepared = frame->sequence;
@@ -1935,7 +1947,20 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         arcadexr::gun::ScreenPlane screen;
         if (!arcadexr::video::GetVirtualScreen(screen)) return false;
         const float distance = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
-        const float depthUnits = std::max(10.0f, arcadexr::config::GetFloat("m2.immersiveDepth", 1200.0f));
+        // Board units per metre, as on the System 22 path: depthUnits board
+        // units sit at `distance` metres, so worldScale = distance/depthUnits.
+        //
+        // MEASURED on srallyc in game (9572 vertices): z percentiles p10=13.7
+        // p50=175 p90=502 -- the scene spans about 500 board units of depth,
+        // which 1200 squeezed into 0.83 m in front of the player, so a 20 cm
+        // head movement crossed a quarter of the world. Two independent
+        // physical references agree (what is just ahead ~3 m, the far scenery
+        // ~100 m): about 4.7 units/m, hence 9.4 at 2 m.
+        //
+        // The scale cannot be read off the picture -- scaling the world and the
+        // camera distance together gives an identical image -- it shows up only
+        // as parallax, which is exactly what the complaint was about.
+        const float depthUnits = std::max(0.5f, arcadexr::config::GetFloat("m2.immersiveDepth", 9.4f));
         const float worldScale = distance / depthUnits;
         const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance, screen.center.y + screen.normal.y * distance, screen.center.z + screen.normal.z * distance};
         XrMatrix4x4f arcadeToWorld{};
@@ -1944,7 +1969,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         arcadeToWorld.m[8] = -screen.normal.x * worldScale; arcadeToWorld.m[9] = -screen.normal.y * worldScale; arcadeToWorld.m[10] = -screen.normal.z * worldScale;
         arcadeToWorld.m[12] = camera.x; arcadeToWorld.m[13] = camera.y; arcadeToWorld.m[14] = camera.z; arcadeToWorld.m[15] = 1.0f;
         const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
-        const float nearMetres = std::max(0.001f, std::min(0.05f, arcadexr::config::GetFloat("immersive.near", 0.005f)));
+        // Near plane, with its own key and its own ceiling -- the System 22
+        // occurrence of this line is deliberately left alone. That path clamps
+        // to 5 cm, which is right at its scale. At the Model 2 scale measured
+        // here the board emits a few vertices below z = 1 unit: they used to
+        // sit at 1.2 mm -- behind any near plane, invisible -- and at the
+        // corrected scale they land 15 cm from the eye and fill the view.
+        // Those were the polygons flying in all directions. 25 cm is also
+        // where a VR near plane belongs; closer cannot be fused comfortably.
+        const float nearMetres = std::max(0.002f, std::min(1.0f,
+            arcadexr::config::GetFloat("m2.immersiveNear", 0.25f)));
         XrMatrix4x4f projection; XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, nearMetres, farMetres);
         XrMatrix4x4f eyeToWorld; XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
         XrMatrix4x4f worldToEye; XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
@@ -1972,6 +2006,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             if (!m_immersiveBlitFbo) glGenFramebuffers(1, &m_immersiveBlitFbo);
             m_immersiveTexW = rw; m_immersiveTexH = rh;
         }
+        // Painter's bias: the sign is baked into the vertex shader, this sets
+        // only the magnitude, in NDC per primitive index.
+        m_m2Gpu.SetDepthBias(arcadexr::config::GetFloat("m2.immersiveDepthBias", 4.0e-8f));
         bool rendered = false;
         if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
             rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp),
@@ -1990,6 +2027,30 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
             glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
                               layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
+        {
+            // dump=<tag>: the Model 2 immersive eye texture, one PPM per eye,
+            // so the result can be judged without a human in the headset.
+            const std::string tag = arcadexr::config::GetString("dump", "");
+            if (rendered && !tag.empty() && tag != m_m2DumpTag[viewIndex]) {
+                m_m2DumpTag[viewIndex] = tag;
+                std::vector<unsigned char> rgba;
+                if (m_m2Gpu.ReadBack(m_immersiveTex[viewIndex], rw, rh, rgba)) {
+                    const std::string path = arcadexr::config::ExternalDirectory() + "/dump-" + tag +
+                                             (viewIndex == 0 ? "-m2imm-L.ppm" : "-m2imm-R.ppm");
+                    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                        std::fprintf(f, "P6\n%d %d\n255\n", rw, rh);
+                        std::vector<unsigned char> row(size_t(rw) * 3);
+                        for (int y = rh - 1; y >= 0; --y) {
+                            const unsigned char* s2 = rgba.data() + size_t(y) * size_t(rw) * 4;
+                            for (int x = 0; x < rw; ++x) { row[x*3] = s2[x*4]; row[x*3+1] = s2[x*4+1]; row[x*3+2] = s2[x*4+2]; }
+                            std::fwrite(row.data(), 1, row.size(), f);
+                        }
+                        std::fclose(f);
+                        __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "dumped %s (%dx%d)", path.c_str(), rw, rh);
+                    }
+                }
+            }
         }
         m_immersiveActive = rendered;
         glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
@@ -2289,6 +2350,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     std::uint64_t m_m2ImmPrepared{0};
     bool m_loggedM2Imm[2]{false, false};
     bool m_m2ImmLoggedGate{false};
+    bool m_m2ImmLoggedFocus{false};
+    std::string m_m2DumpTag[2];
     bool m_m2GpuFailed{false};
     std::uint64_t m_m2LastSequence{0};
     unsigned m_m2Frames{0};
