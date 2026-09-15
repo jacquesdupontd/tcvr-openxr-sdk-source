@@ -1727,7 +1727,11 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // for a second identical System 22 raster pass.
         const bool flat = arcadexr::profiles::GetString("presentation", "screen") == "flat";
         const uint32_t sceneEye = flat ? 0u : viewIndex;
-        glBindTexture(GL_TEXTURE_2D, m_sceneActive ? m_sceneTex[sceneEye] : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
+        glBindTexture(GL_TEXTURE_2D,
+                      m_sceneActive ? m_sceneTex[sceneEye]
+                      : m_m2SourceTexture != 0
+                            ? m_m2SourceTexture
+                            : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
         if (m_sceneActive && !m_loggedEyeRoute[viewIndex]) {
             m_loggedEyeRoute[viewIndex] = true;
             Log::Write(Log::Level::Info, Fmt("TCVR_M14 projection view %u samples scene eye %u texture=%u",
@@ -1946,7 +1950,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
 
         if (!m_m2Gpu.PrepareFrame(*frame)) return;
-        if (!m_m2Gpu.RenderTo(m_m2Texture, width, height, requested)) {
+        if (!m_m2Gpu.RenderTo(m_m2Texture, width, height, requested, m_screenTexture,
+                              m_frameWidth, m_frameHeight)) {
             m_m2GpuFailed = true;
             Log::Write(Log::Level::Error, Fmt("TCVR_M2GPU render failed: %s", m_m2Gpu.LastError().c_str()));
             return;
@@ -2019,7 +2024,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // CPU rasteriser would have written -- at any resolution. Everything
         // downstream (filter, quad, stereo) is left untouched so the two paths
         // are comparable.
-        glBindTexture(GL_TEXTURE_2D, m_m2SourceTexture != 0 ? m_m2SourceTexture : m_screenTexture);
+        glBindTexture(GL_TEXTURE_2D, m_screenTexture);
         glUniform1i(m_upscaleSourceLocation, 0);
         glBindVertexArray(m_upscaleVao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
