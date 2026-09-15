@@ -1963,10 +1963,26 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         const float depthUnits = std::max(0.5f, arcadexr::config::GetFloat("m2.immersiveDepth", 9.4f));
         const float worldScale = distance / depthUnits;
         const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance, screen.center.y + screen.normal.y * distance, screen.center.z + screen.normal.z * distance};
+        // Camera pitch, READ from the background layer's horizon row: Sega
+        // Rally's camera looks down at the road, and mapping its forward axis
+        // onto the horizontal tilted the whole race downwards. The horizon
+        // direction (0, tan, 1) of the board is rotated onto the anchor's
+        // forward. The HUD and the secondary views stay on the screen; the
+        // backdrop pitches with the world. m2.immersivePitch=0 disables it.
+        float pitchTarget = 0.0f;
+        if (arcadexr::config::GetInt("m2.immersivePitch", 1) != 0 && m_m2Gpu.HaveMainView() && m_m2Gpu.HorizonRow() >= 0.0f) {
+            const float t = ((384.0f - float(m_m2Gpu.MainCenterY())) + float(frame->crtc_yoffset) - m_m2Gpu.HorizonRow()) / std::max(frame->focus_y, 1.0f);
+            pitchTarget = std::max(-0.35f, std::min(0.35f, ::atanf(t)));
+        }
+        if (viewIndex == 0) m_m2Pitch += (pitchTarget - m_m2Pitch) * 0.1f;
+        const float cp = ::cosf(m_m2Pitch), sp = ::sinf(m_m2Pitch);
+        const arcadexr::gun::Vec3 upP{cp * screen.up.x - sp * screen.normal.x, cp * screen.up.y - sp * screen.normal.y, cp * screen.up.z - sp * screen.normal.z};
+        const arcadexr::gun::Vec3 normalP{cp * screen.normal.x + sp * screen.up.x, cp * screen.normal.y + sp * screen.up.y, cp * screen.normal.z + sp * screen.up.z};
+        const arcadexr::gun::Vec3 centerP{camera.x - normalP.x * distance, camera.y - normalP.y * distance, camera.z - normalP.z * distance};
         XrMatrix4x4f arcadeToWorld{};
         arcadeToWorld.m[0] = screen.right.x * worldScale;  arcadeToWorld.m[1] = screen.right.y * worldScale;  arcadeToWorld.m[2] = screen.right.z * worldScale;
-        arcadeToWorld.m[4] = screen.up.x * worldScale;     arcadeToWorld.m[5] = screen.up.y * worldScale;     arcadeToWorld.m[6] = screen.up.z * worldScale;
-        arcadeToWorld.m[8] = -screen.normal.x * worldScale; arcadeToWorld.m[9] = -screen.normal.y * worldScale; arcadeToWorld.m[10] = -screen.normal.z * worldScale;
+        arcadeToWorld.m[4] = upP.x * worldScale;     arcadeToWorld.m[5] = upP.y * worldScale;     arcadeToWorld.m[6] = upP.z * worldScale;
+        arcadeToWorld.m[8] = -normalP.x * worldScale; arcadeToWorld.m[9] = -normalP.y * worldScale; arcadeToWorld.m[10] = -normalP.z * worldScale;
         arcadeToWorld.m[12] = camera.x; arcadeToWorld.m[13] = camera.y; arcadeToWorld.m[14] = camera.z; arcadeToWorld.m[15] = 1.0f;
         const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
         // Near plane, with its own key and its own ceiling -- the System 22
@@ -1984,12 +2000,26 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f worldToEye; XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
         XrMatrix4x4f viewProjection; XrMatrix4x4f_Multiply(&viewProjection, &projection, &worldToEye);
         XrMatrix4x4f mvp; XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
+        // The 2D planes (HUD, secondary views, backdrop) at their own distance,
+        // same angular size as the screen: m2.hudDistance metres (3 by default),
+        // further than the 2 m world reference so the HUD stops sitting on the
+        // player's nose while the road runs underneath.
+        const float hudDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 3.0f));
+        const float hudK = hudDistance / distance;
+        const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudDistance, camera.y - screen.normal.y * hudDistance, camera.z - screen.normal.z * hudDistance};
         XrMatrix4x4f hudToWorld{};
-        hudToWorld.m[0] = screen.right.x * screen.width; hudToWorld.m[1] = screen.right.y * screen.width; hudToWorld.m[2] = screen.right.z * screen.width;
-        hudToWorld.m[4] = screen.up.x * screen.height;   hudToWorld.m[5] = screen.up.y * screen.height;   hudToWorld.m[6] = screen.up.z * screen.height;
+        hudToWorld.m[0] = screen.right.x * screen.width * hudK; hudToWorld.m[1] = screen.right.y * screen.width * hudK; hudToWorld.m[2] = screen.right.z * screen.width * hudK;
+        hudToWorld.m[4] = screen.up.x * screen.height * hudK;   hudToWorld.m[5] = screen.up.y * screen.height * hudK;   hudToWorld.m[6] = screen.up.z * screen.height * hudK;
         hudToWorld.m[8] = screen.normal.x; hudToWorld.m[9] = screen.normal.y; hudToWorld.m[10] = screen.normal.z;
-        hudToWorld.m[12] = screen.center.x; hudToWorld.m[13] = screen.center.y; hudToWorld.m[14] = screen.center.z; hudToWorld.m[15] = 1.0f;
+        hudToWorld.m[12] = hudCenter.x; hudToWorld.m[13] = hudCenter.y; hudToWorld.m[14] = hudCenter.z; hudToWorld.m[15] = 1.0f;
         XrMatrix4x4f hudMvp; XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
+        XrMatrix4x4f hudToWorldBack{};
+        const arcadexr::gun::Vec3 backCenter{camera.x - normalP.x * hudDistance, camera.y - normalP.y * hudDistance, camera.z - normalP.z * hudDistance};
+        hudToWorldBack.m[0] = screen.right.x * screen.width * hudK; hudToWorldBack.m[1] = screen.right.y * screen.width * hudK; hudToWorldBack.m[2] = screen.right.z * screen.width * hudK;
+        hudToWorldBack.m[4] = upP.x * screen.height * hudK; hudToWorldBack.m[5] = upP.y * screen.height * hudK; hudToWorldBack.m[6] = upP.z * screen.height * hudK;
+        hudToWorldBack.m[8] = normalP.x; hudToWorldBack.m[9] = normalP.y; hudToWorldBack.m[10] = normalP.z;
+        hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
+        XrMatrix4x4f hudMvpBack; XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
         const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("immersive.scale", 1.0f)));
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
@@ -2008,10 +2038,17 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         // Painter's bias: the sign is baked into the vertex shader, this sets
         // only the magnitude, in NDC per primitive index.
-        m_m2Gpu.SetDepthBias(arcadexr::config::GetFloat("m2.immersiveDepthBias", 4.0e-8f));
+        // MEASURED 15/09: 4e-8 per index is below the 24-bit depth quantum
+        // (1.2e-7 NDC), so coplanar polygons (road markings, car previews,
+        // the mirror) z-fought: see-through shimmer. 6e-7 is five quanta.
+        m_m2Gpu.SetDepthBias(arcadexr::config::GetFloat("m2.immersiveDepthBias", 6.0e-7f));
+        m_m2Gpu.SetEdgeFade(arcadexr::config::GetFloat("m2.immersiveEdgeFade", 20.0f));
+        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 4))));
+        m_m2Gpu.SetRaw(arcadexr::config::GetInt("m2.immersiveRaw", 1) != 0);
+        m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 32));
         bool rendered = false;
         if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
-            rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp),
+            rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp), reinterpret_cast<const float*>(&hudMvpBack),
                                                frame->focus_x, frame->focus_y, frame->crtc_xoffset, frame->crtc_yoffset);
             if (rendered) { m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders; }
             else { m_m2GpuFailed = true; __android_log_print(ANDROID_LOG_ERROR, "TCVR_M2GPU", "immersive render failed: %s", m_m2Gpu.LastError().c_str()); }
@@ -2351,6 +2388,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     bool m_loggedM2Imm[2]{false, false};
     bool m_m2ImmLoggedGate{false};
     bool m_m2ImmLoggedFocus{false};
+    float m_m2Pitch{0.0f};
     std::string m_m2DumpTag[2];
     bool m_m2GpuFailed{false};
     std::uint64_t m_m2LastSequence{0};
