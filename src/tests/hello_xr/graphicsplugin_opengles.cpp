@@ -1038,7 +1038,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // The immersive backend consumes the System 22 camera-space vertices
         // directly. If it is unavailable during cold start, fall back to the
         // proven Arcade Screen path instead of presenting a blank view.
-        if (!RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
+        if (!RenderImmersiveModel2(viewIndex, layerView, colorTexture) &&
+            !RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
             RenderArcadeScreen(viewIndex, layerView);
         }
 
@@ -1902,6 +1903,100 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     // upscale pass then reads instead of the emulator's framebuffer. Opt-in,
     // and MAME's own rasteriser keeps running as the oracle: the point of this
     // first step is to compare, not yet to look better.
+
+    // Sega Model 2 games in immersive presentation: the recorded scene through
+    // the eye's projection, 2D layers on the arcade plane. Same anchor, pose
+    // cache and blit as the System 22 path.
+    bool RenderImmersiveModel2(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView, uint32_t colorTexture) {
+        // Work in progress: scale calibration, sky dome and the stereo window are
+        // missing. Off unless m2.immersive=1, so IMMERSIF falls back to the 4x window.
+        if (viewIndex >= 2 || arcadexr::config::GetString("presentation", "screen") != "immersive") return false;
+        if (arcadexr::config::GetInt("m2.immersive", 0) == 0) return false;
+        if (!arcadexr::hardware::sega_model2::HaveSceneSource()) return false;
+        if (!m_m2Requested) {
+            m_m2Requested = true;
+            arcadexr::hardware::sega_model2::EnableScene(1);
+            Log::Write(Log::Level::Info, "TCVR_M2GPU recording requested (immersive)");
+            return false;
+        }
+        if (!m_m2Gpu.Ready() && !m_m2GpuFailed) {
+            if (!m_m2Gpu.Initialize()) { m_m2GpuFailed = true; Log::Write(Log::Level::Error, Fmt("TCVR_M2GPU disabled: %s", m_m2Gpu.LastError().c_str())); return false; }
+        }
+        if (m_m2GpuFailed) return false;
+        if (viewIndex == 0 || !m_m2ImmFrame) m_m2ImmFrame = arcadexr::hardware::sega_model2::AcquireScene();
+        const tcvr_m2_frame* frame = m_m2ImmFrame;
+        if (!frame) return false;
+        if (frame->sequence != m_m2ImmPrepared) {
+            if (!m_m2Gpu.PrepareFrame(*frame)) return false;
+            m_m2ImmPrepared = frame->sequence;
+        }
+        arcadexr::gun::ScreenPlane screen;
+        if (!arcadexr::video::GetVirtualScreen(screen)) return false;
+        const float distance = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
+        const float depthUnits = std::max(10.0f, arcadexr::config::GetFloat("m2.immersiveDepth", 1000.0f));
+        const float worldScale = distance / depthUnits;
+        const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance, screen.center.y + screen.normal.y * distance, screen.center.z + screen.normal.z * distance};
+        XrMatrix4x4f arcadeToWorld{};
+        arcadeToWorld.m[0] = screen.right.x * worldScale;  arcadeToWorld.m[1] = screen.right.y * worldScale;  arcadeToWorld.m[2] = screen.right.z * worldScale;
+        arcadeToWorld.m[4] = screen.up.x * worldScale;     arcadeToWorld.m[5] = screen.up.y * worldScale;     arcadeToWorld.m[6] = screen.up.z * worldScale;
+        arcadeToWorld.m[8] = -screen.normal.x * worldScale; arcadeToWorld.m[9] = -screen.normal.y * worldScale; arcadeToWorld.m[10] = -screen.normal.z * worldScale;
+        arcadeToWorld.m[12] = camera.x; arcadeToWorld.m[13] = camera.y; arcadeToWorld.m[14] = camera.z; arcadeToWorld.m[15] = 1.0f;
+        const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
+        const float nearMetres = std::max(0.001f, std::min(0.05f, arcadexr::config::GetFloat("immersive.near", 0.005f)));
+        XrMatrix4x4f projection; XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_OPENGL_ES, layerView.fov, nearMetres, farMetres);
+        XrMatrix4x4f eyeToWorld; XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
+        XrMatrix4x4f worldToEye; XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
+        XrMatrix4x4f viewProjection; XrMatrix4x4f_Multiply(&viewProjection, &projection, &worldToEye);
+        XrMatrix4x4f mvp; XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
+        XrMatrix4x4f hudToWorld{};
+        hudToWorld.m[0] = screen.right.x * screen.width; hudToWorld.m[1] = screen.right.y * screen.width; hudToWorld.m[2] = screen.right.z * screen.width;
+        hudToWorld.m[4] = screen.up.x * screen.height;   hudToWorld.m[5] = screen.up.y * screen.height;   hudToWorld.m[6] = screen.up.z * screen.height;
+        hudToWorld.m[8] = screen.normal.x; hudToWorld.m[9] = screen.normal.y; hudToWorld.m[10] = screen.normal.z;
+        hudToWorld.m[12] = screen.center.x; hudToWorld.m[13] = screen.center.y; hudToWorld.m[14] = screen.center.z; hudToWorld.m[15] = 1.0f;
+        XrMatrix4x4f hudMvp; XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
+        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("immersive.scale", 1.0f)));
+        const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
+        const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
+        if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
+            for (int e = 0; e < 2; ++e) {
+                if (!m_immersiveTex[e]) glGenTextures(1, &m_immersiveTex[e]);
+                glBindTexture(GL_TEXTURE_2D, m_immersiveTex[e]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                m_immersiveHasImage[e] = false;
+            }
+            glBindTexture(GL_TEXTURE_2D, 0);
+            if (!m_immersiveBlitFbo) glGenFramebuffers(1, &m_immersiveBlitFbo);
+            m_immersiveTexW = rw; m_immersiveTexH = rh;
+        }
+        bool rendered = false;
+        if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
+            rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp),
+                                               frame->focus_x, frame->focus_y, frame->crtc_xoffset, frame->crtc_yoffset);
+            if (rendered) { m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders; }
+            else { m_m2GpuFailed = true; Log::Write(Log::Level::Error, Fmt("TCVR_M2GPU immersive render failed: %s", m_m2Gpu.LastError().c_str())); }
+        } else {
+            auto& submitted = const_cast<XrCompositionLayerProjectionView&>(layerView);
+            submitted.pose = m_immersivePose[viewIndex]; submitted.fov = m_immersiveFov[viewIndex];
+            rendered = true;
+        }
+        if (rendered) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveTex[viewIndex], 0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+            glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
+                              layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
+        m_immersiveActive = rendered;
+        glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+        glViewport(layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y, eyeW, eyeH);
+        glEnable(GL_DEPTH_TEST); glEnable(GL_CULL_FACE); glDisable(GL_BLEND); glActiveTexture(GL_TEXTURE0);
+        if (rendered && !m_loggedM2Imm[viewIndex]) { m_loggedM2Imm[viewIndex] = true; Log::Write(Log::Level::Info, Fmt("TCVR_M2GPU immersive view=%u %dx%d focus=%.1f,%.1f crtc=%d,%d depthUnits=%.0f", viewIndex, rw, rh, frame->focus_x, frame->focus_y, frame->crtc_xoffset, frame->crtc_yoffset, depthUnits)); }
+        return rendered;
+    }
+
     void MaybeRenderModel2Gpu() {
         static const int requested = [] {
             // Settings file first (m2.gpuRaster, default 4 = on), the test property overrides.
@@ -1941,7 +2036,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glBindTexture(GL_TEXTURE_2D, m_m2Texture);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                          nullptr);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            // Minified on the virtual screen: without mipmaps a 4x image aliases and shimmers on every edge.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1965,6 +2061,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             Log::Write(Log::Level::Error, Fmt("TCVR_M2GPU render failed: %s", m_m2Gpu.LastError().c_str()));
             return;
         }
+        glBindTexture(GL_TEXTURE_2D, m_m2Texture);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
         m_m2SourceTexture = m_m2Texture;
 
         if (++m_m2Frames % 60 == 0) {
@@ -2149,6 +2248,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_m2SourceTexture{0};
     int m_m2Width{0}, m_m2Height{0};
     bool m_m2Requested{false};
+    const tcvr_m2_frame* m_m2ImmFrame{nullptr};
+    std::uint64_t m_m2ImmPrepared{0};
+    bool m_loggedM2Imm[2]{false, false};
     bool m_m2GpuFailed{false};
     std::uint64_t m_m2LastSequence{0};
     unsigned m_m2Frames{0};
