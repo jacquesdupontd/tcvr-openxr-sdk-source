@@ -1904,10 +1904,11 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     // first step is to compare, not yet to look better.
     void MaybeRenderModel2Gpu() {
         static const int requested = [] {
+            // Settings file first (m2.gpuRaster, default 4 = on), the test property overrides.
             char value[PROP_VALUE_MAX] = {};
-            if (__system_property_get("debug.tcvr.m2.gpuRaster", value) <= 0) return 0;
-            const int n = atoi(value);
-            return (n < 0) ? 0 : (n > 4 ? 4 : n);
+            int n = arcadexr::config::GetInt("m2.gpuRaster", 4);
+            if (__system_property_get("debug.tcvr.m2.gpuRaster", value) > 0) n = atoi(value);
+            return (n < 0) ? 0 : (n > 8 ? 8 : n);
         }();
         if (requested == 0) return;
         if (!arcadexr::hardware::sega_model2::HaveSceneSource()) return;
@@ -1951,7 +1952,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
 
         {
             char stipple[PROP_VALUE_MAX] = {};
-            m_m2Gpu.SetStippleBlend(__system_property_get("debug.tcvr.m2.stipple", stipple) > 0 && stipple[0] == '1');
+            // m2.stipple: 1 = order-exact 50% blend (default), 0 = the board's one pixel in two.
+            bool blend = arcadexr::config::GetInt("m2.stipple", 1) != 0;
+            if (__system_property_get("debug.tcvr.m2.stipple", stipple) > 0) blend = (stipple[0] == '1');
+            m_m2Gpu.SetStippleBlend(blend);
         }
         if (!m_m2Gpu.PrepareFrame(*frame)) return;
         if (!m_m2Gpu.RenderTo(m_m2Texture, width, height, requested, m_screenTexture,
