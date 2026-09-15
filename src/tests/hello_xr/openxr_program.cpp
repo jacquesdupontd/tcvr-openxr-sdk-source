@@ -278,6 +278,11 @@ struct OpenXrProgram : IOpenXrProgram {
         XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
         createInfo.next = m_platformPlugin->GetInstanceCreateExtension();
         createInfo.enabledExtensionCount = (uint32_t)extensions.size();
+        // MEASURED 15/09: without a request the runtime settles the CPU at level 3
+        // of 4 (1651 MHz) as soon as the XR side looks light, and MAME, single-
+        // threaded, falls to 56 of 60 frames. The levels are requested right after
+        // the session exists; this only records whether the extension is on.
+        m_supportsPerfSettings = std::any_of(extensions.begin(), extensions.end(), [](const char* e) { return 0 == strcmp(e, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME); });
         createInfo.enabledExtensionNames = extensions.data();
 
         strcpy(createInfo.applicationInfo.applicationName, "HelloXR");
@@ -800,6 +805,20 @@ struct OpenXrProgram : IOpenXrProgram {
             createInfo.systemId = m_systemId;
             CHECK_XRCMD(xrCreateSession(m_instance, &createInfo, &m_session));
             Log::Write(Log::Level::Info, "TCVR_M0 xrCreateSession succeeded");
+            if (m_supportsPerfSettings) {
+                PFN_xrPerfSettingsSetPerformanceLevelEXT setLevel = nullptr;
+                xrGetInstanceProcAddr(m_instance, "xrPerfSettingsSetPerformanceLevelEXT", reinterpret_cast<PFN_xrVoidFunction*>(&setLevel));
+                if (setLevel) {
+                    // perf.cpuLevel / perf.gpuLevel: 0 power savings, 1 sustained low, 2 sustained high, 3 boost.
+                    auto level = [](int l) { return l >= 3 ? XR_PERF_SETTINGS_LEVEL_BOOST_EXT : l == 2 ? XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT : l == 1 ? XR_PERF_SETTINGS_LEVEL_SUSTAINED_LOW_EXT : XR_PERF_SETTINGS_LEVEL_POWER_SAVINGS_EXT; };
+                    const int cpu = arcadexr::config::GetInt("perf.cpuLevel", 3), gpu = arcadexr::config::GetInt("perf.gpuLevel", 2);
+                    const XrResult rc = setLevel(m_session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, level(cpu));
+                    const XrResult rg = setLevel(m_session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, level(gpu));
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M0 performance levels requested: cpu=%d (%d) gpu=%d (%d)", cpu, int(rc), gpu, int(rg)));
+                }
+            } else {
+                Log::Write(Log::Level::Warning, "TCVR_M0 XR_EXT_performance_settings unavailable: CPU level left to the runtime");
+            }
         }
 
         LogReferenceSpaces();
@@ -1794,6 +1813,7 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_supportsThreadSettings{false};
     bool m_spaceWarpRequested{false};
     bool m_supportsSpaceWarp{false};
+    bool m_supportsPerfSettings{false};
     uint32_t m_spaceWarpWidth{0};
     uint32_t m_spaceWarpHeight{0};
     bool m_loggedFirstEndFrame{false};
