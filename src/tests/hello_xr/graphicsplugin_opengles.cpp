@@ -2059,7 +2059,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (!m_m2Gpu.PrepareFrame(*frame)) return;
         // Stereo window (FENETRE 3D): one render per eye with the camera moved
         // by +-strength/2 board units, converging at m2.stereoConvergence.
-        const float strength = arcadexr::config::GetFloat("m2.stereoStrength", 0.0f);
+        // ECRAN PLAT (presentation=flat) shows the left texture to both eyes,
+        // so it must be rendered without any eye offset: with the offset kept,
+        // every polygon was shifted by strength*focus/(2z) pixels against the
+        // 2D layers -- up to 150 px for the nearest ones (seen live 15/09).
+        const bool flatPresentation = arcadexr::profiles::GetString("presentation", "screen") == "flat";
+        const float strength = flatPresentation ? 0.0f : arcadexr::config::GetFloat("m2.stereoStrength", 0.0f);
         const float convergence = arcadexr::config::GetFloat("m2.stereoConvergence", 0.0f);
         m_m2Stereo = strength != 0.0f;
         if (m_m2Stereo && m_m2TexR == 0) {
