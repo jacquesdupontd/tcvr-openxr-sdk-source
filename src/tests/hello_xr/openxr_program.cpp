@@ -1252,6 +1252,7 @@ struct OpenXrProgram : IOpenXrProgram {
         {
             auto& menu = arcadexr::ui::Menu::Get();
             const bool wasOpen = menu.IsOpen();
+            menu.PollBootError();
             menu.OpenSelectorOnce(!arcadexr::mame::EmulatorStarted());
             // A controller resting on its trigger must not instantly launch the
             // highlighted ROM when the startup selector appears.

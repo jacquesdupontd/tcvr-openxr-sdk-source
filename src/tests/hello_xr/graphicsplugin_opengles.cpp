@@ -438,6 +438,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (m_screenVao != 0) {
             glDeleteVertexArrays(1, &m_screenVao);
         }
+        if (m_menuVao != 0) glDeleteVertexArrays(1, &m_menuVao);
         if (m_screenVertexBuffer != 0) {
             glDeleteBuffers(1, &m_screenVertexBuffer);
         }
@@ -625,6 +626,23 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glVertexAttribPointer(screenTexCoord, 2, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex),
                               reinterpret_cast<const void*>(sizeof(XrVector3f)));
         glBindVertexArray(0);
+        // Attribute locations are assigned per linked shader program. Sharing
+        // the screen VAO with the menu shader silently drops the panel on GPUs
+        // that choose different locations for VertexPos and TexCoord.
+        const GLint menuPosition = glGetAttribLocation(m_menuProgram, "VertexPos");
+        const GLint menuTexCoord = glGetAttribLocation(m_menuProgram, "TexCoord");
+        glGenVertexArrays(1, &m_menuVao);
+        glBindVertexArray(m_menuVao);
+        glBindBuffer(GL_ARRAY_BUFFER, m_screenVertexBuffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_screenIndexBuffer);
+        glEnableVertexAttribArray(menuPosition);
+        glEnableVertexAttribArray(menuTexCoord);
+        glVertexAttribPointer(menuPosition, 3, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex), nullptr);
+        glVertexAttribPointer(menuTexCoord, 2, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex),
+                              reinterpret_cast<const void*>(sizeof(XrVector3f)));
+        glBindVertexArray(0);
+        Log::Write(Log::Level::Info, Fmt("TCVR_MENU shader locations menu=%d,%d screen=%d,%d",
+                                           menuPosition, menuTexCoord, screenPosition, screenTexCoord));
         GLuint upscaleVertexShader = glCreateShader(GL_VERTEX_SHADER);
         glShaderSource(upscaleVertexShader, 1, &UpscaleVertexShaderGlsl, nullptr);
         glCompileShader(upscaleVertexShader);
@@ -1100,19 +1118,35 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
                 glBindVertexArray(0);
             }
         }
-        RenderMenu(pose, vp);
+        // Arcade rendering may have used a private offscreen FBO. Composite
+        // the menu into this eye's current XR swapchain, not that scratch FBO.
+        glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+        glViewport(static_cast<GLint>(layerView.subImage.imageRect.offset.x),
+                   static_cast<GLint>(layerView.subImage.imageRect.offset.y),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.width),
+                   static_cast<GLsizei>(layerView.subImage.imageRect.extent.height));
+        RenderMenu(pose, vp, viewIndex);
         glUseProgram(0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    // The menu shares the cabinet's world anchor. Y and Meta recenter already
-    // rebuild that anchor, so both menus follow them and remain binocularly
-    // centred instead of being frozen from the first eye pose that rendered.
-    void RenderMenu(const XrPosef&, const XrMatrix4x4f& vp) {
+    // Keep both menu pages in front of the player's head even if the arcade
+    // screen was anchored while the headset was lying on a desk. One pose is
+    // latched on view 0 and shared with view 1 for stable binocular depth.
+    void RenderMenu(const XrPosef& eyePose, const XrMatrix4x4f& vp, uint32_t viewIndex) {
         auto& menu = arcadexr::ui::Menu::Get();
         if (!menu.IsOpen()) return;
-        arcadexr::gun::ScreenPlane screen;
-        if (!arcadexr::video::GetVirtualScreen(screen)) return;
+        if (viewIndex == 0 || !m_menuFramePoseValid) {
+            m_menuFramePose = eyePose;
+            m_menuFramePoseValid = true;
+        }
+        const XrPosef& anchor = m_menuFramePose;
+        const XrVector3f localRight{1, 0, 0}, localUp{0, 1, 0}, localNormal{0, 0, 1};
+        XrVector3f right, up, normal;
+        XrQuaternionf_RotateVector3f(&right, &anchor.orientation, &localRight);
+        XrQuaternionf_RotateVector3f(&up, &anchor.orientation, &localUp);
+        XrQuaternionf_RotateVector3f(&normal, &anchor.orientation, &localNormal);
         std::vector<unsigned char> rgba;
         int w = 0, h = 0;
         if (menu.Render(rgba, w, h)) {
@@ -1124,19 +1158,19 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         const float width = 0.95f;
         const float height = width / m_menuAspect;
         const XrVector3f center{
-            screen.center.x + screen.normal.x * 0.70f,
-            screen.center.y + screen.normal.y * 0.70f,
-            screen.center.z + screen.normal.z * 0.70f};
+            anchor.position.x - normal.x * 1.4f,
+            anchor.position.y - normal.y * 1.4f,
+            anchor.position.z - normal.z * 1.4f};
         XrMatrix4x4f model{};
-        model.m[0] = screen.right.x * width;
-        model.m[1] = screen.right.y * width;
-        model.m[2] = screen.right.z * width;
-        model.m[4] = screen.up.x * height;
-        model.m[5] = screen.up.y * height;
-        model.m[6] = screen.up.z * height;
-        model.m[8] = screen.normal.x;
-        model.m[9] = screen.normal.y;
-        model.m[10] = screen.normal.z;
+        model.m[0] = right.x * width;
+        model.m[1] = right.y * width;
+        model.m[2] = right.z * width;
+        model.m[4] = up.x * height;
+        model.m[5] = up.y * height;
+        model.m[6] = up.z * height;
+        model.m[8] = normal.x;
+        model.m[9] = normal.y;
+        model.m[10] = normal.z;
         model.m[12] = center.x;
         model.m[13] = center.y;
         model.m[14] = center.z;
@@ -1152,7 +1186,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, m_menuTexture);
         glUniform1i(m_menuTexLocation, 0);
-        glBindVertexArray(m_screenVao);
+        glBindVertexArray(m_menuVao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
         glBindVertexArray(0);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -2055,6 +2089,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     float m_loggedSharpen{-1.0f};
     GLuint m_screenTexture{0};
     GLuint m_screenVao{0};
+    GLuint m_menuVao{0};
     GLuint m_screenVertexBuffer{0};
     GLuint m_screenIndexBuffer{0};
     GLint m_screenMvpUniformLocation{0};
@@ -2095,6 +2130,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLint m_menuMvpLocation{-1};
     GLint m_menuTexLocation{-1};
     float m_menuAspect{1.6f};
+    XrPosef m_menuFramePose{};
+    bool m_menuFramePoseValid{false};
     GLuint m_immersiveAa[2]{0, 0};
     int m_immersiveAaW{0};
     int m_immersiveAaH{0};
