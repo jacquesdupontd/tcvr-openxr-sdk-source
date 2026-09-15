@@ -1039,8 +1039,35 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // The immersive backend consumes the System 22 camera-space vertices
         // directly. If it is unavailable during cold start, fall back to the
         // proven Arcade Screen path instead of presenting a blank view.
-        if (!RenderImmersiveModel2(viewIndex, layerView, colorTexture) &&
-            !RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
+        // Scene mode 2 (MAME records instead of rasterising) is decided HERE, at
+        // the call site, and not inside RenderImmersiveModel2.
+        //
+        // That function has seven early exits -- m2.immersive off, no scene
+        // source, GPU init failed, a still-zero focal length, no scene
+        // acquired, PrepareFrame failed, presentation changed -- and a guard
+        // placed in one of them leaves the other six able to strand MAME in
+        // mode 2 with nothing drawing it. The symptom is brutal and was
+        // reported twice: the picture freezes while the menu still answers and
+        // the sound keeps playing.
+        //
+        // Deciding on the RESULT, every frame, cannot be stranded: whatever the
+        // reason the immersive pass did not produce a frame, the flat path is
+        // what runs, and the flat path needs MAME's rasteriser.
+        const bool m2Immersive = RenderImmersiveModel2(viewIndex, layerView, colorTexture);
+        // m2.skipCpuRaster: 0 (default) keeps MAME rasterising even in immersive.
+        //
+        // Mode 2 -- MAME records instead of rasterising -- is a real 10 ms/frame
+        // saving and it took the emulation from frameskip 8 at 87-93% to
+        // frameskip 0 at 100%. But it removes the only other source of a fresh
+        // picture: the moment the immersive pass stops producing frames, for any
+        // reason, the last image stays glued on screen while the emulation and
+        // the sound carry on. That was reported twice from the headset, and it
+        // is not acceptable as a default until the freeze itself is understood.
+        //
+        // Off by default, therefore, and available for measurement.
+        const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 0) != 0;
+        if (viewIndex == 0 && m_m2Requested) SetM2SceneMode((m2Immersive && allowSkip) ? 2 : 1);
+        if (!m2Immersive && !RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
             RenderArcadeScreen(viewIndex, layerView);
         }
 
@@ -1908,16 +1935,42 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     // Sega Model 2 games in immersive presentation: the recorded scene through
     // the eye's projection, 2D layers on the arcade plane. Same anchor, pose
     // cache and blit as the System 22 path.
+    // Recording mode for the Model 2 scene store, in one place so the flat and
+    // immersive paths cannot fight over it.
+    //
+    // Mode 2 tells MAME to record the scene INSTEAD of rasterising it: the
+    // immersive pass draws that scene itself and never reads destmap, and the
+    // CPU raster costs 9.5-11.0 ms per frame (measured as the render_polygons
+    // `dispatch` figure, wait and join at zero), which is nearly all of
+    // screen_update and what dropped the emulation to frameskip 8 at 91-92%.
+    //
+    // It is only ever requested once an immersive frame has actually been
+    // rendered, and dropped back to 1 as soon as it has not: every early exit
+    // of RenderImmersiveModel2 falls back on the flat window, which does
+    // composite on the emulator's own frame.
+    void SetM2SceneMode(int mode) {
+        if (mode == m_m2SceneMode) return;
+        m_m2SceneMode = mode;
+        arcadexr::hardware::sega_model2::EnableScene(mode);
+        __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU",
+                            "scene recording mode %d (%s)", mode,
+                            mode >= 2 ? "GPU draws it, MAME does not rasterise"
+                                      : "alongside MAME's CPU raster");
+    }
+
     bool RenderImmersiveModel2(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView, uint32_t colorTexture) {
         // Work in progress: scale calibration, sky dome and the stereo window are
         // missing. Off unless m2.immersive=1, so IMMERSIF falls back to the 4x window.
         const std::string presentation = arcadexr::profiles::GetString("presentation", "screen");
-        if (viewIndex >= 2 || presentation != "immersive") { if (!m_m2ImmLoggedGate) { m_m2ImmLoggedGate = true; __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive gate: presentation=%s", presentation.c_str()); } return false; }
+        if (viewIndex >= 2 || presentation != "immersive") {
+            if (!m_m2ImmLoggedGate) { m_m2ImmLoggedGate = true; __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive gate: presentation=%s", presentation.c_str()); }
+            return false;
+        }
         if (arcadexr::profiles::GetInt("m2.immersive", 1) == 0) { if (!m_m2ImmLoggedGate) { m_m2ImmLoggedGate = true; __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive gate: m2.immersive=0"); } return false; }
         if (!arcadexr::hardware::sega_model2::HaveSceneSource()) { if (!m_m2ImmLoggedGate) { m_m2ImmLoggedGate = true; __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive gate: no Model 2 scene source"); } return false; }
         if (!m_m2Requested) {
             m_m2Requested = true;
-            arcadexr::hardware::sega_model2::EnableScene(1);
+            SetM2SceneMode(1);
             __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive: recording requested");
             return false;
         }
@@ -2051,8 +2104,17 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // (1.2e-7 NDC), so coplanar polygons (road markings, car previews,
         // the mirror) z-fought: see-through shimmer. 6e-7 is five quanta.
         m_m2Gpu.SetDepthBias(arcadexr::config::GetFloat("m2.immersiveDepthBias", 6.0e-7f));
+        // One frame in 15, not every frame. The probe's glReadPixels forces the
+        // MSAA buffer to be materialised out of tile memory and cost 0.43 ms per
+        // frame (5.74 vs 5.31 ms) for a ground colour that changes slowly.
+        m_m2Gpu.SetProbeInterval(arcadexr::config::GetInt("m2.probeInterval", 15));
         m_m2Gpu.SetEdgeFade(arcadexr::config::GetFloat("m2.immersiveEdgeFade", 20.0f));
-        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 2))));
+        // 4x by default, not 2x. Measured on srallyc with a RELAUNCH between each
+        // reading -- changing this hot does not reallocate the framebuffer, and a
+        // hot change is what made an earlier reading claim MSAA cost 16 ms:
+        //   MSAA 0 -> 5.24 ms | MSAA 2 -> 5.31 ms | MSAA 4 -> 5.52 ms
+        // So 4x samples cost 0.28 ms, and the pass holds 120/120 either way.
+        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 4))));
         m_m2Gpu.SetRaw(arcadexr::config::GetInt("m2.immersiveRaw", 1) != 0);
         m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 0));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
@@ -2122,10 +2184,13 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // Ask for the recording only once something reads it.
         if (!m_m2Requested) {
             m_m2Requested = true;
-            arcadexr::hardware::sega_model2::EnableScene(1);
+            SetM2SceneMode(1);
             Log::Write(Log::Level::Info, Fmt("TCVR_M2GPU recording requested, scale x%d", requested));
             return;   // the first scene lands on the next frame
         }
+        // The flat window composites on the emulator's own frame and falls back
+        // on it, so MAME must keep rasterising here.
+        SetM2SceneMode(1);
         if (!m_m2Gpu.Ready() && !m_m2GpuFailed) {
             if (!m_m2Gpu.Initialize()) {
                 m_m2GpuFailed = true;
@@ -2398,6 +2463,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     std::uint64_t m_m2ImmPrepared{0};
     bool m_loggedM2Imm[2]{false, false};
     bool m_m2ImmLoggedGate{false};
+    int m_m2SceneMode{0};
     bool m_m2ImmLoggedFocus{false};
     float m_m2Pitch{0.0f};
     std::string m_m2DumpTag[2];
