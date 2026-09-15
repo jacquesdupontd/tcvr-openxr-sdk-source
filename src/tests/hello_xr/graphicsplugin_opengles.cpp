@@ -20,6 +20,7 @@
 #include <cmath>
 #include "virtual_screen.h"
 #include "settings.h"
+#include "game_profile.h"
 #include "aim_state.h"
 #include "gun_model.h"
 #include "gun_mesh.h"
@@ -298,6 +299,33 @@ static const char* EdgeFragmentShaderGlsl = R"_(#version 320 es
     }
     )_";
 
+// Dirt Dash deliberately alternates some opaque black effect layers (notably
+// the car shadow) at the arcade frame rate. A CRT integrates those flashes;
+// sample-and-hold XR makes them painfully distinct. This pass reconstructs
+// that integration only where two consecutive frames differ strongly and at
+// least one of them is near black. Normal motion and coloured detail remain
+// the current frame, so this is not whole-frame motion blur.
+static const char* DarkFlickerFragmentShaderGlsl = R"_(#version 320 es
+    precision highp float;
+    in vec2 PSTexCoord;
+    uniform sampler2D CurrentTexture;
+    uniform sampler2D PreviousTexture;
+    uniform int HavePrevious;
+    out vec4 FragColor;
+    float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+    void main() {
+        vec3 current = texture(CurrentTexture, PSTexCoord).rgb;
+        if (HavePrevious == 0) { FragColor = vec4(current, 1.0); return; }
+        vec3 previous = texture(PreviousTexture, PSTexCoord).rgb;
+        float darkest = min(luma(current), luma(previous));
+        float change = max(max(abs(current.r - previous.r), abs(current.g - previous.g)), abs(current.b - previous.b));
+        float darkGate = 1.0 - smoothstep(0.08, 0.18, darkest);
+        float changeGate = smoothstep(0.12, 0.28, change);
+        float integrate = darkGate * changeGate;
+        FragColor = vec4(mix(current, (current + previous) * 0.5, integrate), 1.0);
+    }
+    )_";
+
 // Lit gun: per-face normals, a fixed key light from above and slightly in
 // front, a fill from below so the underside is never black, and a Blinn
 // highlight from the actual eye so the metal reads as metal as the gun turns.
@@ -390,6 +418,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (m_gunLitIndexBuffer != 0) glDeleteBuffers(1, &m_gunLitIndexBuffer);
         if (m_edgeProgram != 0) glDeleteProgram(m_edgeProgram);
         if (m_edgeTexture != 0) glDeleteTextures(1, &m_edgeTexture);
+        if (m_darkFlickerProgram != 0) glDeleteProgram(m_darkFlickerProgram);
+        glDeleteTextures(4, &m_sceneTemporalRaw[0][0]);
+        glDeleteTextures(4, &m_immersiveTemporalRaw[0][0]);
         if (m_gunVao != 0) glDeleteVertexArrays(1, &m_gunVao);
         if (m_gunVertexBuffer != 0) glDeleteBuffers(1, &m_gunVertexBuffer);
         if (m_upscaleVao != 0) {
@@ -649,6 +680,26 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        {
+            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, 1, &UpscaleVertexShaderGlsl, nullptr);
+            glCompileShader(vs);
+            CheckShader(vs);
+            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, 1, &DarkFlickerFragmentShaderGlsl, nullptr);
+            glCompileShader(fs);
+            CheckShader(fs);
+            m_darkFlickerProgram = glCreateProgram();
+            glAttachShader(m_darkFlickerProgram, vs);
+            glAttachShader(m_darkFlickerProgram, fs);
+            glLinkProgram(m_darkFlickerProgram);
+            CheckProgram(m_darkFlickerProgram);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            m_darkFlickerCurrentLocation = glGetUniformLocation(m_darkFlickerProgram, "CurrentTexture");
+            m_darkFlickerPreviousLocation = glGetUniformLocation(m_darkFlickerProgram, "PreviousTexture");
+            m_darkFlickerHavePreviousLocation = glGetUniformLocation(m_darkFlickerProgram, "HavePrevious");
         }
         glGenFramebuffers(1, &m_upscaleFramebuffer);
         glGenTextures(1, &m_upscaleTexture);
@@ -1004,7 +1055,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
 
         glBindVertexArray(0);
 
-        // The gun: one draw call per pose. Lit mesh by default; the box prototype
+        // The gun belongs to gun-game play only. Menus and driving profiles use
+        // the Touch controls without drawing Time Crisis' cosmetic weapon.
         // stays as a debug fallback (gun.model=boxes). debug.tcvr.gundemo=1 parks
         // one in front of the head so it can be photographed without a controller.
         {
@@ -1021,7 +1073,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
                 guns.pose[0] = demo;
             }
             const bool boxes = arcadexr::config::GetString("gun.model", "mesh") == "boxes";
-            if (guns.count > 0) {
+            if (guns.count > 0 && !arcadexr::ui::Menu::Get().IsOpen() && !arcadexr::profiles::IsDriving()) {
                 if (boxes && m_gunVertexCount > 0) {
                     glUseProgram(m_gunProgram);
                     glBindVertexArray(m_gunVao);
@@ -1053,19 +1105,14 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    // The menu panel: world-locked 1.3 m in front of where the head was when it
-    // opened, drawn last, over everything, with the screen quad's geometry.
-    void RenderMenu(const XrPosef& eyePose, const XrMatrix4x4f& vp) {
+    // The menu shares the cabinet's world anchor. Y and Meta recenter already
+    // rebuild that anchor, so both menus follow them and remain binocularly
+    // centred instead of being frozen from the first eye pose that rendered.
+    void RenderMenu(const XrPosef&, const XrMatrix4x4f& vp) {
         auto& menu = arcadexr::ui::Menu::Get();
-        if (!menu.IsOpen()) { m_menuPoseValid = false; return; }
-        if (!m_menuPoseValid) {
-            const XrVector3f ahead{0.0f, 0.0f, -1.3f};
-            XrVector3f offset;
-            XrQuaternionf_RotateVector3f(&offset, &eyePose.orientation, &ahead);
-            m_menuPose.orientation = eyePose.orientation;
-            m_menuPose.position = {eyePose.position.x + offset.x, eyePose.position.y + offset.y, eyePose.position.z + offset.z};
-            m_menuPoseValid = true;
-        }
+        if (!menu.IsOpen()) return;
+        arcadexr::gun::ScreenPlane screen;
+        if (!arcadexr::video::GetVirtualScreen(screen)) return;
         std::vector<unsigned char> rgba;
         int w = 0, h = 0;
         if (menu.Render(rgba, w, h)) {
@@ -1074,9 +1121,26 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glBindTexture(GL_TEXTURE_2D, 0);
             m_menuAspect = float(w) / float(h);
         }
-        XrMatrix4x4f model;
-        const XrVector3f scale{0.9f, 0.9f / m_menuAspect, 1.0f};
-        XrMatrix4x4f_CreateTranslationRotationScale(&model, &m_menuPose.position, &m_menuPose.orientation, &scale);
+        const float width = 0.95f;
+        const float height = width / m_menuAspect;
+        const XrVector3f center{
+            screen.center.x + screen.normal.x * 0.70f,
+            screen.center.y + screen.normal.y * 0.70f,
+            screen.center.z + screen.normal.z * 0.70f};
+        XrMatrix4x4f model{};
+        model.m[0] = screen.right.x * width;
+        model.m[1] = screen.right.y * width;
+        model.m[2] = screen.right.z * width;
+        model.m[4] = screen.up.x * height;
+        model.m[5] = screen.up.y * height;
+        model.m[6] = screen.up.z * height;
+        model.m[8] = screen.normal.x;
+        model.m[9] = screen.normal.y;
+        model.m[10] = screen.normal.z;
+        model.m[12] = center.x;
+        model.m[13] = center.y;
+        model.m[14] = center.z;
+        model.m[15] = 1.0f;
         XrMatrix4x4f mvp;
         XrMatrix4x4f_Multiply(&mvp, &vp, &model);
         glDisable(GL_DEPTH_TEST);
@@ -1097,14 +1161,57 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glEnable(GL_CULL_FACE);
     }
 
+    void RunDarkFlickerPass(GLuint current, GLuint previous, GLuint target, int width, int height, bool havePrevious) {
+        glBindFramebuffer(GL_FRAMEBUFFER, m_upscaleFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+        const GLenum one[1] = {GL_COLOR_ATTACHMENT0};
+        glDrawBuffers(1, one);
+        glViewport(0, 0, width, height);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glUseProgram(m_darkFlickerProgram);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, current);
+        glUniform1i(m_darkFlickerCurrentLocation, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, previous);
+        glUniform1i(m_darkFlickerPreviousLocation, 1);
+        glUniform1i(m_darkFlickerHavePreviousLocation, havePrevious ? 1 : 0);
+        glBindVertexArray(m_upscaleVao);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        glBindVertexArray(0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+    }
+
+    void ResetSceneAssetsForSelectedGame() {
+        const std::string game = arcadexr::profiles::CurrentGame();
+        if (game == m_sceneGame) return;
+        if (m_scene.AssetsReady()) m_scene.ResetAssets();
+        m_sceneGame = game;
+        m_sceneSequence = 0;
+        m_sceneSignature.clear();
+        m_immersivePreparedSequence = 0;
+        m_sceneActive = m_immersiveActive = false;
+        m_sceneTemporalValid[0] = m_sceneTemporalValid[1] = false;
+        m_immersiveTemporalValid[0] = m_immersiveTemporalValid[1] = false;
+        m_immersiveHasImage[0] = m_immersiveHasImage[1] = false;
+        Log::Write(Log::Level::Info, Fmt("ArcadeXR scene assets selected for profile %s", game.c_str()));
+    }
+
     bool RenderImmersiveArcadeScene(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
                                     uint32_t colorTexture) {
-        if (viewIndex >= 2 || arcadexr::config::GetString("render", "cpu") != "gpu" ||
-            arcadexr::config::GetString("presentation", "screen") != "immersive") {
+        ResetSceneAssetsForSelectedGame();
+        if (viewIndex >= 2 || arcadexr::profiles::GetString("render", "cpu") != "gpu" ||
+            arcadexr::profiles::GetString("presentation", "screen") != "immersive") {
             return false;
         }
 
-        const int sceneMode = arcadexr::config::GetInt("scene.cpuRaster", 0) ? 1 : 2;
+        const int sceneMode = arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2;
         if (m_sceneEnabled != sceneMode) {
             m_sceneEnabled = sceneMode;
             arcadexr::hardware::namco_system22::EnableScene(sceneMode);
@@ -1221,8 +1328,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f hudMvp;
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
 
-        m_scene.SetImmersiveDepth(arcadexr::config::GetInt("immersive.depthTest", 1) != 0,
-                                  arcadexr::config::GetFloat("immersive.depthBias", 4e-8f));
+        m_scene.SetImmersiveDepth(arcadexr::profiles::GetInt("immersive.depthTest", 1) != 0,
+                                  arcadexr::profiles::GetFloat("immersive.depthBias", 4e-8f));
         m_scene.SetFogVoid(arcadexr::config::GetInt("immersive.fogVoid", 1) != 0);
         {
             // immersive.void = game | fog | r,g,b ; immersive.hudBand = top,bottom (fractions)
@@ -1240,10 +1347,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // emulator (MAME 53 -> 33 fps, scene rate down to 10/s). Between two
         // emulated frames the eye keeps the image and the pose it was rendered
         // with; the compositor reprojects the rotation from that pose.
-        float renderScale = arcadexr::config::GetFloat("immersive.scale", 1.0f);
-        const bool fxaa = arcadexr::config::GetInt("immersive.fxaa", 1) != 0 && m_edgeProgram != 0;
+        float renderScale = arcadexr::profiles::GetFloat("immersive.scale", 1.0f);
+        const bool fxaa = arcadexr::profiles::GetInt("immersive.fxaa", 1) != 0 && m_edgeProgram != 0;
         {
-            const int texAa = arcadexr::config::GetInt("immersive.texAA", 1);
+            const int texAa = arcadexr::profiles::GetInt("immersive.texAA", 1);
             m_scene.SetTextureSamples(texAa <= 0 ? 1 : (texAa == 1 ? 4 : 16));
             const int msaa = arcadexr::config::GetInt("immersive.msaa", 0);
             m_scene.SetMsaa(msaa >= 4 ? 4 : (msaa >= 2 ? 2 : 1));
@@ -1265,14 +1372,44 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             if (!m_immersiveBlitFbo) glGenFramebuffers(1, &m_immersiveBlitFbo);
             m_immersiveTexW = rw;
             m_immersiveTexH = rh;
+            m_immersiveTemporalValid[0] = m_immersiveTemporalValid[1] = false;
             Log::Write(Log::Level::Info, Fmt("TCVR_M15 immersive render scale %.2f -> %dx%d per eye", renderScale, rw, rh));
+        }
+        const bool stabilizeDark = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0 && m_darkFlickerProgram != 0;
+        if (stabilizeDark && !m_immersiveTemporalRaw[0][0]) glGenTextures(4, &m_immersiveTemporalRaw[0][0]);
+        if (stabilizeDark && (rw != m_immersiveTemporalW || rh != m_immersiveTemporalH)) {
+            for (int e = 0; e < 2; ++e) for (int i = 0; i < 2; ++i) {
+                glBindTexture(GL_TEXTURE_2D, m_immersiveTemporalRaw[e][i]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_immersiveTemporalW = rw; m_immersiveTemporalH = rh;
+            m_immersiveTemporalValid[0] = m_immersiveTemporalValid[1] = false;
         }
         const bool everyFrame = arcadexr::config::GetInt("immersive.everyFrame", 0) != 0;
         bool rendered = false;
         const auto begin = std::chrono::steady_clock::now();
         if (everyFrame || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
-            rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, m_immersiveTex[viewIndex], rw, rh,
-                                         reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp));
+            if (stabilizeDark) {
+                const int current = m_immersiveTemporalIndex[viewIndex] ^ 1;
+                rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, m_immersiveTemporalRaw[viewIndex][current], rw, rh,
+                                             reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp));
+                if (rendered) {
+                    RunDarkFlickerPass(m_immersiveTemporalRaw[viewIndex][current],
+                                       m_immersiveTemporalRaw[viewIndex][m_immersiveTemporalIndex[viewIndex]],
+                                       m_immersiveTex[viewIndex], rw, rh, m_immersiveTemporalValid[viewIndex]);
+                    m_immersiveTemporalIndex[viewIndex] = current;
+                    m_immersiveTemporalValid[viewIndex] = true;
+                }
+            } else {
+                rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, m_immersiveTex[viewIndex], rw, rh,
+                                             reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp));
+                m_immersiveTemporalValid[viewIndex] = false;
+            }
             if (rendered && fxaa) {
                 // The same FXAA pass as the screen window's edge filter, on the eye image.
                 if (m_immersiveAaW != rw || m_immersiveAaH != rh) {
@@ -1407,23 +1544,24 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
 
     void RenderArcadeScreen(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView) {
         m_immersiveActive = false;
+        ResetSceneAssetsForSelectedGame();
         CHECK(viewIndex < 2);
         // render=gpu: the true-3D path. Recording in the emulator is switched
         // on only while someone reads the scene.
-        const bool gpuRender = arcadexr::config::GetString("render", "cpu") == "gpu";
+        const bool gpuRender = arcadexr::profiles::GetString("render", "cpu") == "gpu";
         // Measured 21:50 on the same scene, toggling live: with the CPU rasteriser
         // kept as a fallback the emulator thread blocked in the saturated
         // rasteriser queue (dispatch 24-37 ms, MAME 55 fps, 25-75 audio underruns
         // a second); without it, dispatch 0.5 ms, MAME 59.9, no underruns. The
         // GPU draws the frame: the CPU rasteriser is off unless asked for.
-        const int mode = gpuRender ? (arcadexr::config::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
+        const int mode = gpuRender ? (arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
         if (mode != m_sceneEnabled) {
             m_sceneEnabled = mode;
             arcadexr::hardware::namco_system22::EnableScene(mode);
             m_sceneActive = false;
             Log::Write(Log::Level::Info, Fmt("TCVR_M12 render=%s scene recording mode %d", gpuRender ? "gpu" : "cpu", mode));
         }
-        if (gpuRender) RenderSceneIfNew(layerView); else m_sceneActive = false;
+        if (gpuRender) RenderSceneIfNew(viewIndex, layerView); else m_sceneActive = false;
         // The XR presentation clock runs far faster than the arcade clock, and
         // is deliberately not tied to it: between two emulated frames the screen
         // simply keeps the texture it already has. Asking what the latest frame
@@ -1440,9 +1578,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // dump request must still take effect: re-run the pass when the
         // settings signature changes. Checked once a frame, not once an eye.
         if (!haveNewFrame && m_frameWidth > 0 && (++m_settingsPoll & 1) == 0) {
-            const std::string signature = arcadexr::config::GetString("filter", "") + "|" +
-                                          arcadexr::config::GetString("sharpen", "") + "|" +
-                                          arcadexr::config::GetString("upscale", "") + "|" +
+            const std::string signature = arcadexr::profiles::GetString("filter", "edge") + "|" +
+                                          arcadexr::profiles::GetString("sharpen", "0") + "|" +
+                                          arcadexr::profiles::GetString("upscale", "1") + "|" +
                                           arcadexr::config::GetString("dump", "");
             if (signature != m_settingsSignature) {
                 m_settingsSignature = signature;
@@ -1548,11 +1686,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUseProgram(m_screenProgram);
         glUniformMatrix4fv(m_screenMvpUniformLocation, 1, GL_FALSE, reinterpret_cast<const GLfloat*>(&mvp));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_sceneActive ? m_sceneTex[viewIndex] : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
+        // A flat profile deliberately has no per-eye scene disparity. Reuse
+        // the left scene texture for both projection views instead of paying
+        // for a second identical System 22 raster pass.
+        const bool flat = arcadexr::profiles::GetString("presentation", "screen") == "flat";
+        const uint32_t sceneEye = flat ? 0u : viewIndex;
+        glBindTexture(GL_TEXTURE_2D, m_sceneActive ? m_sceneTex[sceneEye] : (m_upscaleFactor > 1 ? m_finalTexture : m_screenTexture));
         if (m_sceneActive && !m_loggedEyeRoute[viewIndex]) {
             m_loggedEyeRoute[viewIndex] = true;
             Log::Write(Log::Level::Info, Fmt("TCVR_M14 projection view %u samples scene eye %u texture=%u",
-                viewIndex, viewIndex, m_sceneTex[viewIndex]));
+                viewIndex, sceneEye, m_sceneTex[sceneEye]));
         }
         glUniform1i(m_screenTextureUniformLocation, 0);
         const auto aim = arcadexr::gun::GetAimState();
@@ -1570,7 +1713,11 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     // render=gpu: rasterise the recorded scene on the GPU, once per emulated
     // frame, for both eyes at once so they always show the same frame. The
     // CPU frame keeps being uploaded underneath as the fallback.
-    bool RenderSceneIfNew(const XrCompositionLayerProjectionView& layerView) {
+    bool RenderSceneIfNew(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView) {
+        // RenderView is called once per projection view. Latch and rasterise a
+        // new MAME scene only for view 0, then make view 1 sample that exact
+        // pair. This guarantees that both eyes see one immutable emulated frame.
+        if (viewIndex != 0) return m_sceneActive;
         if (!m_sceneInit) {
             m_sceneInit = true;
             if (!m_scene.Initialize()) {
@@ -1589,12 +1736,13 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
                 return false;
             }
         }
-        int scale = arcadexr::config::GetInt("scene.scale", 2);
+        int scale = arcadexr::profiles::GetInt("scene.scale", 2);
         scale = std::max(1, std::min(4, scale));
-        const float strength = arcadexr::config::GetFloat("stereo.strength", 0.0f);
-        const float convergence = arcadexr::config::GetFloat("stereo.convergence", 0.0f);
+        const bool forceMono = arcadexr::profiles::GetString("presentation", "screen") == "flat";
+        const float strength = forceMono ? 0.0f : arcadexr::profiles::GetFloat("stereo.strength", 0.0f);
+        const float convergence = arcadexr::profiles::GetFloat("stereo.convergence", 0.0f);
         const std::string tag = arcadexr::config::GetString("dump", "");
-        const std::string signature = Fmt("%d|%.4f|%.2f|%s", scale, strength, convergence, tag.c_str());
+        const std::string signature = Fmt("%d|%.4f|%.2f|%d|%s", scale, strength, convergence, forceMono ? 1 : 0, tag.c_str());
         if (frame->sequence == m_sceneSequence && signature == m_sceneSignature) {
             m_sceneActive = true;
             return true;
@@ -1614,14 +1762,41 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glBindTexture(GL_TEXTURE_2D, 0);
             m_sceneW = width;
             m_sceneH = height;
+            m_sceneTemporalValid[0] = m_sceneTemporalValid[1] = false;
+        }
+        const bool stabilizeDark = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0 && m_darkFlickerProgram != 0;
+        if (stabilizeDark && !m_sceneTemporalRaw[0][0]) glGenTextures(4, &m_sceneTemporalRaw[0][0]);
+        if (stabilizeDark && (width != m_sceneTemporalW || height != m_sceneTemporalH)) {
+            for (int e = 0; e < 2; ++e) for (int i = 0; i < 2; ++i) {
+                glBindTexture(GL_TEXTURE_2D, m_sceneTemporalRaw[e][i]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_sceneTemporalW = width; m_sceneTemporalH = height;
+            m_sceneTemporalValid[0] = m_sceneTemporalValid[1] = false;
         }
         const auto t0 = std::chrono::steady_clock::now();
         const bool prepared = m_scene.PrepareFrame(*frame);
         const auto t1 = std::chrono::steady_clock::now();
         if (prepared) {
-            for (int e = 0; e < 2; ++e) {
+            const int eyeCount = forceMono ? 1 : 2;
+            for (int e = 0; e < eyeCount; ++e) {
                 const float offset = (e == 0 ? -0.5f : 0.5f) * strength;
-                m_scene.RenderEye(*frame, offset, convergence, m_sceneTex[e], width, height);
+                if (stabilizeDark) {
+                    const int current = m_sceneTemporalIndex[e] ^ 1;
+                    m_scene.RenderEye(*frame, offset, convergence, m_sceneTemporalRaw[e][current], width, height);
+                    RunDarkFlickerPass(m_sceneTemporalRaw[e][current], m_sceneTemporalRaw[e][m_sceneTemporalIndex[e]],
+                                       m_sceneTex[e], width, height, m_sceneTemporalValid[e]);
+                    m_sceneTemporalIndex[e] = current;
+                    m_sceneTemporalValid[e] = true;
+                } else {
+                    m_scene.RenderEye(*frame, offset, convergence, m_sceneTex[e], width, height);
+                    m_sceneTemporalValid[e] = false;
+                }
             }
         }
         const auto t2 = std::chrono::steady_clock::now();
@@ -1632,7 +1807,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (prepared && m_scene.LastStereoPrimCount() > 0 && !tag.empty() && tag != m_sceneDumpTag) {
             m_sceneDumpTag = tag;
             std::vector<unsigned char> rgba;
-            for (int e = 0; e < 2; ++e) {
+            const int eyeCount = forceMono ? 1 : 2;
+            for (int e = 0; e < eyeCount; ++e) {
                 if (!m_scene.ReadBack(m_sceneTex[e], width, height, rgba)) continue;
                 const std::string path = arcadexr::config::ExternalDirectory() + "/dump-" + tag + (e == 0 ? "-L.ppm" : "-R.ppm");
                 if (FILE* f = std::fopen(path.c_str(), "wb")) {
@@ -1683,7 +1859,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     // arcade clock -- sixty times a second -- and never to the presentation
     // clock, which on this headset runs at 207 Hz.
     void RunUpscalePass(const XrCompositionLayerProjectionView& layerView) {
-        int requested = arcadexr::config::GetInt("upscale", 1);
+        int requested = arcadexr::profiles::GetInt("upscale", 1);
         if (requested < 1) requested = 1;
         if (requested > 4) requested = 4;
         if (requested == 1 || m_frameWidth <= 0 || m_frameHeight <= 0) {
@@ -1715,13 +1891,13 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // bilinear washes out, and the FXAA pass on top is the only mode that
         // visibly softens the polygon staircases without touching texture
         // interiors; text stays readable. +0.06 ms of GPU over bicubic.
-        const std::string filter = arcadexr::config::GetString("filter", "edge");
+        const std::string filter = arcadexr::profiles::GetString("filter", "edge");
         const bool edge = (filter == "edge");
         const int filterIndex = (filter == "nearest")    ? 0
                                 : (filter == "bilinear") ? 1
                                 : (filter == "sharp")    ? 2
                                                          : 3;   // bicubic, catmull, edge
-        float sharpen = arcadexr::config::GetFloat("sharpen", 0.0f);
+        float sharpen = arcadexr::profiles::GetFloat("sharpen", 0.0f);
         if (sharpen < 0.0f) sharpen = 0.0f;
         if (sharpen > 2.0f) sharpen = 2.0f;
 
@@ -1838,6 +2014,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLuint m_edgeTexture{0};
     GLint m_edgeSourceLocation{0};
     GLint m_edgeTargetSizeLocation{0};
+    GLuint m_darkFlickerProgram{0};
+    GLint m_darkFlickerCurrentLocation{-1};
+    GLint m_darkFlickerPreviousLocation{-1};
+    GLint m_darkFlickerHavePreviousLocation{-1};
     int m_edgeWidth{0};
     int m_edgeHeight{0};
     GLuint m_finalTexture{0};
@@ -1890,10 +2070,15 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     bool m_loggedImmersiveRoute[2]{false, false};
     int m_sceneEnabled{-1};
     GLuint m_sceneTex[2]{0, 0};
+    GLuint m_sceneTemporalRaw[2][2]{{0, 0}, {0, 0}};
+    int m_sceneTemporalIndex[2]{0, 0};
+    bool m_sceneTemporalValid[2]{false, false};
+    int m_sceneTemporalW{0}, m_sceneTemporalH{0};
     int m_sceneW{0};
     int m_sceneH{0};
     std::uint64_t m_sceneSequence{0};
     std::string m_sceneSignature;
+    std::string m_sceneGame;
     std::string m_sceneDumpTag;
     const tcvr_scene_frame* m_immersiveFrame{nullptr};
     bool m_immersiveActive{false};
@@ -1901,12 +2086,14 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     arcadexr::gun::Vec3 m_anchorCamera{}, m_anchorRight{}, m_anchorUp{}, m_anchorNormal{};
     float m_anchorScale{1.0f};
     GLuint m_immersiveTex[2]{0, 0};
+    GLuint m_immersiveTemporalRaw[2][2]{{0, 0}, {0, 0}};
+    int m_immersiveTemporalIndex[2]{0, 0};
+    bool m_immersiveTemporalValid[2]{false, false};
+    int m_immersiveTemporalW{0}, m_immersiveTemporalH{0};
     GLuint m_menuProgram{0};
     GLuint m_menuTexture{0};
     GLint m_menuMvpLocation{-1};
     GLint m_menuTexLocation{-1};
-    bool m_menuPoseValid{false};
-    XrPosef m_menuPose{};
     float m_menuAspect{1.6f};
     GLuint m_immersiveAa[2]{0, 0};
     int m_immersiveAaW{0};

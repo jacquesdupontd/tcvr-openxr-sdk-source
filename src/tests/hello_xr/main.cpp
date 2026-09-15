@@ -248,6 +248,11 @@ void android_main(struct android_app* app) {
         arcadexr::xr::SetSettingsDirectory(app->activity->internalDataPath);
         arcadexr::config::SetDirectory(app->activity->internalDataPath);
         arcadexr::config::SetExternalDirectory(app->activity->externalDataPath);
+        // The debug-driver path starts immediately below, before the normal
+        // frame loop gets its first chance to Poll(). Load the selected game
+        // and its per-game render profile now so automated boots cannot fall
+        // back to CPU/screen mode for their first session.
+        arcadexr::config::Poll();
         program->InitializeDevice();
         program->InitializeSession(options->AppSpace);
         program->CreateSwapchains();

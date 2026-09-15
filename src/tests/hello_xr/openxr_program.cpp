@@ -21,6 +21,7 @@
 #include "display_refresh.h"
 #include "audio_bridge.h"
 #include "settings.h"
+#include "game_profile.h"
 #include "xr_performance.h"
 #include <array>
 #include <unistd.h>
@@ -492,6 +493,7 @@ struct OpenXrProgram : IOpenXrProgram {
         bool lastPedal{false};
         bool lastStart{false};
         bool lastCoin{false};
+        bool lastView{false};
     };
 
     void InitializeActions() {
@@ -668,9 +670,10 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.grabAction, squeezeValuePath[Side::RIGHT]},
                                                             {m_input.poseAction, posePath[Side::LEFT]},
                                                             {m_input.poseAction, posePath[Side::RIGHT]},
-                                                            {m_input.quitAction, menuClickPath[Side::LEFT]},
+                                                            {m_input.quitAction, thumbstickClickPath[Side::RIGHT]},
                                                             {m_input.vibrateAction, hapticPath[Side::LEFT]},
                                                             {m_input.vibrateAction, hapticPath[Side::RIGHT]},
+                                                            {m_input.triggerAction, triggerValuePath[Side::LEFT]},
                                                             {m_input.triggerAction, triggerValuePath[Side::RIGHT]},
                                                             {m_input.pedalAction, aClickPath[Side::RIGHT]},
                                                             {m_input.startAction, bClickPath[Side::RIGHT]},
@@ -1228,8 +1231,9 @@ struct OpenXrProgram : IOpenXrProgram {
         const bool triggerEdge = triggerPressed && !m_triggerHeld;
         m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld && !menuOpen;
         // Recoil: one hard pulse per shot, on the hand that holds the gun.
-        if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen) {
-            const int ms = arcadexr::config::GetInt("haptics.ms", 120);
+        const bool driving = arcadexr::profiles::IsDriving();
+        if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen && !driving) {
+            const int ms = arcadexr::profiles::GetInt("haptics.ms", 120);
             if (ms > 0) {
                 XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
                 vibration.amplitude = 1.0f;
@@ -1242,12 +1246,16 @@ struct OpenXrProgram : IOpenXrProgram {
             }
         }
         m_triggerHeld = triggerPressed;
-        reportDigital("trigger", triggerPressed && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen, m_input.lastTrigger);
+        reportDigital("trigger", !driving && triggerPressed && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen, m_input.lastTrigger);
         // The menu: left menu button opens and closes it, the left thumbstick
         // moves and cycles, the trigger validates. Opened once at startup.
         {
             auto& menu = arcadexr::ui::Menu::Get();
+            const bool wasOpen = menu.IsOpen();
             menu.OpenSelectorOnce(!arcadexr::mame::EmulatorStarted());
+            // A controller resting on its trigger must not instantly launch the
+            // highlighted ROM when the startup selector appears.
+            if (!wasOpen && menu.IsOpen()) m_blockTriggerUntilRelease = true;
             {
                 XrActionStateGetInfo tgl{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuToggleAction, XR_NULL_PATH};
                 XrActionStateBoolean tglState{XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -1267,7 +1275,16 @@ struct OpenXrProgram : IOpenXrProgram {
                         m_menuNavHeld = false;
                     }
                 }
-                if (triggerEdge) menu.Activate();
+                XrActionStateGetInfo confirmInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.pedalAction,
+                                                 m_input.handSubactionPath[Side::RIGHT]};
+                XrActionStateBoolean confirm{XR_TYPE_ACTION_STATE_BOOLEAN};
+                const bool confirmA = XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &confirmInfo, &confirm)) &&
+                                      confirm.isActive == XR_TRUE && confirm.changedSinceLastSync == XR_TRUE &&
+                                      confirm.currentState == XR_TRUE;
+                if (wasOpen && ((triggerEdge && !m_blockTriggerUntilRelease) || confirmA)) {
+                    arcadexr::audio::PlayUiConfirm();
+                    menu.Activate();
+                }
             }
         }
 
@@ -1277,15 +1294,24 @@ struct OpenXrProgram : IOpenXrProgram {
             CHECK_XRCMD(xrGetActionStateBoolean(m_session, &info, &state));
             return state.isActive == XR_TRUE && state.currentState == XR_TRUE;
         };
-        reportDigital("pedal", readButton(m_input.pedalAction, Side::RIGHT), m_input.lastPedal);
-        reportDigital("start", readButton(m_input.startAction, Side::RIGHT), m_input.lastStart);
+        const bool faceB = readButton(m_input.startAction, Side::RIGHT);
+        XrActionStateGetInfo clickInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.crosshairAction, XR_NULL_PATH};
+        XrActionStateBoolean clickState{XR_TYPE_ACTION_STATE_BOOLEAN};
+        const bool leftStickClick = XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &clickInfo, &clickState)) &&
+                                    clickState.isActive == XR_TRUE && clickState.currentState == XR_TRUE;
+        reportDigital("pedal", (!driving || arcadexr::profiles::GetInt("driving.handBrakeOnA", 0)) &&
+                               readButton(m_input.pedalAction, Side::RIGHT) && !menuOpen, m_input.lastPedal);
+        reportDigital("start", (!driving && faceB) ||
+                               (driving && arcadexr::profiles::GetInt("driving.stickClickStart", 0) &&
+                                leftStickClick && !menuOpen), m_input.lastStart);
+        reportDigital("view", driving && faceB && !menuOpen, m_input.lastView);
         reportDigital("coin", readButton(m_input.coinAction, Side::LEFT), m_input.lastCoin);
 
         // There were no subaction paths specified for the quit action, because we don't care which hand did it.
         XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.quitAction, XR_NULL_PATH};
         XrActionStateBoolean quitValue{XR_TYPE_ACTION_STATE_BOOLEAN};
         CHECK_XRCMD(xrGetActionStateBoolean(m_session, &getInfo, &quitValue));
-        if ((quitValue.isActive == XR_TRUE) && (quitValue.changedSinceLastSync == XR_TRUE) && (quitValue.currentState == XR_TRUE)) {
+        if (!driving && (quitValue.isActive == XR_TRUE) && (quitValue.changedSinceLastSync == XR_TRUE) && (quitValue.currentState == XR_TRUE)) {
             m_calibrating = !m_calibrating;
             // Calibrating the gun used to reset the screen as well. Those are
             // two different intentions and now have two different buttons.
@@ -1306,10 +1332,10 @@ struct OpenXrProgram : IOpenXrProgram {
             Log::Write(Log::Level::Info, "TCVR_M9 arcade screen re-anchor requested by the player");
         }
 
-        if (pressedOnce(m_input.crosshairAction)) {
-            const std::string current = arcadexr::config::GetString("crosshair", "visible");
+        if (!driving && pressedOnce(m_input.crosshairAction)) {
+            const std::string current = arcadexr::profiles::GetString("crosshair", "visible");
             const char* next = (current == "visible") ? "calibration" : (current == "calibration" ? "hidden" : "visible");
-            arcadexr::config::Set("crosshair", next);
+            arcadexr::profiles::Set("crosshair", next);
             Log::Write(Log::Level::Info, Fmt("TCVR_M10 crosshair mode %s -> %s", current.c_str(), next));
         }
     }
@@ -1350,7 +1376,7 @@ struct OpenXrProgram : IOpenXrProgram {
         arcadexr::audio::LogStatsPeriodically();
         arcadexr::config::Poll();
         {
-            const std::string mode = arcadexr::config::GetString("crosshair", "visible");
+            const std::string mode = arcadexr::profiles::GetString("crosshair", "visible");
             m_crosshairMode = (mode == "hidden")        ? CrosshairMode::Hidden
                               : (mode == "calibration") ? CrosshairMode::CalibrationOnly
                                                         : CrosshairMode::Visible;
@@ -1464,6 +1490,8 @@ struct OpenXrProgram : IOpenXrProgram {
         arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating,false});
         arcadexr::gun::GunPoses gunPoses;
         bool gunTracked = false;
+        const bool driving = arcadexr::profiles::IsDriving();
+        const bool menuOpen = arcadexr::ui::Menu::Get().IsOpen();
         m_handValid[Side::LEFT] = m_handValid[Side::RIGHT] = false;
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
             XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -1498,6 +1526,7 @@ struct OpenXrProgram : IOpenXrProgram {
             const XrPosef pose = arcadexr::gun::GunPose(location.pose, hand == Side::RIGHT ? m_gunCalibration : identity);
             m_handPose[hand] = location.pose;
             m_handValid[hand] = true;
+            if (driving) continue;
             // Time Crisis has one gun. Drawing a second in the off hand was
             // wrong, and it is the aiming hand that carries it.
             const bool drawThisHand = (hand == Side::RIGHT) || m_gunBothHands;
@@ -1536,57 +1565,11 @@ struct OpenXrProgram : IOpenXrProgram {
             const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
                                                     (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating));
             arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
-            // Driving profile (System 22 racers): the wheel is the angle between
-            // the two hands, or the roll of the right hand alone; gas is the
-            // trigger, brake the grip, gears the right thumbstick.
-            {
-                const std::string profile = arcadexr::config::GetString("input.profile", "auto");
-                const bool wheel = profile == "wheel" || (profile == "auto" && arcadexr::config::GetString("game", "timecris") == "dirtdash");
-                if (wheel) {
-                    const float maxDeg = std::max(10.0f, arcadexr::config::GetFloat("driving.maxAngle", 60.0f));
-                    const float invert = arcadexr::config::GetInt("driving.invert", 0) ? -1.0f : 1.0f;
-                    float angle = 0.0f;
-                    if (m_handValid[Side::LEFT]) {
-                        const float dx = m_handPose[Side::RIGHT].position.x - m_handPose[Side::LEFT].position.x;
-                        const float dy = m_handPose[Side::RIGHT].position.y - m_handPose[Side::LEFT].position.y;
-                        const float dz = m_handPose[Side::RIGHT].position.z - m_handPose[Side::LEFT].position.z;
-                        angle = std::atan2(dy, std::sqrt(dx * dx + dz * dz));   // right hand higher = turning left
-                    } else {
-                        const XrVector3f xAxis{1.0f, 0.0f, 0.0f};
-                        XrVector3f r;
-                        XrQuaternionf_RotateVector3f(&r, &m_handPose[Side::RIGHT].orientation, &xAxis);
-                        angle = std::asin(std::max(-1.0f, std::min(1.0f, r.y)));
-                    }
-                    const float steer = 0.5f - invert * (angle / (maxDeg * 3.14159265f / 180.0f)) * 0.5f;
-                    arcadexr::input::SetAnalog("steer", std::max(0.0f, std::min(1.0f, steer)));
-                    XrActionStateGetInfo gasInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.triggerAction, m_input.handSubactionPath[Side::RIGHT]};
-                    XrActionStateFloat gas{XR_TYPE_ACTION_STATE_FLOAT};
-                    float gasValue = 0.0f;
-                    if (XR_SUCCEEDED(xrGetActionStateFloat(m_session, &gasInfo, &gas)) && gas.isActive == XR_TRUE && !arcadexr::ui::Menu::Get().IsOpen()) gasValue = gas.currentState;
-                    arcadexr::input::SetAnalog("gas", gasValue);
-                    XrActionStateGetInfo grabInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.grabAction, m_input.handSubactionPath[Side::RIGHT]};
-                    XrActionStateFloat grab{XR_TYPE_ACTION_STATE_FLOAT};
-                    float brake = 0.0f;
-                    if (XR_SUCCEEDED(xrGetActionStateFloat(m_session, &grabInfo, &grab)) && grab.isActive == XR_TRUE) brake = grab.currentState;
-                    arcadexr::input::SetAnalog("brake", brake);
-                    XrActionStateGetInfo shiftInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.driveShiftAction, XR_NULL_PATH};
-                    XrActionStateVector2f shift{XR_TYPE_ACTION_STATE_VECTOR2F};
-                    if (XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &shiftInfo, &shift)) && shift.isActive == XR_TRUE) {
-                        const float y = shift.currentState.y;
-                        if (!m_shiftHeld && std::fabs(y) > 0.6f) { m_shiftHeld = true; m_shiftPulse = 8; m_shiftDir = (y > 0.0f) ? 1 : -1; }
-                        else if (m_shiftHeld && std::fabs(y) < 0.3f) m_shiftHeld = false;
-                    }
-                    arcadexr::input::SetDigital("shift_up", m_shiftPulse > 0 && m_shiftDir > 0);
-                    arcadexr::input::SetDigital("shift_down", m_shiftPulse > 0 && m_shiftDir < 0);
-                    if (m_shiftPulse > 0) --m_shiftPulse;
-                    if (!m_loggedWheel) { m_loggedWheel = true; Log::Write(Log::Level::Info, Fmt("TCVR_M17 driving profile active (%s hands)", m_handValid[Side::LEFT] ? "two" : "one")); }
-                }
-            }
             // Arcade Screen draws the reticle in its quad shader. Immersive
             // presentation has no quad, so put the same aiming truth on the
             // invisible game projection plane as a small world-space marker.
             // Input remains the ray/plane result above; this is cosmetic only.
-            if (showCrosshair && arcadexr::config::GetString("presentation", "screen") == "immersive") {
+            if (showCrosshair && arcadexr::profiles::GetString("presentation", "screen") == "immersive") {
                 const XrVector3f point{
                     screen.center.x + screen.right.x*(hit.normalized_x-.5f)*screen.width + screen.up.x*(.5f-hit.normalized_y)*screen.height,
                     screen.center.y + screen.right.y*(hit.normalized_x-.5f)*screen.width + screen.up.y*(.5f-hit.normalized_y)*screen.height,
@@ -1616,6 +1599,113 @@ struct OpenXrProgram : IOpenXrProgram {
                 Log::Write(Log::Level::Info,Fmt("TCVR_M7 gun=%s x=%.3f y=%.3f",onScreen?"on_screen":"offscreen",hit.normalized_x,hit.normalized_y));
                 m_gunStateKnown = true;
                 m_lastGunOnScreen = onScreen;
+            }
+        }
+
+        if (driving) {
+            const std::string drivingGame = arcadexr::profiles::CurrentGame();
+            if (drivingGame != m_drivingGame) {
+                m_drivingGame = drivingGame;
+                m_driveSelectionMode = true;
+                m_driveConfirmCount = 0;
+                m_driveSelectionSteer = 0.5f;
+                m_driveSelectionStickHeld = m_driveConfirmHeld = false;
+            }
+            const bool wheelSelection = arcadexr::profiles::GetInt("driving.wheelSelection", 0) != 0;
+            float steer = 0.5f;
+            const std::string controls = arcadexr::profiles::GetString("driving.controls", "stick");
+            XrActionStateGetInfo navInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuNavAction, XR_NULL_PATH};
+            XrActionStateVector2f nav{XR_TYPE_ACTION_STATE_VECTOR2F};
+            float stickX = 0.0f;
+            if (!menuOpen && XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &navInfo, &nav)) && nav.isActive == XR_TRUE)
+                stickX = nav.currentState.x;
+
+            if (!menuOpen && controls == "wheel" && m_handValid[Side::RIGHT]) {
+                const float maxDeg = std::max(10.0f, arcadexr::profiles::GetFloat("driving.maxAngle", 60.0f));
+                const float invert = arcadexr::profiles::GetInt("driving.invert", 0) ? -1.0f : 1.0f;
+                float angle = 0.0f;
+                if (m_handValid[Side::LEFT]) {
+                    const float dx = m_handPose[Side::RIGHT].position.x - m_handPose[Side::LEFT].position.x;
+                    const float dy = m_handPose[Side::RIGHT].position.y - m_handPose[Side::LEFT].position.y;
+                    const float dz = m_handPose[Side::RIGHT].position.z - m_handPose[Side::LEFT].position.z;
+                    angle = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+                } else {
+                    const XrVector3f xAxis{1.0f, 0.0f, 0.0f};
+                    XrVector3f right;
+                    XrQuaternionf_RotateVector3f(&right, &m_handPose[Side::RIGHT].orientation, &xAxis);
+                    angle = std::asin(std::max(-1.0f, std::min(1.0f, right.y)));
+                }
+                steer = 0.5f - invert * (angle / (maxDeg * 3.14159265f / 180.0f)) * 0.5f;
+            } else if (!menuOpen && wheelSelection && m_driveSelectionMode) {
+                // Dirt Dash's selectors read an absolute cabinet wheel. A
+                // self-centring thumbstick otherwise jumps back to the middle
+                // car/course as soon as it is released. Each deliberate flick
+                // therefore advances a retained virtual wheel position.
+                if (!m_driveSelectionStickHeld && std::fabs(stickX) > 0.6f) {
+                    m_driveSelectionStickHeld = true;
+                    m_driveSelectionSteer = std::max(0.05f, std::min(0.95f,
+                        m_driveSelectionSteer + std::copysign(0.22f, stickX)));
+                } else if (m_driveSelectionStickHeld && std::fabs(stickX) < 0.3f) {
+                    m_driveSelectionStickHeld = false;
+                }
+                steer = m_driveSelectionSteer;
+            } else if (!menuOpen) {
+                {
+                    const float deadzone = std::max(0.0f, std::min(0.4f, arcadexr::profiles::GetFloat("driving.deadzone", 0.10f)));
+                    float x = stickX;
+                    if (std::fabs(x) <= deadzone) x = 0.0f;
+                    else x = std::copysign((std::fabs(x) - deadzone) / (1.0f - deadzone), x);
+                    const float range = controls == "stick_direct" ? 0.5f :
+                        std::max(0.10f, std::min(0.5f, arcadexr::profiles::GetFloat("driving.stickRange", 0.22f)));
+                    steer = 0.5f + x * range;
+                }
+            }
+            arcadexr::input::SetAnalog("steer", std::max(0.0f, std::min(1.0f, steer)));
+
+            auto readTrigger = [this, menuOpen](int hand) {
+                XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.triggerAction, m_input.handSubactionPath[hand]};
+                XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+                if (!menuOpen && XR_SUCCEEDED(xrGetActionStateFloat(m_session, &info, &state)) && state.isActive == XR_TRUE)
+                    return state.currentState;
+                return 0.0f;
+            };
+            const float rightTrigger = readTrigger(Side::RIGHT);
+            XrActionStateGetInfo aInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.pedalAction,
+                                       m_input.handSubactionPath[Side::RIGHT]};
+            XrActionStateBoolean aState{XR_TYPE_ACTION_STATE_BOOLEAN};
+            const bool buttonA = !menuOpen && XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &aInfo, &aState)) &&
+                                 aState.isActive == XR_TRUE && aState.currentState == XR_TRUE;
+            const float gas = std::max(rightTrigger,
+                buttonA && arcadexr::profiles::GetInt("driving.aGas", 0) ? 1.0f : 0.0f);
+            arcadexr::input::SetAnalog("gas", gas);
+            arcadexr::input::SetAnalog("brake", readTrigger(Side::LEFT));
+            const bool confirming = gas > 0.5f;
+            if (wheelSelection && m_driveSelectionMode && confirming && !m_driveConfirmHeld) {
+                ++m_driveConfirmCount;
+                if (m_driveConfirmCount >= 3) {
+                    m_driveSelectionMode = false;
+                    Log::Write(Log::Level::Info, "TCVR_M17 Dirt Dash selectors complete; thumbstick now self-centres for racing");
+                }
+            }
+            m_driveConfirmHeld = confirming;
+
+            XrActionStateGetInfo shiftInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.driveShiftAction, XR_NULL_PATH};
+            XrActionStateVector2f shift{XR_TYPE_ACTION_STATE_VECTOR2F};
+            if (!menuOpen && XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &shiftInfo, &shift)) && shift.isActive == XR_TRUE) {
+                const float y = shift.currentState.y;
+                if (!m_shiftHeld && std::fabs(y) > 0.6f) { m_shiftHeld = true; m_shiftPulse = 8; m_shiftDir = (y > 0.0f) ? 1 : -1; }
+                else if (m_shiftHeld && std::fabs(y) < 0.3f) m_shiftHeld = false;
+            } else if (menuOpen) {
+                m_shiftHeld = false;
+                m_shiftPulse = 0;
+            }
+            arcadexr::input::SetDigital("shift_up", m_shiftPulse > 0 && m_shiftDir > 0);
+            arcadexr::input::SetDigital("shift_down", m_shiftPulse > 0 && m_shiftDir < 0);
+            if (m_shiftPulse > 0) --m_shiftPulse;
+            if (!m_loggedDriving || controls != m_loggedDrivingControls) {
+                m_loggedDriving = true;
+                m_loggedDrivingControls = controls;
+                Log::Write(Log::Level::Info, Fmt("TCVR_M17 driving controls=%s steer=left-stick gas=right-trigger brake=left-trigger view=B shift=right-stick", controls.c_str()));
             }
         }
         arcadexr::gun::SetGunPoses(gunPoses);
@@ -1733,7 +1823,14 @@ struct OpenXrProgram : IOpenXrProgram {
     int m_shiftPulse{0};
     int m_shiftDir{0};
     bool m_shiftHeld{false};
-    bool m_loggedWheel{false};
+    bool m_loggedDriving{false};
+    std::string m_loggedDrivingControls;
+    std::string m_drivingGame;
+    bool m_driveSelectionMode{true};
+    bool m_driveSelectionStickHeld{false};
+    bool m_driveConfirmHeld{false};
+    int m_driveConfirmCount{0};
+    float m_driveSelectionSteer{0.5f};
     XrQuaternionf m_gunCalibration{0, 0, 0, 1};
     bool m_gunStateKnown{false};
     bool m_lastGunOnScreen{false};
