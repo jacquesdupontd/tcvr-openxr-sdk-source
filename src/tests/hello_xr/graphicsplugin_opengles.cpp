@@ -2004,9 +2004,15 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // same angular size as the screen: m2.hudDistance metres (3 by default),
         // further than the 2 m world reference so the HUD stops sitting on the
         // player's nose while the road runs underneath.
-        const float hudDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 3.0f));
+        const float hudDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 10.0f));
         const float hudK = hudDistance / distance;
-        const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudDistance, camera.y - screen.normal.y * hudDistance, camera.z - screen.normal.z * hudDistance};
+        // MEASURED 15/09: Sega Rally puts the speed/time HUD along the BOTTOM
+        // of its 4:3 frame. On a flat plane facing the player that bottom edge
+        // dips below the eye and the vertical plane pokes into the road ("le
+        // compteur est dans la route"). Lift the whole HUD plane up along the
+        // screen up axis. m2.hudLift in metres.
+        const float hudLift = arcadexr::config::GetFloat("m2.hudLift", 1.8f);
+        const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudDistance + screen.up.x * hudLift, camera.y - screen.normal.y * hudDistance + screen.up.y * hudLift, camera.z - screen.normal.z * hudDistance + screen.up.z * hudLift};
         XrMatrix4x4f hudToWorld{};
         hudToWorld.m[0] = screen.right.x * screen.width * hudK; hudToWorld.m[1] = screen.right.y * screen.width * hudK; hudToWorld.m[2] = screen.right.z * screen.width * hudK;
         hudToWorld.m[4] = screen.up.x * screen.height * hudK;   hudToWorld.m[5] = screen.up.y * screen.height * hudK;   hudToWorld.m[6] = screen.up.z * screen.height * hudK;
@@ -2014,13 +2020,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         hudToWorld.m[12] = hudCenter.x; hudToWorld.m[13] = hudCenter.y; hudToWorld.m[14] = hudCenter.z; hudToWorld.m[15] = 1.0f;
         XrMatrix4x4f hudMvp; XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
         XrMatrix4x4f hudToWorldBack{};
-        const arcadexr::gun::Vec3 backCenter{camera.x - normalP.x * hudDistance, camera.y - normalP.y * hudDistance, camera.z - normalP.z * hudDistance};
+        const arcadexr::gun::Vec3 backCenter{camera.x - normalP.x * hudDistance + screen.up.x * hudLift, camera.y - normalP.y * hudDistance + screen.up.y * hudLift, camera.z - normalP.z * hudDistance + screen.up.z * hudLift};
         hudToWorldBack.m[0] = screen.right.x * screen.width * hudK; hudToWorldBack.m[1] = screen.right.y * screen.width * hudK; hudToWorldBack.m[2] = screen.right.z * screen.width * hudK;
         hudToWorldBack.m[4] = upP.x * screen.height * hudK; hudToWorldBack.m[5] = upP.y * screen.height * hudK; hudToWorldBack.m[6] = upP.z * screen.height * hudK;
         hudToWorldBack.m[8] = normalP.x; hudToWorldBack.m[9] = normalP.y; hudToWorldBack.m[10] = normalP.z;
         hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
         XrMatrix4x4f hudMvpBack; XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
-        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("immersive.scale", 1.0f)));
+        // MEASURED 15/09: full per-eye resolution with MSAA 4x drops the race
+        // to ~30/120 (GPU bound: two eyes, two passes, high overdraw). 0.8 and
+        // MSAA 2x hold it; both are live-tunable if the player wants sharper.
+        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 0.8f)));
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
         if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
@@ -2043,7 +2052,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // the mirror) z-fought: see-through shimmer. 6e-7 is five quanta.
         m_m2Gpu.SetDepthBias(arcadexr::config::GetFloat("m2.immersiveDepthBias", 6.0e-7f));
         m_m2Gpu.SetEdgeFade(arcadexr::config::GetFloat("m2.immersiveEdgeFade", 20.0f));
-        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 4))));
+        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 2))));
         m_m2Gpu.SetRaw(arcadexr::config::GetInt("m2.immersiveRaw", 1) != 0);
         m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 32));
         bool rendered = false;
