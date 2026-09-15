@@ -16,6 +16,7 @@
 #include "scene_bridge.h"
 #include "menu.h"
 #include "stereo_renderer.h"
+#include "gpu_renderer.h"
 #include <chrono>
 #include <cmath>
 #include "virtual_screen.h"
@@ -1638,6 +1639,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
             glBindTexture(GL_TEXTURE_2D, 0);
             m_lastFrameSequence = got.sequence;
+            MaybeRenderModel2Gpu();
             RunUpscalePass(layerView);
             if (!m_loggedScreenUpload) {
                 Log::Write(Log::Level::Info, Fmt("TCVR_M4 XR screen texture upload seq=%llu size=%dx%d (direct BGRA)",
@@ -1892,6 +1894,73 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     // a new emulated frame has just been uploaded, so its cost is tied to the
     // arcade clock -- sixty times a second -- and never to the presentation
     // clock, which on this headset runs at 207 Hz.
+    // Rasterise the recorded Model 2 scene on the GPU, into a texture the
+    // upscale pass then reads instead of the emulator's framebuffer. Opt-in,
+    // and MAME's own rasteriser keeps running as the oracle: the point of this
+    // first step is to compare, not yet to look better.
+    void MaybeRenderModel2Gpu() {
+        static const int requested = [] {
+            char value[PROP_VALUE_MAX] = {};
+            if (__system_property_get("debug.tcvr.m2.gpuRaster", value) <= 0) return 0;
+            const int n = atoi(value);
+            return (n < 0) ? 0 : (n > 4 ? 4 : n);
+        }();
+        if (requested == 0) return;
+        if (!arcadexr::hardware::sega_model2::HaveSceneSource()) return;
+
+        // Ask for the recording only once something reads it.
+        if (!m_m2Requested) {
+            m_m2Requested = true;
+            arcadexr::hardware::sega_model2::EnableScene(1);
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2GPU recording requested, scale x%d", requested));
+            return;   // the first scene lands on the next frame
+        }
+        if (!m_m2Gpu.Ready() && !m_m2GpuFailed) {
+            if (!m_m2Gpu.Initialize()) {
+                m_m2GpuFailed = true;
+                Log::Write(Log::Level::Error,
+                           Fmt("TCVR_M2GPU disabled: %s", m_m2Gpu.LastError().c_str()));
+                return;
+            }
+        }
+        if (m_m2GpuFailed) return;
+
+        const tcvr_m2_frame* frame = arcadexr::hardware::sega_model2::AcquireScene();
+        if (frame == nullptr || frame->sequence == m_m2LastSequence) return;
+        m_m2LastSequence = frame->sequence;
+
+        const int width = (frame->width > 0 ? frame->width : 496) * requested;
+        const int height = (frame->height > 0 ? frame->height : 384) * requested;
+        if (m_m2Texture == 0) glGenTextures(1, &m_m2Texture);
+        if (width != m_m2Width || height != m_m2Height) {
+            glBindTexture(GL_TEXTURE_2D, m_m2Texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_m2Width = width;
+            m_m2Height = height;
+        }
+
+        if (!m_m2Gpu.PrepareFrame(*frame)) return;
+        if (!m_m2Gpu.RenderTo(m_m2Texture, width, height, requested)) {
+            m_m2GpuFailed = true;
+            Log::Write(Log::Level::Error, Fmt("TCVR_M2GPU render failed: %s", m_m2Gpu.LastError().c_str()));
+            return;
+        }
+        m_m2SourceTexture = m_m2Texture;
+
+        if (++m_m2Frames % 60 == 0) {
+            Log::Write(Log::Level::Info,
+                       Fmt("TCVR_M2GPU %dx%d prims=%u verts=%u dirty_blocks=%u dropped=%u",
+                           width, height, m_m2Gpu.LastPrimCount(), m_m2Gpu.LastVertexCount(),
+                           m_m2Gpu.LastDirtyBlocks(), frame->dropped_prims));
+        }
+    }
+
     void RunUpscalePass(const XrCompositionLayerProjectionView& layerView) {
         int requested = arcadexr::profiles::GetInt("upscale", 1);
         if (requested < 1) requested = 1;
@@ -1946,7 +2015,11 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glUniform1i(m_upscaleFilterLocation, filterIndex);
         glUniform1f(m_upscaleSharpenLocation, sharpen);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_screenTexture);
+        // The Model 2 GPU pass, when it runs, produces the same 3D layer the
+        // CPU rasteriser would have written -- at any resolution. Everything
+        // downstream (filter, quad, stereo) is left untouched so the two paths
+        // are comparable.
+        glBindTexture(GL_TEXTURE_2D, m_m2SourceTexture != 0 ? m_m2SourceTexture : m_screenTexture);
         glUniform1i(m_upscaleSourceLocation, 0);
         glBindVertexArray(m_upscaleVao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
@@ -2055,6 +2128,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     int m_edgeWidth{0};
     int m_edgeHeight{0};
     GLuint m_finalTexture{0};
+    // Model 2 GPU rasteriser: its output texture, and the override the upscale
+    // pass reads instead of the emulator framebuffer once it has produced one.
+    arcadexr::hardware::sega_model2::GpuRenderer m_m2Gpu;
+    GLuint m_m2Texture{0};
+    GLuint m_m2SourceTexture{0};
+    int m_m2Width{0}, m_m2Height{0};
+    bool m_m2Requested{false};
+    bool m_m2GpuFailed{false};
+    std::uint64_t m_m2LastSequence{0};
+    unsigned m_m2Frames{0};
     std::string m_lastDumpTag;
     std::string m_settingsSignature;
     unsigned m_settingsPoll{0};
