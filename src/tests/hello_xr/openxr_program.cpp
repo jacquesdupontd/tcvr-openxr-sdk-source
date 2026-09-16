@@ -1373,9 +1373,26 @@ struct OpenXrProgram : IOpenXrProgram {
         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         std::vector<XrCompositionLayerProjectionView> projectionLayerViews;
         std::vector<XrCompositionLayerDepthInfoKHR> depthInfos;
+        bool renderLayerOk = false;
         if (frameState.shouldRender == XR_TRUE) {
-            if (RenderLayer(frameState.predictedDisplayTime, projectionLayerViews, depthInfos, layer)) {
+            renderLayerOk = RenderLayer(frameState.predictedDisplayTime, projectionLayerViews, depthInfos, layer);
+            if (renderLayerOk) {
                 layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+            }
+        }
+        {
+            // SUBMIT PROBE (16/09): the last link. If layers is empty, xrEndFrame
+            // presents nothing and the compositor freezes on the previous frame,
+            // reprojected by head pose -- exactly the reported freeze.
+            static unsigned s_tick = 0, s_submitted = 0, s_shouldRender = 0, s_layerOk = 0;
+            if (frameState.shouldRender == XR_TRUE) s_shouldRender++;
+            if (renderLayerOk) s_layerOk++;
+            if (!layers.empty()) s_submitted++;
+            if ((++s_tick % 120u) == 0u) {
+                __android_log_print(ANDROID_LOG_INFO, "TCVR_M0",
+                    "SUBMIT/120f: shouldRender=%u renderLayerOk=%u layersSubmitted=%u",
+                    s_shouldRender, s_layerOk, s_submitted);
+                s_shouldRender = s_layerOk = s_submitted = 0;
             }
         }
 

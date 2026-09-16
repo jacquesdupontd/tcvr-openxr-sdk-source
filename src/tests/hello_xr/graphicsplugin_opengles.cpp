@@ -2142,8 +2142,10 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 96))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
         immTrace("render");
+        const bool chainReRender = (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
+        bool chainBlit = false;
         bool rendered = false;
-        if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
+        if (chainReRender) {
             rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp), reinterpret_cast<const float*>(&hudMvpBack),
                                                focusX, focusY, frame->crtc_xoffset, frame->crtc_yoffset);
             if (rendered) { m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders; }
@@ -2154,12 +2156,25 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             rendered = true;
         }
         if (rendered) {
+            chainBlit = true;
             glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
             glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveTex[viewIndex], 0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
             glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
                               layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
+        if (viewIndex == 0) {
+            static std::uint64_t s_lastAcq = 0; static unsigned s_reRender = 0, s_reuse = 0, s_blit = 0, s_tick = 0;
+            if (chainReRender) s_reRender++; else s_reuse++;
+            if (chainBlit) s_blit++;
+            if ((++s_tick % 120u) == 0u) {
+                __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU",
+                    "CHAIN/120f: acqSeq=%llu (advanced=%d) renderedSeq=%llu reRender=%u reuse=%u blit=%u swapTex=%u",
+                    (unsigned long long)frame->sequence, frame->sequence != s_lastAcq ? 1 : 0,
+                    (unsigned long long)m_immersiveRenderedSeq[viewIndex], s_reRender, s_reuse, s_blit, colorTexture);
+                s_lastAcq = frame->sequence; s_reRender = s_reuse = s_blit = 0;
+            }
         }
         {
             // dump=<tag>: the Model 2 immersive eye texture, one PPM per eye,
