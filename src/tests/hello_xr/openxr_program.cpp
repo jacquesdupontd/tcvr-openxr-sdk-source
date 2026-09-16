@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
 #include "openxr/openxr.h"
 #include "pch.h"
 #include "common.h"
@@ -924,7 +925,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 // than a constant because what it costs is a judgement call.
                 float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.0f);
                 if (scale < 0.3f) scale = 0.3f;
-                if (scale > 1.0f) scale = 1.0f;
+                if (scale > 2.0f) scale = 2.0f;   // allow >1.0 = supersampling (sharper, at fill cost)
                 swapchainCreateInfo.width = uint32_t(vp.recommendedImageRectWidth * scale);
                 swapchainCreateInfo.height = uint32_t(vp.recommendedImageRectHeight * scale);
                 Log::Write(Log::Level::Info, Fmt("TCVR_M12 eye %u swapchain %ux%u (scale %.2f of %ux%u)", i,
@@ -1116,6 +1117,12 @@ struct OpenXrProgram : IOpenXrProgram {
                     // cheap lever before the emulated CPUs themselves are the wall.
                     arcadexr::xr::PinEmulatorAndRenderer(emulator, (uint32_t)gettid());
                     m_nextPinTime = 1;  // re-check from the frame loop
+                    // ADPF (17/09): give the scheduler our frame deadline over the
+                    // render+emulator threads. perf.adpf=0 disables for A/B.
+                    if (arcadexr::config::GetInt("perf.adpf", 1)) {
+                        const int hz = std::max(30, std::min(120, arcadexr::config::GetInt("perf.adpfHz", 90)));
+                        arcadexr::xr::EnableAdpf((uint32_t)gettid(), emulator, 1000000000LL / hz);
+                    }
                 }
                 break;
             }
@@ -1365,6 +1372,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrFrameWaitInfo frameWaitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         CHECK_XRCMD(xrWaitFrame(m_session, &frameWaitInfo, &frameState));
+        const auto adpfStart = std::chrono::steady_clock::now();  // ADPF: measure the frame WORK (post-wait)
 
         XrFrameBeginInfo frameBeginInfo{XR_TYPE_FRAME_BEGIN_INFO};
         CHECK_XRCMD(xrBeginFrame(m_session, &frameBeginInfo));
@@ -1432,6 +1440,7 @@ struct OpenXrProgram : IOpenXrProgram {
         frameEndInfo.layerCount = (uint32_t)layers.size();
         frameEndInfo.layers = layers.data();
         CHECK_XRCMD(xrEndFrame(m_session, &frameEndInfo));
+        arcadexr::xr::ReportFrameWork(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - adpfStart).count());
         if (!m_loggedFirstEndFrame) {
             Log::Write(Log::Level::Info, "TCVR_M0 xrEndFrame succeeded");
             m_loggedFirstEndFrame = true;
