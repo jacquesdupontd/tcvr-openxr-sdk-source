@@ -1969,6 +1969,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // Work in progress: scale calibration, sky dome and the stereo window are
         // missing. Off unless m2.immersive=1, so IMMERSIF falls back to the 4x window.
         const std::string presentation = arcadexr::profiles::GetString("presentation", "screen");
+        const bool immLog = (++m_m2ImmTick % 120u) == 1u;
+        auto immTrace = [&](const char* why) { if (immLog) __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive exit=%s view=%u failed=%d requested=%d present=%s", why, viewIndex, m_m2GpuFailed?1:0, m_m2Requested?1:0, presentation.c_str()); };
         if (viewIndex >= 2 || presentation != "immersive") {
             if (!m_m2ImmLoggedGate) { m_m2ImmLoggedGate = true; __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive gate: presentation=%s", presentation.c_str()); }
             return false;
@@ -1984,28 +1986,35 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         if (!m_m2Gpu.Ready() && !m_m2GpuFailed) {
             if (!m_m2Gpu.Initialize()) { m_m2GpuFailed = true; Log::Write(Log::Level::Error, Fmt("TCVR_M2GPU disabled: %s", m_m2Gpu.LastError().c_str())); return false; }
         }
-        if (m_m2GpuFailed) return false;
+        if (m_m2GpuFailed) { immTrace("gpu_failed"); return false; }
         if (viewIndex == 0 || !m_m2ImmFrame) m_m2ImmFrame = arcadexr::hardware::sega_model2::AcquireScene();
         const tcvr_m2_frame* frame = m_m2ImmFrame;
-        if (!frame) return false;
+        if (!frame) { immTrace("no_frame"); return false; }
         // The geometry engine's focal length is zero until the game programs
         // it. Undoing the projection then divides by 1e-6 and the scene
         // explodes, so fall back on the flat window until it is real.
-        if (!(frame->focus_x > 1.0f) || !(frame->focus_y > 1.0f)) {
-            if (!m_m2ImmLoggedFocus) {
-                m_m2ImmLoggedFocus = true;
-                __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU",
-                                    "immersive: waiting for a real focal length (focus=%.1f,%.1f)",
-                                    frame->focus_x, frame->focus_y);
-            }
-            return false;
-        }
+        // FIXED 16/09: the geometry engine's focal length reads ZERO on most
+        // frames in scene-recording mode (measured: 47 of 51). Bailing then
+        // (the old behaviour) reused the last eye texture -- the frozen picture,
+        // while MAME published fresh geometry every frame. The focus is a slowly
+        // changing camera parameter, so cache the last real one and keep
+        // rendering the live geometry with it; only bail before we ever saw one.
+        // The geometry engine programs its focal length only when a 3D camera
+        // is active; in attract and menus it reads zero, and Sega Rally's focus
+        // is in fact the constant 512. Bailing on zero (the old behaviour) fell
+        // through to the flat window, which is empty and expensive in scene mode
+        // 2 -- the frozen, slow picture. Never bail: use the last real focus, or
+        // a sane default, and always render the live geometry.
+        if (frame->focus_x > 1.0f && frame->focus_y > 1.0f) { m_m2FocusX = frame->focus_x; m_m2FocusY = frame->focus_y; }
+        const float defFocus = arcadexr::config::GetFloat("m2.immersiveFocus", 512.0f);
+        const float focusX = m_m2FocusX > 1.0f ? m_m2FocusX : defFocus;
+        const float focusY = m_m2FocusY > 1.0f ? m_m2FocusY : defFocus;
         if (frame->sequence != m_m2ImmPrepared) {
-            if (!m_m2Gpu.PrepareFrame(*frame)) return false;
+            if (!m_m2Gpu.PrepareFrame(*frame)) { immTrace("prepare_failed"); return false; }
             m_m2ImmPrepared = frame->sequence;
         }
         arcadexr::gun::ScreenPlane screen;
-        if (!arcadexr::video::GetVirtualScreen(screen)) return false;
+        if (!arcadexr::video::GetVirtualScreen(screen)) { immTrace("no_virtual_screen"); return false; }
         const float distance = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
         // Board units per metre, as on the System 22 path: depthUnits board
         // units sit at `distance` metres, so worldScale = distance/depthUnits.
@@ -2031,7 +2040,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // backdrop pitches with the world. m2.immersivePitch=0 disables it.
         float pitchTarget = 0.0f;
         if (arcadexr::config::GetInt("m2.immersivePitch", 1) != 0 && m_m2Gpu.HaveMainView() && m_m2Gpu.HorizonRow() >= 0.0f) {
-            const float t = ((384.0f - float(m_m2Gpu.MainCenterY())) + float(frame->crtc_yoffset) - m_m2Gpu.HorizonRow()) / std::max(frame->focus_y, 1.0f);
+            const float t = ((384.0f - float(m_m2Gpu.MainCenterY())) + float(frame->crtc_yoffset) - m_m2Gpu.HorizonRow()) / std::max(focusY, 1.0f);
             pitchTarget = std::max(-0.35f, std::min(0.35f, ::atanf(t)));
         }
         pitchTarget += arcadexr::config::GetFloat("m2.immersivePitchOffset", 0.0f);
@@ -2132,10 +2141,11 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // m2.mipBias in mml units (128 = one mip level blurrier); tames text/decal shimmer.
         m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 96))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
+        immTrace("render");
         bool rendered = false;
         if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
             rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp), reinterpret_cast<const float*>(&hudMvpBack),
-                                               frame->focus_x, frame->focus_y, frame->crtc_xoffset, frame->crtc_yoffset);
+                                               focusX, focusY, frame->crtc_xoffset, frame->crtc_yoffset);
             if (rendered) { m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders; }
             else { m_m2GpuFailed = true; __android_log_print(ANDROID_LOG_ERROR, "TCVR_M2GPU", "immersive render failed: %s", m_m2Gpu.LastError().c_str()); }
         } else {
@@ -2479,6 +2489,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     bool m_m2ImmLoggedGate{false};
     int m_m2SceneMode{0};
     bool m_m2ImmLoggedFocus{false};
+    unsigned m_m2ImmTick{0};
+    float m_m2FocusX{0.0f}, m_m2FocusY{0.0f};
     float m_m2Pitch{0.0f};
     std::string m_m2DumpTag[2];
     bool m_m2GpuFailed{false};
