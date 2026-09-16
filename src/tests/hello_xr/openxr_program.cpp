@@ -120,6 +120,10 @@ struct OpenXrProgram : IOpenXrProgram {
             xrDestroySwapchain(swapchain.handle);
         }
 
+        for (Swapchain swapchain : m_motionVectorSwapchains) {
+            xrDestroySwapchain(swapchain.handle);
+        }
+
         for (XrSpace visualizedSpace : m_visualizedSpaces) {
             xrDestroySpace(visualizedSpace);
         }
@@ -879,6 +883,16 @@ struct OpenXrProgram : IOpenXrProgram {
             m_colorSwapchainFormat = m_graphicsPlugin->SelectColorSwapchainFormat(true, swapchainFormats);
             m_depthSwapchainFormat = m_graphicsPlugin->SelectDepthSwapchainFormat(false, swapchainFormats);
 
+            // AppSW motion vectors need an RGBA16F swapchain (GL_RGBA16F = 0x881A).
+            // Only enable AppSW if the runtime advertises it.
+            if (m_supportsSpaceWarp) {
+                for (int64_t format : swapchainFormats) {
+                    if (format == 0x881A /* GL_RGBA16F */) { m_motionVectorSwapchainFormat = format; break; }
+                }
+                if (m_motionVectorSwapchainFormat == 0)
+                    Log::Write(Log::Level::Warning, "TCVR_M16 AppSW: no RGBA16F swapchain format; AppSW disabled");
+            }
+
             if (m_depthSwapchainFormat == -1) {
                 Log::Write(Log::Level::Info,
                            "Runtime does not support creating swapchains with a suitable depth format. Using our own  fallback "
@@ -989,6 +1003,40 @@ struct OpenXrProgram : IOpenXrProgram {
 
                     m_swapchainImages.insert(std::make_pair(swapchain.handle, std::move(swapchainImages)));
                 }
+
+                // AppSW: one motion-vector swapchain per view (RGBA16F), same
+                // resolution as the eye (avoids a size-mismatch blit for first
+                // light). Reuses the existing per-view depth swapchain as the
+                // space-warp depth. Only if the runtime advertises RGBA16F.
+                if (m_supportsSpaceWarp && m_motionVectorSwapchainFormat != 0 && m_depthSwapchainFormat != -1) {
+                    XrSwapchainCreateInfo mvCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                    mvCreateInfo.arraySize = 1;
+                    mvCreateInfo.format = m_motionVectorSwapchainFormat;
+                    mvCreateInfo.width = swapchainCreateInfo.width;
+                    mvCreateInfo.height = swapchainCreateInfo.height;
+                    mvCreateInfo.mipCount = 1;
+                    mvCreateInfo.faceCount = 1;
+                    mvCreateInfo.sampleCount = 1;
+                    mvCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+                    Swapchain mvSwapchain;
+                    mvSwapchain.width = mvCreateInfo.width;
+                    mvSwapchain.height = mvCreateInfo.height;
+                    CHECK_XRCMD(xrCreateSwapchain(m_session, &mvCreateInfo, &mvSwapchain.handle));
+                    m_motionVectorSwapchains.push_back(mvSwapchain);
+                    uint32_t mvImageCount;
+                    CHECK_XRCMD(xrEnumerateSwapchainImages(mvSwapchain.handle, 0, &mvImageCount, nullptr));
+                    ISwapchainImageData* mvImages = m_graphicsPlugin->AllocateSwapchainImageData(mvImageCount, mvCreateInfo);
+                    CHECK_XRCMD(xrEnumerateSwapchainImages(mvSwapchain.handle, mvImageCount, &mvImageCount,
+                                                           mvImages->GetColorImageArray()));
+                    m_swapchainImages.insert(std::make_pair(mvSwapchain.handle, std::move(mvImages)));
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M16 AppSW motion-vector swapchain view=%d %dx%d", i,
+                                                     mvSwapchain.width, mvSwapchain.height));
+                }
+            }
+            if (m_supportsSpaceWarp && m_motionVectorSwapchains.size() == m_swapchains.size() &&
+                !m_motionVectorSwapchains.empty()) {
+                m_appswActive = true;
+                Log::Write(Log::Level::Info, "TCVR_M16 AppSW ACTIVE: motion+depth submission enabled");
             }
         }
     }
@@ -1530,6 +1578,7 @@ struct OpenXrProgram : IOpenXrProgram {
 
         projectionLayerViews.resize(viewCountOutput);
         if (m_supportsDepthLayer) depthInfos.resize(viewCountOutput);
+        if (m_appswActive) m_spaceWarpInfos.resize(viewCountOutput);
         std::vector<Cube> cubes;
         cubes.reserve(64);
         arcadexr::gun::SetAimState({false,0.5f,0.5f,m_calibrating,false});
@@ -1785,7 +1834,11 @@ struct OpenXrProgram : IOpenXrProgram {
             projectionLayerViews[i].subImage.imageRect.offset = {0, 0};
             projectionLayerViews[i].subImage.imageRect.extent = {viewSwapchain.width, viewSwapchain.height};
 
-            if (m_supportsDepthLayer) {
+            // When AppSW is active the space-warp info carries its own depth, so
+            // the plain depth layer is not chained (avoids referencing the same
+            // depth swapchain twice). The space-warp struct is chained below,
+            // after the view is rendered.
+            if (m_supportsDepthLayer && !m_appswActive) {
                 projectionLayerViews[i].next = &depthInfos[i];
                 depthInfos[i].type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR;
                 depthInfos[i].subImage.swapchain = m_depthSwapchains[i].handle;
@@ -1808,6 +1861,45 @@ struct OpenXrProgram : IOpenXrProgram {
             CHECK_XRCMD(xrReleaseSwapchainImage(viewSwapchain.handle, &releaseInfo));
 
             m_swapchainImages[viewSwapchain.handle]->ReleaseDepthSwapchainImage();
+
+            // AppSW: fill the motion-vector image (zero for the static world) and
+            // chain the space-warp info, which carries the scene depth we just
+            // rendered. The runtime then extrapolates the frames the app is too
+            // slow to render (exactly the dense-section dips), instead of a plain
+            // rotational reprojection.
+            if (m_appswActive && i < m_motionVectorSwapchains.size()) {
+                const Swapchain mvSwapchain = m_motionVectorSwapchains[i];
+                XrSwapchainImageAcquireInfo mvAcquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                uint32_t mvIndex;
+                CHECK_XRCMD(xrAcquireSwapchainImage(mvSwapchain.handle, &mvAcquire, &mvIndex));
+                XrSwapchainImageWaitInfo mvWait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                mvWait.timeout = XR_INFINITE_DURATION;
+                CHECK_XRCMD(xrWaitSwapchainImage(mvSwapchain.handle, &mvWait));
+                const XrSwapchainImageBaseHeader* mvImage =
+                    m_swapchainImages[mvSwapchain.handle]->GetGenericColorImage(mvIndex);
+                m_graphicsPlugin->ClearMotionVectorImage(mvImage, mvSwapchain.width, mvSwapchain.height);
+                XrSwapchainImageReleaseInfo mvRelease{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                CHECK_XRCMD(xrReleaseSwapchainImage(mvSwapchain.handle, &mvRelease));
+
+                XrCompositionLayerSpaceWarpInfoFB& sw = m_spaceWarpInfos[i];
+                sw = {XR_TYPE_COMPOSITION_LAYER_SPACE_WARP_INFO_FB};
+                sw.next = nullptr;
+                sw.layerFlags = 0;
+                sw.motionVectorSubImage.swapchain = mvSwapchain.handle;
+                sw.motionVectorSubImage.imageRect.offset = {0, 0};
+                sw.motionVectorSubImage.imageRect.extent = {mvSwapchain.width, mvSwapchain.height};
+                sw.motionVectorSubImage.imageArrayIndex = 0;
+                sw.appSpaceDeltaPose = XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+                sw.depthSubImage.swapchain = m_depthSwapchains[i].handle;
+                sw.depthSubImage.imageRect.offset = {0, 0};
+                sw.depthSubImage.imageRect.extent = {m_depthSwapchains[i].width, m_depthSwapchains[i].height};
+                sw.depthSubImage.imageArrayIndex = 0;
+                sw.minDepth = 0.0f;
+                sw.maxDepth = 1.0f;
+                sw.nearZ = 0.05f;
+                sw.farZ = 100.0f;
+                projectionLayerViews[i].next = &sw;
+            }
         }
 
         layer.space = m_appSpace;
@@ -1888,6 +1980,11 @@ struct OpenXrProgram : IOpenXrProgram {
     std::vector<Swapchain> m_swapchains;
     std::vector<Swapchain> m_depthSwapchains;
     std::map<XrSwapchain, ISwapchainImageData*> m_swapchainImages;
+    // AppSW (XR_FB_space_warp) first light.
+    std::vector<Swapchain> m_motionVectorSwapchains;
+    int64_t m_motionVectorSwapchainFormat{0};
+    bool m_appswActive{false};
+    std::vector<XrCompositionLayerSpaceWarpInfoFB> m_spaceWarpInfos;
     std::vector<XrView> m_views;
     int64_t m_colorSwapchainFormat{-1};
     int64_t m_depthSwapchainFormat{-1};

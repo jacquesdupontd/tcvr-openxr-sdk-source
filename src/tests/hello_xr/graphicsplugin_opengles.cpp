@@ -1004,6 +1004,20 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         return ret;
     }
 
+    // AppSW first light: zero the motion-vector image (RGBA16F). See the base
+    // class comment. Uses the shared swapchain framebuffer; detaches depth.
+    void ClearMotionVectorImage(const XrSwapchainImageBaseHeader* image, int width, int height) override {
+        const uint32_t tex = reinterpret_cast<const XrSwapchainImageOpenGLESKHR*>(image)->image;
+        glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, width, height);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
     void RenderView(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
                     int64_t swapchainFormat, const std::vector<Cube>& cubes) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.

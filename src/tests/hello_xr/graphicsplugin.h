@@ -68,6 +68,17 @@ struct IGraphicsPlugin {
     // ClearColor depends on the environment (blend mode). We will set this after initialization
     // based on the blend mode selected / available.
     virtual void SetClearColor(const std::array<float, 4> clearColor) = 0;
+
+    // AppSW (XR_FB_space_warp) first light: fill a motion-vector swapchain image
+    // with zero. For a driving game the world is static in world space, so
+    // depth + head-pose reprojection already reconstructs its screen motion;
+    // zero motion vectors are correct for it (only independently-moving cars
+    // smear a little). Default no-op for backends that do not implement AppSW.
+    virtual void ClearMotionVectorImage(const XrSwapchainImageBaseHeader* image, int width, int height) {
+        (void)image;
+        (void)width;
+        (void)height;
+    }
 };
 
 // Graphics API factories are forward declared here.
