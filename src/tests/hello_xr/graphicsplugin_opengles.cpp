@@ -1064,9 +1064,16 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // the sound carry on. That was reported twice from the headset, and it
         // is not acceptable as a default until the freeze itself is understood.
         //
-        // Off by default, therefore, and available for measurement.
-        const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 0) != 0;
-        if (viewIndex == 0 && m_m2Requested) SetM2SceneMode((m2Immersive && allowSkip) ? 2 : 1);
+        // FIXED 16/09: the freeze was mode 2 staying on when the immersive pass
+        // drew but had NO real 3D view -- intro and menus, where the board's
+        // "main view" is off-centre and RenderImmersiveModel2 only lays 2D
+        // billboards. MAME then recorded instead of rasterising and nobody
+        // produced a picture. So skip CPU raster ONLY when a centred main view
+        // exists this frame (a race); otherwise mode 1, MAME keeps drawing. Safe
+        // to default on now: the race gets 100% emulation, the rest never gluess.
+        const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 1) != 0;
+        const bool raceView = m2Immersive && m_m2Gpu.HaveMainView();
+        if (viewIndex == 0 && m_m2Requested) SetM2SceneMode((raceView && allowSkip) ? 2 : 1);
         if (!m2Immersive && !RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
             RenderArcadeScreen(viewIndex, layerView);
         }
@@ -2117,6 +2124,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 4))));
         m_m2Gpu.SetRaw(arcadexr::config::GetInt("m2.immersiveRaw", 1) != 0);
         m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 0));
+        // E1 (16/09): depth = the board's draw order, one value per polygon. m2.depthOrder=0 goes back to geometry + bias.
+        m_m2Gpu.SetDepthOrder(arcadexr::config::GetInt("m2.depthOrder", 1) != 0);
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
         bool rendered = false;
         if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {

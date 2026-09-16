@@ -171,6 +171,13 @@ static void app_handle_cmd(struct android_app* app, int32_t cmd) {
         case APP_CMD_STOP: {
             Log::Write(Log::Level::Info, "onStop()");
             Log::Write(Log::Level::Info, "    APP_CMD_STOP");
+            // MEASURED 15/09: quitting from the Meta menu delivers STOP but neither
+            // XR_SESSION_STATE_EXITING nor (reliably) DESTROY, so the process, MAME
+            // and the audio callback lived on: the game kept playing and a relaunch
+            // resumed mid-race. An arcade cabinet that is no longer visible is off.
+            arcadexr::audio::Stop();
+            arcadexr::mame::StopGame();
+            std::_Exit(0);
             break;
         }
         case APP_CMD_DESTROY: {
