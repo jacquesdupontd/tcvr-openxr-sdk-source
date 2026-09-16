@@ -2009,7 +2009,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         const float defFocus = arcadexr::config::GetFloat("m2.immersiveFocus", 512.0f);
         const float focusX = m_m2FocusX > 1.0f ? m_m2FocusX : defFocus;
         const float focusY = m_m2FocusY > 1.0f ? m_m2FocusY : defFocus;
-        if (frame->sequence != m_m2ImmPrepared) {
+        const bool forceRefresh = arcadexr::config::GetInt("m2.forceRefresh", 0) != 0;
+        if (forceRefresh || frame->sequence != m_m2ImmPrepared) {
             if (!m_m2Gpu.PrepareFrame(*frame)) { immTrace("prepare_failed"); return false; }
             m_m2ImmPrepared = frame->sequence;
         }
@@ -2146,18 +2147,33 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // six ids, so we SEE which one freezes first. rawHash is computed here
         // over the pre-XR raw geometry the immersive is about to consume.
         if (viewIndex == 0) {
+            // Colleague's test (16/09): on the SAME frame, hash the raw 3D the
+            // immersive consumes AND the 2D layer that visibly animates. If 2D
+            // changes while raw3D stays constant during motion, the bug is in the
+            // copy/publication of the 3D stream, not the game.
             std::uint32_t rawHash = 2166136261u;
             const std::size_t nb = std::min<std::size_t>(frame->raw_vertex_count * 5u, 40000u);
             const float* rv = reinterpret_cast<const float*>(frame->raw_vertices);
             for (std::size_t i = 0; i < nb; ++i) { std::uint32_t b; std::memcpy(&b, &rv[i], 4); rawHash = (rawHash ^ b) * 16777619u; }
+            std::uint32_t clipHash = 2166136261u;
+            const std::size_t nbc = std::min<std::size_t>(frame->vertex_count, 8000u);
+            for (std::size_t i = 0; i < nbc; ++i) { std::uint32_t b; std::memcpy(&b, &frame->vertices[i].x, 4); clipHash = (clipHash ^ b) * 16777619u; std::memcpy(&b, &frame->vertices[i].y, 4); clipHash = (clipHash ^ b) * 16777619u; }
+            std::uint32_t hud2d = 2166136261u;
+            if (frame->front2d && frame->front2d_stride && frame->width > 0 && frame->height > 0) {
+                for (int y = 0; y < frame->height; y += 8) { const std::uint32_t* row = frame->front2d + std::size_t(y) * frame->front2d_stride; for (int x = 0; x < frame->width; x += 8) hud2d = (hud2d ^ row[x]) * 16777619u; }
+            }
+            std::uint32_t back2d = 2166136261u;
+            if (frame->back2d && frame->back2d_stride && frame->width > 0 && frame->height > 0) {
+                for (int y = 0; y < frame->height; y += 8) { const std::uint32_t* row = frame->back2d + std::size_t(y) * frame->back2d_stride; for (int x = 0; x < frame->width; x += 8) back2d = (back2d ^ row[x]) * 16777619u; }
+            }
             static unsigned s_t = 0;
             if ((s_t++ % 30u) == 0u)
                 __android_log_print(ANDROID_LOG_INFO, "TCVR_TABLE",
-                    "mameFrame=%u emuTime=%.3f rawHashPreXR=%08x sceneGen=%llu gpuConsumedScene=%llu xrFrame=%u",
-                    frame->mame_frame, frame->emu_time, rawHash,
-                    (unsigned long long)frame->sequence, (unsigned long long)m_immersiveRenderedSeq[viewIndex], s_t);
+                    "mameFrame=%u emuTime=%.3f raw3D=%08x clip3D=%08x hud2d=%08x back2d=%08x rawCount=%u sceneGen=%llu",
+                    frame->mame_frame, frame->emu_time, rawHash, clipHash, hud2d, back2d, frame->raw_vertex_count,
+                    (unsigned long long)frame->sequence);
         }
-        const bool chainReRender = (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
+        const bool chainReRender = (forceRefresh || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
         bool chainBlit = false;
         bool rendered = false;
         if (chainReRender) {
