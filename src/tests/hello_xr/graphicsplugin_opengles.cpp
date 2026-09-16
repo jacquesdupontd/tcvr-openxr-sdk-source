@@ -2142,6 +2142,21 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 96))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
         immTrace("render");
+        // NO-HYPOTHESIS CHAIN TABLE (16/09, Guillaume's demand): one line, the
+        // six ids, so we SEE which one freezes first. rawHash is computed here
+        // over the pre-XR raw geometry the immersive is about to consume.
+        if (viewIndex == 0) {
+            std::uint32_t rawHash = 2166136261u;
+            const std::size_t nb = std::min<std::size_t>(frame->raw_vertex_count * 5u, 40000u);
+            const float* rv = reinterpret_cast<const float*>(frame->raw_vertices);
+            for (std::size_t i = 0; i < nb; ++i) { std::uint32_t b; std::memcpy(&b, &rv[i], 4); rawHash = (rawHash ^ b) * 16777619u; }
+            static unsigned s_t = 0;
+            if ((s_t++ % 30u) == 0u)
+                __android_log_print(ANDROID_LOG_INFO, "TCVR_TABLE",
+                    "mameFrame=%u emuTime=%.3f rawHashPreXR=%08x sceneGen=%llu gpuConsumedScene=%llu xrFrame=%u",
+                    frame->mame_frame, frame->emu_time, rawHash,
+                    (unsigned long long)frame->sequence, (unsigned long long)m_immersiveRenderedSeq[viewIndex], s_t);
+        }
         const bool chainReRender = (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
         bool chainBlit = false;
         bool rendered = false;
