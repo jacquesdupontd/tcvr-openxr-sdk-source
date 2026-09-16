@@ -2034,6 +2034,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             const float t = ((384.0f - float(m_m2Gpu.MainCenterY())) + float(frame->crtc_yoffset) - m_m2Gpu.HorizonRow()) / std::max(frame->focus_y, 1.0f);
             pitchTarget = std::max(-0.35f, std::min(0.35f, ::atanf(t)));
         }
+        pitchTarget += arcadexr::config::GetFloat("m2.immersivePitchOffset", 0.0f);
         if (viewIndex == 0) m_m2Pitch += (pitchTarget - m_m2Pitch) * 0.1f;
         const float cp = ::cosf(m_m2Pitch), sp = ::sinf(m_m2Pitch);
         const arcadexr::gun::Vec3 upP{cp * screen.up.x - sp * screen.normal.x, cp * screen.up.y - sp * screen.normal.y, cp * screen.up.z - sp * screen.normal.z};
@@ -2126,6 +2127,8 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 0));
         // E1 (16/09): depth = the board's draw order, one value per polygon. m2.depthOrder=0 goes back to geometry + bias.
         m_m2Gpu.SetDepthOrder(arcadexr::config::GetInt("m2.depthOrder", 1) != 0);
+        // E2 (16/09): anisotropic taps against grazing-angle texel shimmer (road, car decals). GPU has the headroom.
+        m_m2Gpu.SetAniso(std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 4))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
         bool rendered = false;
         if (frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
