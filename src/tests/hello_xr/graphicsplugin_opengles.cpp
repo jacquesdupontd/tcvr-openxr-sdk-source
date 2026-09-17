@@ -1191,6 +1191,18 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // to default on now: the race gets 100% emulation, the rest never gluess.
         const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 1) != 0;
         const bool raceView = m2Immersive && m_m2Gpu.HaveMainView();
+        // AppSW: fill the depth swapchain with REAL geometric depth (gated, opt-in
+        // debug.tcvr.appsw.depth). The immersive colour was blitted with depth test
+        // off, so the depth swapchain is otherwise flat -> AppSW can't reproject.
+        // Replaying the opaque geometry as geometric depth gives AppSW something real.
+        if (raceView && m_m2Gpu.HasGeoDepthState() && arcadexr::config::GetInt("appsw.depth", 0) != 0) {
+            glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthTexture, 0);
+            m_m2Gpu.RenderGeoDepthInto(static_cast<int>(layerView.subImage.imageRect.extent.width),
+                                       static_cast<int>(layerView.subImage.imageRect.extent.height));
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
         if (viewIndex == 0 && m_m2Requested) SetM2SceneMode((raceView && allowSkip) ? 2 : 1);
         if (!m2Immersive && !RenderImmersiveArcadeScene(viewIndex, layerView, colorTexture)) {
             RenderArcadeScreen(viewIndex, layerView);
