@@ -369,6 +369,80 @@ static const char* GunLitFragmentShaderGlsl = R"_(#version 320 es
     }
     )_";
 
+// Snapdragon Game Super Resolution 1 (mobile), Qualcomm, BSD-3-Clause.
+// Single-pass 12-tap Lanczos-like reconstruction + adaptive sharpen, optimise
+// Adreno. Rend une source basse-res nette (bien mieux qu'un blit lineaire aux
+// gros ratios). ViewportInfo[0] = (1/srcW, 1/srcH, srcW, srcH). ps0 = source.
+static const char* SgsrVertexShaderGlsl = R"_(#version 320 es
+    layout(location=0) in vec3 VertexPos;
+    layout(location=0) out highp vec4 in_TEXCOORD0;
+    void main() {
+        gl_Position = vec4(VertexPos.xy * 2.0, 0.0, 1.0);
+        in_TEXCOORD0 = vec4(VertexPos.xy + 0.5, 0.0, 0.0);
+    }
+    )_";
+
+static const char* SgsrFragmentShaderGlsl = R"_(#version 320 es
+    precision mediump float;
+    precision highp int;
+    #define OperationMode 1
+    #define EdgeThreshold (8.0/255.0)
+    uniform highp vec4 ViewportInfo[1];
+    uniform mediump sampler2D ps0;
+    uniform mediump float EdgeSharpness;
+    layout(location=0) in highp vec4 in_TEXCOORD0;
+    layout(location=0) out vec4 out_Target0;
+    float fastLanczos2(float x){ float wA=x-4.0; float wB=x*wA-wA; wA*=wA; return wB*wA; }
+    vec2 weightY(float dx,float dy,float c,float std){ float x=((dx*dx)+(dy*dy))*0.55+clamp(abs(c)*std,0.0,1.0); float w=fastLanczos2(x); return vec2(w,w*c); }
+    void main(){
+        int mode=OperationMode; float edgeThreshold=EdgeThreshold; float edgeSharpness=EdgeSharpness;
+        vec4 color; color.xyz=textureLod(ps0,in_TEXCOORD0.xy,0.0).xyz;
+        {
+            highp vec2 imgCoord=((in_TEXCOORD0.xy*ViewportInfo[0].zw)+vec2(-0.5,0.5));
+            highp vec2 imgCoordPixel=floor(imgCoord);
+            highp vec2 coord=(imgCoordPixel*ViewportInfo[0].xy);
+            vec2 pl=(imgCoord+(-imgCoordPixel));
+            vec4 left=textureGather(ps0,coord,mode);
+            float edgeVote=abs(left.z-left.y)+abs(color[mode]-left.y)+abs(color[mode]-left.z);
+            if(edgeVote>edgeThreshold){
+                coord.x+=ViewportInfo[0].x;
+                vec4 right=textureGather(ps0,coord+highp vec2(ViewportInfo[0].x,0.0),mode);
+                vec4 upDown;
+                upDown.xy=textureGather(ps0,coord+highp vec2(0.0,-ViewportInfo[0].y),mode).wz;
+                upDown.zw=textureGather(ps0,coord+highp vec2(0.0,ViewportInfo[0].y),mode).yx;
+                float mean=(left.y+left.z+right.x+right.w)*0.25;
+                left=left-vec4(mean); right=right-vec4(mean); upDown=upDown-vec4(mean);
+                color.w=color[mode]-mean;
+                float sum=(((((abs(left.x)+abs(left.y))+abs(left.z))+abs(left.w))+(((abs(right.x)+abs(right.y))+abs(right.z))+abs(right.w)))+(((abs(upDown.x)+abs(upDown.y))+abs(upDown.z))+abs(upDown.w)));
+                float std=2.181818/sum;
+                vec2 aWY=weightY(pl.x,pl.y+1.0,upDown.x,std);
+                aWY+=weightY(pl.x-1.0,pl.y+1.0,upDown.y,std);
+                aWY+=weightY(pl.x-1.0,pl.y-2.0,upDown.z,std);
+                aWY+=weightY(pl.x,pl.y-2.0,upDown.w,std);
+                aWY+=weightY(pl.x+1.0,pl.y-1.0,left.x,std);
+                aWY+=weightY(pl.x,pl.y-1.0,left.y,std);
+                aWY+=weightY(pl.x,pl.y,left.z,std);
+                aWY+=weightY(pl.x+1.0,pl.y,left.w,std);
+                aWY+=weightY(pl.x-1.0,pl.y-1.0,right.x,std);
+                aWY+=weightY(pl.x-2.0,pl.y-1.0,right.y,std);
+                aWY+=weightY(pl.x-2.0,pl.y,right.z,std);
+                aWY+=weightY(pl.x-1.0,pl.y,right.w,std);
+                float finalY=aWY.y/aWY.x;
+                float maxY=max(max(left.y,left.z),max(right.x,right.w));
+                float minY=min(min(left.y,left.z),min(right.x,right.w));
+                finalY=clamp(edgeSharpness*finalY,minY,maxY);
+                float deltaY=finalY-color.w;
+                deltaY=clamp(deltaY,-23.0/255.0,23.0/255.0);
+                color.x=clamp((color.x+deltaY),0.0,1.0);
+                color.y=clamp((color.y+deltaY),0.0,1.0);
+                color.z=clamp((color.z+deltaY),0.0,1.0);
+            }
+        }
+        color.w=1.0;
+        out_Target0=color;
+    }
+    )_";
+
 struct ScreenVertex {
     XrVector3f Position;
     XrVector2f TexCoord;
@@ -700,6 +774,36 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        {
+            // Snapdragon GSR : programme dédié + VAO propre (VertexPos en location=0).
+            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, 1, &SgsrVertexShaderGlsl, nullptr);
+            glCompileShader(vs);
+            CheckShader(vs);
+            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, 1, &SgsrFragmentShaderGlsl, nullptr);
+            glCompileShader(fs);
+            CheckShader(fs);
+            m_sgsrProgram = glCreateProgram();
+            glAttachShader(m_sgsrProgram, vs);
+            glAttachShader(m_sgsrProgram, fs);
+            glLinkProgram(m_sgsrProgram);
+            CheckProgram(m_sgsrProgram);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            m_sgsrViewportLocation = glGetUniformLocation(m_sgsrProgram, "ViewportInfo[0]");
+            m_sgsrSourceLocation = glGetUniformLocation(m_sgsrProgram, "ps0");
+            m_sgsrSharpnessLocation = glGetUniformLocation(m_sgsrProgram, "EdgeSharpness");
+            const GLint sgsrPos = glGetAttribLocation(m_sgsrProgram, "VertexPos");
+            glGenVertexArrays(1, &m_sgsrVao);
+            glBindVertexArray(m_sgsrVao);
+            glBindBuffer(GL_ARRAY_BUFFER, m_screenVertexBuffer);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_screenIndexBuffer);
+            glEnableVertexAttribArray(sgsrPos);
+            glVertexAttribPointer(sgsrPos, 3, GL_FLOAT, GL_FALSE, sizeof(ScreenVertex), nullptr);
+            glBindVertexArray(0);
+            Log::Write(Log::Level::Info, Fmt("TCVR_SGSR program=%u vao=%u", m_sgsrProgram, m_sgsrVao));
         }
         {
             GLuint vs = glCreateShader(GL_VERTEX_SHADER);
@@ -2204,12 +2308,64 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         }
         if (rendered) {
             chainBlit = true;
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
-            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveTex[viewIndex], 0);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
-            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
-            glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
-                              layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            // Etage upscale : au lieu du blit LINEAIRE bete (mou en montee de resolution),
+            // une passe shader Catmull-Rom + sharpen adaptatif (reutilise m_upscaleProgram,
+            // deja teste sur le chemin arcade). Gated pour ne rien casser :
+            //   debug.tcvr.m2_upscaleFilter : 0 = blit lineaire (defaut), 2 = sharp bilinear, 3 = Catmull-Rom
+            //   debug.tcvr.m2_sharpen : 0..1 (sharpen adaptatif, contre le "moche" du rendu bas->haut)
+            const int m2filter = arcadexr::config::GetInt("m2.upscaleFilter", 0);
+            const float m2sharpen = std::max(0.0f, std::min(1.0f, arcadexr::config::GetFloat("m2.sharpen", 0.0f)));
+            const bool m2sgsr = arcadexr::config::GetInt("m2.sgsr", 0) != 0;
+            if (m_sgsrProgram != 0 && m2sgsr) {
+                // Snapdragon GSR : remplace le blit lineaire. Reconstruit la source
+                // basse-res (rw x rh) vers la sortie (eyeW x eyeH) avec Lanczos + sharpen
+                // adaptatif. EdgeSharpness reglable via debug.tcvr.m2_sgsrSharpness (defaut 2.0).
+                const float sgsrSharp = std::max(0.5f, std::min(5.0f, arcadexr::config::GetFloat("m2.sgsrSharpness", 2.0f)));
+                glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+                glViewport(layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y, eyeW, eyeH);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glDisable(GL_BLEND);
+                glUseProgram(m_sgsrProgram);
+                glUniform4f(m_sgsrViewportLocation, 1.0f / float(rw), 1.0f / float(rh), float(rw), float(rh));
+                glUniform1f(m_sgsrSharpnessLocation, sgsrSharp);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, m_immersiveTex[viewIndex]);
+                glUniform1i(m_sgsrSourceLocation, 0);
+                glBindVertexArray(m_sgsrVao);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+                glBindVertexArray(0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glUseProgram(0);
+            } else if (m_upscaleProgram != 0 && (m2filter > 0 || m2sharpen > 0.0f)) {
+                glBindFramebuffer(GL_FRAMEBUFFER, m_swapchainFramebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+                glViewport(layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y, eyeW, eyeH);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glDisable(GL_BLEND);
+                glUseProgram(m_upscaleProgram);
+                glUniform2f(m_upscaleSourceSizeLocation, float(rw), float(rh));
+                glUniform2f(m_upscaleTargetSizeLocation, float(eyeW), float(eyeH));
+                glUniform1i(m_upscaleFilterLocation, m2filter > 0 ? m2filter : 3);
+                glUniform1f(m_upscaleSharpenLocation, m2sharpen);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, m_immersiveTex[viewIndex]);
+                glUniform1i(m_upscaleSourceLocation, 0);
+                glBindVertexArray(m_upscaleVao);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+                glBindVertexArray(0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glUseProgram(0);
+            } else {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_immersiveTex[viewIndex], 0);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
+                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+                glBlitFramebuffer(0, 0, rw, rh, layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
+                                  layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            }
         }
         if (viewIndex == 0) {
             static std::uint64_t s_lastAcq = 0; static unsigned s_reRender = 0, s_reuse = 0, s_blit = 0, s_tick = 0;
@@ -2583,6 +2739,12 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     GLint m_upscaleTargetSizeLocation{0};
     GLint m_upscaleFilterLocation{0};
     GLint m_upscaleSharpenLocation{0};
+    // Snapdragon GSR
+    GLuint m_sgsrProgram{0};
+    GLuint m_sgsrVao{0};
+    GLint m_sgsrViewportLocation{0};
+    GLint m_sgsrSourceLocation{0};
+    GLint m_sgsrSharpnessLocation{0};
     int m_upscaleFactor{0};
     int m_upscaleWidth{0};
     int m_upscaleHeight{0};
