@@ -937,7 +937,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 // backgrounded and not rendering, and 51-58 in the foreground.
                 // This scale is the lever for that, and it is a setting rather
                 // than a constant because what it costs is a judgement call.
-                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.2f);
+                float scale = arcadexr::profiles::GetFloat("xr.resolution_scale", 1.0f);
                 if (scale < 0.3f) scale = 0.3f;
                 if (scale > 2.0f) scale = 2.0f;   // allow >1.0 = supersampling (sharper, at fill cost)
                 swapchainCreateInfo.width = uint32_t(vp.recommendedImageRectWidth * scale);
@@ -1035,8 +1035,8 @@ struct OpenXrProgram : IOpenXrProgram {
             }
             if (m_supportsSpaceWarp && m_motionVectorSwapchains.size() == m_swapchains.size() &&
                 !m_motionVectorSwapchains.empty()) {
-                m_appswActive = true;
-                Log::Write(Log::Level::Info, "TCVR_M16 AppSW ACTIVE: motion+depth submission enabled");
+                m_appswActive = (arcadexr::profiles::GetInt("appsw", 0) != 0);
+                Log::Write(Log::Level::Info, Fmt("TCVR_M16 AppSW %s (per-jeu profil appsw=%d, jeu=%s)", m_appswActive?"ACTIVE":"disponible-mais-OFF", arcadexr::profiles::GetInt("appsw",0), arcadexr::profiles::CurrentGame().c_str()));
             }
         }
     }
