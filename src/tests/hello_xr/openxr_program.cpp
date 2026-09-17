@@ -257,7 +257,7 @@ struct OpenXrProgram : IOpenXrProgram {
         // full-rate immersive path must not pay for an experiment they do not
         // use.  The first hardware gate is only capability discovery; actual
         // frame synthesis is enabled later, once its buffers are valid.
-        m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 0) != 0;
+        m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 1) != 0;
         if (m_spaceWarpRequested) {
             m_supportsSpaceWarp = enableIfPresent(XR_FB_SPACE_WARP_EXTENSION_NAME);
         } else {
@@ -937,7 +937,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 // backgrounded and not rendering, and 51-58 in the foreground.
                 // This scale is the lever for that, and it is a setting rather
                 // than a constant because what it costs is a judgement call.
-                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.0f);
+                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.2f);
                 if (scale < 0.3f) scale = 0.3f;
                 if (scale > 2.0f) scale = 2.0f;   // allow >1.0 = supersampling (sharper, at fill cost)
                 swapchainCreateInfo.width = uint32_t(vp.recommendedImageRectWidth * scale);

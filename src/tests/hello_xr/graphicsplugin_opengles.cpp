@@ -2114,7 +2114,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // MEASURED 15/09: full per-eye resolution with MSAA 4x drops the race
         // to ~30/120 (GPU bound: two eyes, two passes, high overdraw). 0.8 and
         // MSAA 2x hold it; both are live-tunable if the player wants sharper.
-        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 1.2f)));
+        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 1.1f)));
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
         if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
@@ -2154,7 +2154,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // E2 (16/09): anisotropic taps against grazing-angle texel shimmer (road, car decals). GPU has the headroom.
         m_m2Gpu.SetAniso(std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1))));
         // m2.mipBias in mml units (128 = one mip level blurrier); tames text/decal shimmer.
-        m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0))));
+        m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 64))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
         // E3 (17/09): SELECTIVE depth pre-pass. m2.prepassMode 0=off,1=untextured solids,2=+microtextured,3=all opaque.
         m_m2Gpu.SetPrepassMode(std::max(0, std::min(3, arcadexr::config::GetInt("m2.prepassMode", 0))));
