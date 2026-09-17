@@ -1867,7 +1867,12 @@ struct OpenXrProgram : IOpenXrProgram {
             // rendered. The runtime then extrapolates the frames the app is too
             // slow to render (exactly the dense-section dips), instead of a plain
             // rotational reprojection.
-            if (m_appswActive && i < m_motionVectorSwapchains.size()) {
+            // AppSW UNIQUEMENT en immersif : en mode plat/ecran, reprojeter selon la tete
+            // fait vibrer l'image fixe (et desynchronise le pacing -> son pitche). Lu par frame
+            // car le joueur peut changer de mode dans le menu.
+            const bool appswImmersive = m_appswActive &&
+                arcadexr::profiles::GetString("presentation", "screen") == "immersive";
+            if (appswImmersive && i < m_motionVectorSwapchains.size()) {
                 const Swapchain mvSwapchain = m_motionVectorSwapchains[i];
                 XrSwapchainImageAcquireInfo mvAcquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 uint32_t mvIndex;
