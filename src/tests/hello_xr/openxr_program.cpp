@@ -257,7 +257,11 @@ struct OpenXrProgram : IOpenXrProgram {
         // full-rate immersive path must not pay for an experiment they do not
         // use.  The first hardware gate is only capability discovery; actual
         // frame synthesis is enabled later, once its buffers are valid.
+#ifdef TCVR_BAKE_HWONLY
+        m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 1) != 0;   // hwbake : AppSW baké ON
+#else
         m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 0) != 0;
+#endif
         if (m_spaceWarpRequested) {
             m_supportsSpaceWarp = enableIfPresent(XR_FB_SPACE_WARP_EXTENSION_NAME);
         } else {

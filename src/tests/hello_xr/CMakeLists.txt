@@ -89,6 +89,13 @@ if(ANDROID)
         target_include_directories(hello_xr PRIVATE "${TCVR_PROJECT_ROOT}/emulation/mame" "${TCVR_PROJECT_ROOT}/video" "${TCVR_PROJECT_ROOT}/audio" "${TCVR_PROJECT_ROOT}/input" "${TCVR_PROJECT_ROOT}/gun" "${TCVR_PROJECT_ROOT}/config" "${TCVR_PROJECT_ROOT}/profiles" "${TCVR_PROJECT_ROOT}/hardware/namco_system22" "${TCVR_PROJECT_ROOT}/hardware/sega_model2" "${TCVR_PROJECT_ROOT}/ui")
     endif()
 
+    # Variante hwbake : bake le preset (hwonly + srallyc immersif + autoboot + appsw + 120)
+    # en dur, pour un APK autonome sans props (les props survivent pas au reboot).
+    if(TCVR_BAKE_HWONLY)
+        target_compile_definitions(hello_xr PRIVATE TCVR_BAKE_HWONLY=1)
+        message(STATUS "hello_xr: TCVR_BAKE_HWONLY -> preset hwonly bake en dur")
+    endif()
+
     # Only for Android because it lacks a command line
     set(HELLOXR_DEFAULT_GRAPHICS_PLUGIN
         "OpenGLES"
