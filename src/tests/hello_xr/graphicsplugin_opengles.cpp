@@ -2218,7 +2218,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // MEASURED 15/09: full per-eye resolution with MSAA 4x drops the race
         // to ~30/120 (GPU bound: two eyes, two passes, high overdraw). 0.8 and
         // MSAA 2x hold it; both are live-tunable if the player wants sharper.
-        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 1.2f)));
+        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 1.0f)));
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
         if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
@@ -2257,6 +2257,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_m2Gpu.SetDepthOrder(arcadexr::config::GetInt("m2.depthOrder", 1) != 0);
         // E2 (16/09): anisotropic taps against grazing-angle texel shimmer (road, car decals). GPU has the headroom.
         m_m2Gpu.SetAniso(std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1))));
+        m_m2Gpu.SetFilterMode(std::max(0, std::min(2, arcadexr::config::GetInt("m2.filter", 0))));
         // m2.mipBias in mml units (128 = one mip level blurrier); tames text/decal shimmer.
         m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
@@ -2300,7 +2301,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp), reinterpret_cast<const float*>(&hudMvpBack),
                                                focusX, focusY, frame->crtc_xoffset, frame->crtc_yoffset);
             if (rendered) { m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders; }
-            else { m_m2GpuFailed = true; __android_log_print(ANDROID_LOG_ERROR, "TCVR_M2GPU", "immersive render failed: %s", m_m2Gpu.LastError().c_str()); }
+            else { __android_log_print(ANDROID_LOG_WARN, "TCVR_M2GPU", "immersive render transiently failed: %s", m_m2Gpu.LastError().c_str()); }
         } else {
             auto& submitted = const_cast<XrCompositionLayerProjectionView&>(layerView);
             submitted.pose = m_immersivePose[viewIndex]; submitted.fov = m_immersiveFov[viewIndex];

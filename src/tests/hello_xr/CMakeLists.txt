@@ -96,6 +96,11 @@ if(ANDROID)
         message(STATUS "hello_xr: TCVR_BAKE_HWONLY -> preset hwonly bake en dur")
     endif()
 
+    if(TCVR_RAW_SHEET)
+        target_compile_definitions(hello_xr PRIVATE TCVR_RAW_SHEET=1)
+        message(STATUS "hello_xr: TCVR_RAW_SHEET -> direct texture sheet rendering")
+    endif()
+
     # Only for Android because it lacks a command line
     set(HELLOXR_DEFAULT_GRAPHICS_PLUGIN
         "OpenGLES"
