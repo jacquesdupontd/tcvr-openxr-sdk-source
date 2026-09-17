@@ -450,6 +450,12 @@ struct OpenXrProgram : IOpenXrProgram {
                 // Runtimes return blend modes in preference order
                 m_blendMode = blendModes[0];
             }
+            // TCVR : on ne veut JAMAIS de realite mixte. Forcer OPAQUE en dur des
+            // qu'il est disponible (baked, aucune prop). Le passthrough du systeme
+            // ne transparait plus a travers notre couche.
+            if (std::find(blendModes.begin(), blendModes.end(), XR_ENVIRONMENT_BLEND_MODE_OPAQUE) != blendModes.end()) {
+                m_blendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            }
         }
     }
 

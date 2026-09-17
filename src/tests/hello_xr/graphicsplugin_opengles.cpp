@@ -2114,7 +2114,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // MEASURED 15/09: full per-eye resolution with MSAA 4x drops the race
         // to ~30/120 (GPU bound: two eyes, two passes, high overdraw). 0.8 and
         // MSAA 2x hold it; both are live-tunable if the player wants sharper.
-        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 0.9f)));
+        const float renderScale = std::max(0.3f, std::min(2.0f, arcadexr::config::GetFloat("m2.immersiveScale", 1.1f)));
         const int eyeW = layerView.subImage.imageRect.extent.width, eyeH = layerView.subImage.imageRect.extent.height;
         const int rw = std::max(64, int(eyeW * renderScale)), rh = std::max(64, int(eyeH * renderScale));
         if (m_immersiveTexW != rw || m_immersiveTexH != rh) {
