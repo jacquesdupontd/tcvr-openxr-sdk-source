@@ -2146,7 +2146,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         // hot change is what made an earlier reading claim MSAA cost 16 ms:
         //   MSAA 0 -> 5.24 ms | MSAA 2 -> 5.31 ms | MSAA 4 -> 5.52 ms
         // So 4x samples cost 0.28 ms, and the pass holds 120/120 either way.
-        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 4))));
+        m_m2Gpu.SetMsaa(std::max(0, std::min(4, arcadexr::config::GetInt("m2.immersiveMsaa", 0))));
         m_m2Gpu.SetRaw(arcadexr::config::GetInt("m2.immersiveRaw", 1) != 0);
         m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 0));
         // E1 (16/09): depth = the board's draw order, one value per polygon. m2.depthOrder=0 goes back to geometry + bias.
