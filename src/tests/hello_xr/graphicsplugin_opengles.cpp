@@ -15,6 +15,7 @@
 #include "framebuffer_bridge.h"
 #include "scene_bridge.h"
 #include "menu.h"
+#include "display_refresh.h"
 #include <android/log.h>
 #include "stereo_renderer.h"
 #include "gpu_renderer.h"
@@ -313,12 +314,26 @@ static const char* DarkFlickerFragmentShaderGlsl = R"_(#version 320 es
     uniform sampler2D CurrentTexture;
     uniform sampler2D PreviousTexture;
     uniform int HavePrevious;
+    uniform float uTemporalStrength;   // >0 = TAA-lite (difference-gated temporal accumulation), 0 = dark-flicker gate
+    uniform float uTemporalLo;         // change below this = static -> full stabilise
+    uniform float uTemporalHi;         // change above this = motion -> keep current (no ghost)
     out vec4 FragColor;
     float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
     void main() {
         vec3 current = texture(CurrentTexture, PSTexCoord).rgb;
         if (HavePrevious == 0) { FragColor = vec4(current, 1.0); return; }
         vec3 previous = texture(PreviousTexture, PSTexCoord).rgb;
+        if (uTemporalStrength > 0.0) {
+            // TAA-lite (no motion vectors): mimic supersampling's temporal stability.
+            // Blend hard toward the previous frame where the pixel is ~static (the
+            // shimmer/crawl), fade the blend out as the per-pixel change grows so
+            // genuinely moving content keeps the current frame and does NOT ghost.
+            vec3 d = abs(current - previous);
+            float change = max(max(d.r, d.g), d.b);
+            float w = clamp(uTemporalStrength, 0.0, 1.0) * (1.0 - smoothstep(uTemporalLo, uTemporalHi, change));
+            FragColor = vec4(mix(current, previous, w), 1.0);
+            return;
+        }
         float darkest = min(luma(current), luma(previous));
         float change = max(max(abs(current.r - previous.r), abs(current.g - previous.g)), abs(current.b - previous.b));
         float darkGate = 1.0 - smoothstep(0.08, 0.18, darkest);
@@ -1362,7 +1377,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glEnable(GL_CULL_FACE);
     }
 
-    void RunDarkFlickerPass(GLuint current, GLuint previous, GLuint target, int width, int height, bool havePrevious) {
+    void RunDarkFlickerPass(GLuint current, GLuint previous, GLuint target, int width, int height, bool havePrevious, float temporalStrength = 0.0f, float temporalLo = 0.05f, float temporalHi = 0.25f) {
         glBindFramebuffer(GL_FRAMEBUFFER, m_upscaleFramebuffer);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
         const GLenum one[1] = {GL_COLOR_ATTACHMENT0};
@@ -1379,6 +1394,9 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         glBindTexture(GL_TEXTURE_2D, previous);
         glUniform1i(m_darkFlickerPreviousLocation, 1);
         glUniform1i(m_darkFlickerHavePreviousLocation, havePrevious ? 1 : 0);
+        { const GLint l = glGetUniformLocation(m_darkFlickerProgram, "uTemporalStrength"); if (l >= 0) glUniform1f(l, temporalStrength); }
+        { const GLint l = glGetUniformLocation(m_darkFlickerProgram, "uTemporalLo"); if (l >= 0) glUniform1f(l, temporalLo); }
+        { const GLint l = glGetUniformLocation(m_darkFlickerProgram, "uTemporalHi"); if (l >= 0) glUniform1f(l, temporalHi); }
         glBindVertexArray(m_upscaleVao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
         glBindVertexArray(0);
@@ -1592,9 +1610,26 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             m_immersiveTemporalValid[0] = m_immersiveTemporalValid[1] = false;
         }
         const bool everyFrame = arcadexr::config::GetInt("immersive.everyFrame", 0) != 0;
+        // immersive.refreshLock: cale la cadence de RENDU sur le RAFRAICHISSEMENT.
+        //   0 = off (defaut Golden) : rendu par frame emulee (~57,5/s) -> holds inegaux (2,2,2,3)
+        //       contre l'affichage 120 -> battement visible.
+        //   1 = auto : rendu a ~60 Hz = une division ENTIERE du refresh courant, donc chaque image
+        //       rendue est tenue le MEME nombre d'images d'affichage -> holds uniformes, plus de battement.
+        //   N>=2 = diviseur explicite (rendu 1 frame XR sur N).
+        const int refreshLock = arcadexr::config::GetInt("immersive.refreshLock", 0);
+        int lockDiv = 0;
+        if (refreshLock == 1) {
+            const float hz = arcadexr::xr::State().current;
+            lockDiv = (hz > 1.0f) ? std::max(1, int(hz / 60.0f + 0.5f)) : 2;
+        } else if (refreshLock >= 2) {
+            lockDiv = refreshLock;
+        }
         bool rendered = false;
         const auto begin = std::chrono::steady_clock::now();
-        if (everyFrame || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]) {
+        const bool cadenceGate = (lockDiv > 0)
+            ? ((m_xrFrameTick % static_cast<std::uint64_t>(lockDiv)) == 0u || !m_immersiveHasImage[viewIndex])
+            : (everyFrame || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
+        if (cadenceGate) {
             if (stabilizeDark) {
                 const int current = m_immersiveTemporalIndex[viewIndex] ^ 1;
                 rendered = m_scene.RenderEye(*frame, 0.0f, 0.0f, m_immersiveTemporalRaw[viewIndex][current], rw, rh,
@@ -2098,6 +2133,7 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     bool RenderImmersiveModel2(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView, uint32_t colorTexture) {
         // Work in progress: scale calibration, sky dome and the stereo window are
         // missing. Off unless m2.immersive=1, so IMMERSIF falls back to the 4x window.
+        if (viewIndex == 0) ++m_xrFrameTick;   // per-XR-frame clock for the refresh-locked render cadence
         const std::string presentation = arcadexr::profiles::GetString("presentation", "screen");
         const bool immLog = (++m_m2ImmTick % 120u) == 1u;
         auto immTrace = [&](const char* why) { if (immLog) __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "immersive exit=%s view=%u failed=%d requested=%d present=%s", why, viewIndex, m_m2GpuFailed?1:0, m_m2Requested?1:0, presentation.c_str()); };
@@ -2267,9 +2303,15 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
         m_m2Gpu.SetFarMin(arcadexr::config::GetInt("m2.immersiveFarMin", 0));
         // E1 (16/09): depth = the board's draw order, one value per polygon. m2.depthOrder=0 goes back to geometry + bias.
         m_m2Gpu.SetDepthOrder(arcadexr::config::GetInt("m2.depthOrder", 1) != 0);
+        // Alpha-to-coverage on cutout edges (trees/signs/windows/decals) so they
+        // stop flashing frame to frame. Gated; default off = Golden hard discard.
+        m_m2Gpu.SetAlphaCoverage(arcadexr::config::GetInt("m2.alphaCoverage", 0) != 0);
         // E2 (16/09): anisotropic taps against grazing-angle texel shimmer (road, car decals). GPU has the headroom.
         m_m2Gpu.SetAniso(std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1))));
-        m_m2Gpu.SetFilterMode(std::max(0, std::min(2, arcadexr::config::GetInt("m2.filter", 0))));
+        // 0 nearest (Golden), 1/2 bilinear/trilinear on INDICES (corrupt colour),
+        // 3 bilinear-RGB (colour-safe, 1 level), 4 trilinear-RGB (colour-safe
+        // minification -- the far-texture crawl fix). Allow up to 4.
+        m_m2Gpu.SetFilterMode(std::max(0, std::min(4, arcadexr::config::GetInt("m2.filter", 0))));
         // m2.mipBias in mml units (128 = one mip level blurrier); tames text/decal shimmer.
         m_m2Gpu.SetMipBias(std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0))));
         m_m2Gpu.SetHideHud(arcadexr::config::GetInt("m2.hideHud", 0) != 0);
@@ -2306,20 +2348,109 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
                     frame->mame_frame, frame->emu_time, rawHash, clipHash, hud2d, back2d, frame->raw_vertex_count,
                     (unsigned long long)frame->sequence);
         }
-        const bool chainReRender = (forceRefresh || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
+        // Temporal blend (temporal.blend, 0..1): the rawsheet renders each frame
+        // fresh, so sharp texture-pattern edges CRAWL as the scene advances (~115/120).
+        // Blend the fresh frame with the previous one to average the edge's sub-pixel
+        // position -> the slide smooths. Mild motion trail, NO motion vectors (unlike
+        // AppSW). Reuses the DarkFlicker blend program via a ping-pong per eye.
+        // REFONTE jalon 1 : rendu DIRECT-TO-SWAPCHAIN (debug.tcvr.directswap). L'immersif rend
+        // DIRECTEMENT dans l'image swapchain (RenderImmersive fait deja du MSAA-into-texture via
+        // EXT_multisampled_render_to_texture), sans texture intermediaire ni blit. C'est le
+        // prerequis du foveated rendering (jalon 2). L'image swapchain change chaque frame -> on
+        // rend chaque frame (pas de hold/reuse). Gated ; defaut byte-identique.
+        const bool directSwap = arcadexr::config::GetInt("directswap", 0) != 0;
+        const float temporalBlend = std::max(0.0f, std::min(1.0f, arcadexr::config::GetFloat("temporal.blend", 0.0f)));
+        const float temporalLo = arcadexr::config::GetFloat("temporal.lo", 0.05f);
+        const float temporalHi = arcadexr::config::GetFloat("temporal.hi", 0.25f);
+        const bool useTemporal = temporalBlend > 0.0f && m_darkFlickerProgram != 0 && !directSwap;
+        if (useTemporal) {
+            if (!m_rawTempTex[0][0]) glGenTextures(4, &m_rawTempTex[0][0]);
+            if (rw != m_rawTempW || rh != m_rawTempH) {
+                for (int e = 0; e < 2; ++e) for (int i = 0; i < 2; ++i) {
+                    glBindTexture(GL_TEXTURE_2D, m_rawTempTex[e][i]);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                }
+                glBindTexture(GL_TEXTURE_2D, 0);
+                m_rawTempW = rw; m_rawTempH = rh;
+                m_rawTempValid[0] = m_rawTempValid[1] = false;
+            }
+        }
+        // HOLD direct-to-swapchain : garder une copie eyeWxeyeH du dernier rendu direct, pour
+        // REMPLIR les frames de reuse par un blit (pas de re-dispatch geometrie -> MAME nourri).
+        if (directSwap) {
+            if (m_dsKeep[0] == 0) glGenTextures(2, m_dsKeep);
+            if (eyeW != m_dsKeepW || eyeH != m_dsKeepH) {
+                for (int e = 0; e < 2; ++e) {
+                    glBindTexture(GL_TEXTURE_2D, m_dsKeep[e]);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, eyeW, eyeH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                }
+                glBindTexture(GL_TEXTURE_2D, 0);
+                m_dsKeepW = eyeW; m_dsKeepH = eyeH;
+            }
+        }
+        // directSwap : rendu a CADENCE fixe (1 frame XR sur N, via m_xrFrameTick) et blit du keep
+        // sur les autres. frame->sequence avance ~chaque frame (peu fiable pour tenir), donc on
+        // borne la cadence : divise la charge de rendu (2D+3D) par N -> App chute -> jouable a 2.0.
+        // N = debug.tcvr.directDivisor (defaut 2). Le chemin normal reste sur frame->sequence.
+        int dsDiv = arcadexr::config::GetInt("directDivisor", 2); if (dsDiv < 1) dsDiv = 1;
+        const bool chainReRender = directSwap
+            ? ((m_xrFrameTick % static_cast<std::uint64_t>(dsDiv)) == 0u || !m_immersiveHasImage[viewIndex])
+            : (forceRefresh || frame->sequence != m_immersiveRenderedSeq[viewIndex] || !m_immersiveHasImage[viewIndex]);
         bool chainBlit = false;
         bool rendered = false;
         if (chainReRender) {
-            rendered = m_m2Gpu.RenderImmersive(m_immersiveTex[viewIndex], rw, rh, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp), reinterpret_cast<const float*>(&hudMvpBack),
+            const int tcur = useTemporal ? (m_rawTempIndex[viewIndex] ^ 1) : 0;
+            const GLuint target = directSwap ? colorTexture : (useTemporal ? m_rawTempTex[viewIndex][tcur] : m_immersiveTex[viewIndex]);
+            const int rtw = directSwap ? eyeW : rw;
+            const int rth = directSwap ? eyeH : rh;
+            rendered = m_m2Gpu.RenderImmersive(target, rtw, rth, reinterpret_cast<const float*>(&mvp), reinterpret_cast<const float*>(&hudMvp), reinterpret_cast<const float*>(&hudMvpBack),
                                                focusX, focusY, frame->crtc_xoffset, frame->crtc_yoffset);
-            if (rendered) { m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders; }
+            if (rendered) {
+                if (directSwap) {
+                    // keep = copie du rendu direct (region swapchain -> m_dsKeep 0,0)
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
+                    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
+                    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_dsKeep[viewIndex], 0);
+                    glBlitFramebuffer(layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
+                                      layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH,
+                                      0, 0, eyeW, eyeH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                } else if (useTemporal) {
+                    RunDarkFlickerPass(target, m_rawTempTex[viewIndex][m_rawTempIndex[viewIndex]], m_immersiveTex[viewIndex], rw, rh, m_rawTempValid[viewIndex], temporalBlend, temporalLo, temporalHi);
+                    m_rawTempIndex[viewIndex] = tcur;
+                    m_rawTempValid[viewIndex] = true;
+                }
+                m_immersiveRenderedSeq[viewIndex] = frame->sequence; m_immersivePose[viewIndex] = layerView.pose; m_immersiveFov[viewIndex] = layerView.fov; m_immersiveHasImage[viewIndex] = true; ++m_immersiveRenders;
+            }
             else { __android_log_print(ANDROID_LOG_WARN, "TCVR_M2GPU", "immersive render transiently failed: %s", m_m2Gpu.LastError().c_str()); }
         } else {
             auto& submitted = const_cast<XrCompositionLayerProjectionView&>(layerView);
             submitted.pose = m_immersivePose[viewIndex]; submitted.fov = m_immersiveFov[viewIndex];
             rendered = true;
+            if (directSwap && m_dsKeep[viewIndex] != 0) {
+                // reuse : remplir la nouvelle image swapchain depuis le keep (aucun re-rendu)
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, m_immersiveBlitFbo);
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_dsKeep[viewIndex], 0);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_swapchainFramebuffer);
+                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+                glBlitFramebuffer(0, 0, eyeW, eyeH,
+                                  layerView.subImage.imageRect.offset.x, layerView.subImage.imageRect.offset.y,
+                                  layerView.subImage.imageRect.offset.x + eyeW, layerView.subImage.imageRect.offset.y + eyeH,
+                                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            }
         }
-        if (rendered) {
+        // TAA jalon 1 : dump du champ de motion vectors (une fois, oeil 0), gated debug.tcvr.veldump.
+        if (viewIndex == 0 && arcadexr::config::GetInt("veldump", 0) != 0) m_m2Gpu.DumpVelocity(rw, rh);
+        // directSwap : deja rendu dans l'image swapchain, aucun blit/upscale a faire.
+        if (rendered && !directSwap) {
             chainBlit = true;
             // Etage upscale : au lieu du blit LINEAIRE bete (mou en montee de resolution),
             // une passe shader Catmull-Rom + sharpen adaptatif (reutilise m_upscaleProgram,
@@ -2399,19 +2530,27 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
             if (rendered && !tag.empty() && tag != m_m2DumpTag[viewIndex]) {
                 m_m2DumpTag[viewIndex] = tag;
                 std::vector<unsigned char> rgba;
-                if (m_m2Gpu.ReadBack(m_immersiveTex[viewIndex], rw, rh, rgba)) {
+                // Dump du rendu m2 (m_immersiveTex, le résultat du sampling HD/software AVANT upscale).
+                // La swapchain ne se relit pas fiablement au glReadPixels (-> noir), donc on lit ceci.
+                // Le blanc "en course" est à la source du sampling -> il apparaît ICI si on capture
+                // pendant une COURSE (pas l'attract). directSwap rend dans m_dsKeep, on le lit alors.
+                const bool dumpDs = directSwap && m_dsKeep[viewIndex] != 0;
+                const GLuint dumpTex = dumpDs ? m_dsKeep[viewIndex] : m_immersiveTex[viewIndex];
+                const int dumpW = dumpDs ? eyeW : rw;
+                const int dumpH = dumpDs ? eyeH : rh;
+                if (m_m2Gpu.ReadBack(dumpTex, dumpW, dumpH, rgba)) {
                     const std::string path = arcadexr::config::ExternalDirectory() + "/dump-" + tag +
                                              (viewIndex == 0 ? "-m2imm-L.ppm" : "-m2imm-R.ppm");
                     if (FILE* f = std::fopen(path.c_str(), "wb")) {
-                        std::fprintf(f, "P6\n%d %d\n255\n", rw, rh);
-                        std::vector<unsigned char> row(size_t(rw) * 3);
-                        for (int y = rh - 1; y >= 0; --y) {
-                            const unsigned char* s2 = rgba.data() + size_t(y) * size_t(rw) * 4;
-                            for (int x = 0; x < rw; ++x) { row[x*3] = s2[x*4]; row[x*3+1] = s2[x*4+1]; row[x*3+2] = s2[x*4+2]; }
+                        std::fprintf(f, "P6\n%d %d\n255\n", dumpW, dumpH);
+                        std::vector<unsigned char> row(size_t(dumpW) * 3);
+                        for (int y = dumpH - 1; y >= 0; --y) {
+                            const unsigned char* s2 = rgba.data() + size_t(y) * size_t(dumpW) * 4;
+                            for (int x = 0; x < dumpW; ++x) { row[x*3] = s2[x*4]; row[x*3+1] = s2[x*4+1]; row[x*3+2] = s2[x*4+2]; }
                             std::fwrite(row.data(), 1, row.size(), f);
                         }
                         std::fclose(f);
-                        __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "dumped %s (%dx%d)", path.c_str(), rw, rh);
+                        __android_log_print(ANDROID_LOG_INFO, "TCVR_M2GPU", "dumped %s (%dx%d)", path.c_str(), dumpW, dumpH);
                     }
                 }
             }
@@ -2826,6 +2965,13 @@ struct OpenGLESGraphicsPlugin : public IGraphicsPlugin {
     int m_immersiveTexW{0};
     int m_immersiveTexH{0};
     std::uint64_t m_immersivePreparedSequence{0};
+    std::uint64_t m_xrFrameTick{0};   // once per presented XR frame (incremented at viewIndex 0)
+    GLuint m_dsKeep[2] = {0, 0};   // direct-to-swapchain HOLD : copie du dernier rendu direct par oeil (eyeWxeyeH)
+    int m_dsKeepW = 0, m_dsKeepH = 0;
+    GLuint m_rawTempTex[2][2] = {{0, 0}, {0, 0}};   // rawsheet temporal-blend ping-pong (temporal.blend)
+    int m_rawTempIndex[2] = {0, 0};
+    bool m_rawTempValid[2] = {false, false};
+    int m_rawTempW{0}, m_rawTempH{0};
     double m_immersivePrepMs{0};
     double m_immersiveDrawMs{0};
     unsigned m_immersivePreparedFrames{0};

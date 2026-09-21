@@ -268,6 +268,20 @@ struct OpenXrProgram : IOpenXrProgram {
             Log::Write(Log::Level::Info, "TCVR_M16 AppSW not requested (appsw=0)");
         }
 
+        // REFONTE jalon 2 : foveated rendering (XR_FB_foveation). Inutile tant que
+        // l'immersif rendait dans une texture intermediaire ; avec le direct-to-swapchain
+        // (jalon 1) il s'applique au VRAI rendu -> la peripherie rend en basse-res, ce qui
+        // libere le fill-rate pour du supersampling au centre (jalon 3 = tuer le scintillement
+        // la ou l'oeil regarde). On active les extensions si presentes ; le profil est
+        // applique par swapchain selon debug.tcvr.foveation (0=off).
+        {
+            bool f1 = enableIfPresent(XR_FB_FOVEATION_EXTENSION_NAME);
+            bool f2 = enableIfPresent(XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME);
+            bool f3 = enableIfPresent(XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME);
+            m_supportsFoveation = f1 && f2 && f3;
+            Log::Write(Log::Level::Info, Fmt("TCVR_FOV foveation extensions %s", m_supportsFoveation ? "supported" : "absent"));
+        }
+
         // Presentation rate control. Optional: without it the runtime simply
         // keeps whatever rate it chose, and the emulator is unaffected either
         // way -- the arcade clock never depends on the presentation clock.
@@ -958,6 +972,38 @@ struct OpenXrProgram : IOpenXrProgram {
                 swapchain.height = swapchainCreateInfo.height;
                 CHECK_XRCMD(xrCreateSwapchain(m_session, &swapchainCreateInfo, &swapchain.handle));
                 Log::Write(Log::Level::Info, Fmt("TCVR_M0 xrCreateSwapchain succeeded: view=%d", i));
+
+                // REFONTE jalon 2 : applique un profil de foveation a cette swapchain.
+                // debug.tcvr.foveation : 0=off, 1=low, 2=medium, 3=high, 4=high+dynamic.
+                if (m_supportsFoveation) {
+                    const int fovLevel = arcadexr::config::GetInt("foveation", 0);
+                    if (fovLevel > 0) {
+                        PFN_xrCreateFoveationProfileFB createFov = nullptr;
+                        PFN_xrUpdateSwapchainFB updateSc = nullptr;
+                        PFN_xrDestroyFoveationProfileFB destroyFov = nullptr;
+                        xrGetInstanceProcAddr(m_instance, "xrCreateFoveationProfileFB", reinterpret_cast<PFN_xrVoidFunction*>(&createFov));
+                        xrGetInstanceProcAddr(m_instance, "xrUpdateSwapchainFB", reinterpret_cast<PFN_xrVoidFunction*>(&updateSc));
+                        xrGetInstanceProcAddr(m_instance, "xrDestroyFoveationProfileFB", reinterpret_cast<PFN_xrVoidFunction*>(&destroyFov));
+                        if (createFov && updateSc) {
+                            XrFoveationLevelProfileCreateInfoFB lvl{XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
+                            lvl.level = fovLevel >= 3 ? XR_FOVEATION_LEVEL_HIGH_FB : (fovLevel == 2 ? XR_FOVEATION_LEVEL_MEDIUM_FB : XR_FOVEATION_LEVEL_LOW_FB);
+                            lvl.verticalOffset = 0.0f;
+                            lvl.dynamic = fovLevel >= 4 ? XR_FOVEATION_DYNAMIC_LEVEL_ENABLED_FB : XR_FOVEATION_DYNAMIC_DISABLED_FB;
+                            XrFoveationProfileCreateInfoFB pc{XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB};
+                            pc.next = &lvl;
+                            XrFoveationProfileFB profile = XR_NULL_HANDLE;
+                            if (XR_SUCCEEDED(createFov(m_session, &pc, &profile))) {
+                                XrSwapchainStateFoveationFB st{XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB};
+                                st.profile = profile;
+                                XrResult ur = updateSc(swapchain.handle, reinterpret_cast<XrSwapchainStateBaseHeaderFB*>(&st));
+                                Log::Write(Log::Level::Info, Fmt("TCVR_FOV view %u foveation level=%d applied (r=%d)", i, fovLevel, int(ur)));
+                                if (destroyFov) destroyFov(profile);
+                            } else {
+                                Log::Write(Log::Level::Warning, "TCVR_FOV xrCreateFoveationProfileFB failed");
+                            }
+                        }
+                    }
+                }
 
                 m_swapchains.push_back(swapchain);
 
@@ -1930,6 +1976,7 @@ struct OpenXrProgram : IOpenXrProgram {
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
     bool m_supportsDisplayRefreshRate{false};
+    bool m_supportsFoveation{false};
     bool m_supportsPerformanceSettings{false};
     bool m_supportsThreadSettings{false};
     bool m_spaceWarpRequested{false};
