@@ -471,6 +471,7 @@ layout(early_fragment_tests) in;
 // compiler allocates few registers and many pixel groups run in parallel (texture latency hidden).
 void main() {
     uint fl = vPA.w;
+    float acov = 1.0;
     float zb = max(vParam.z, 1e-6);
     vec2 tc = vec2(vParam.x, vParam.y);                 // main view: (u, v) in level-0 texels
     vec3 rgb;
@@ -479,15 +480,27 @@ void main() {
     } else {
         uint layer = vLayer & 0xffffu;
         float bias = float(uMipBias) / 128.0;
-        float t;
+        vec4 c;
         if (layer != 0xffffu && ((fl >> 3) & 3u) == 0u) {
-            t = texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias).r * 15.0;
+            c = texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias);
         } else {
             uint slot = vSlot & 0xffffu;
             uint smp = ((fl >> 3) & 1u) | (((fl >> 4) & 1u) << 1);
             vec2 size = vec2(float(vPA.z & 0xffffu), float(vPA.z >> 16));
-            t = (slot != 0xffffu) ? texture(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, bias).r * 15.0 : 7.0;
+            c = (slot != 0xffffu) ? texture(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, bias) : vec4(0.47, 0.47, 1.0, 1.0);
+            if (uTestStage == 9) { oColor = (slot == 0xffffu) ? vec4(1, 0, 1, 1) : vec4(0, 1, 1, 1); return; }   // diag: slot path
         }
+        if (uTestStage == 10 && ((fl >> 8) & 1u) != 0u) { oColor = vec4(1, 1, 0, 1); return; }            // diag: microtextured
+#ifdef LEAN_CUT
+        // Cut-out: t premultiplied by opacity (G) over the filtered opacity (B), sharpened to a ~1 px
+        // ramp around 0.5 so mips cannot thin sparse foliage away; alpha-to-coverage does the edge.
+        float t = c.g * 15.0 / max(c.b, 1e-4);
+        acov = clamp((c.b - 0.5) / max(fwidth(c.b), 1.0 / 255.0) + 0.5, 0.0, 1.0);
+        if (acov <= 0.0) discard;
+#else
+        float t = c.r * 15.0;
+#endif
+#ifndef LEAN_CUT
         if (((fl >> 8) & 1u) != 0u && (vLayer >> 16) != 0xffffu) {
             vec2 dx = dFdx(tc), dy = dFdy(tc);
             float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-12)) + bias;
@@ -498,11 +511,15 @@ void main() {
                 t = mix(t, mt, min(-lod * 128.0 / float(1 << int(ulod)), 127.0) / 256.0);
             }
         }
+#endif
         uint t8 = min(uint(t * 16.0 + 0.5), 0xf0u);
         uint luma = min((lumaram8((vPB.y & 0xffffu) + (t8 >> 1)) * (vPB.y >> 16)) / 256u, 0x3fu);
         rgb = shade_c(vColor & 0x7fffu, luma);
     }
     oColor = vec4(clamp((rgb - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0), 1.0);
+#ifdef LEAN_CUT
+    if (((fl >> 6) & 1u) != 0u) oColor.a = acov;
+#endif
 }
 #else
 void main() {

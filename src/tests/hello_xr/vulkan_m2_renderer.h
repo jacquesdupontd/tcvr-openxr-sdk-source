@@ -22,6 +22,7 @@
 #include "m2_frag_nd_spv.h"
 #include "m2_frag_cutd_spv.h"
 #include "m2_frag_lean_spv.h"
+#include "m2_frag_leancut_spv.h"
 #include "m2_frag_cutc_spv.h"
 #include "quad_vert_spv.h"
 #include "quad_far_vert_spv.h"
@@ -198,6 +199,7 @@ public:
         m_m2FragNdModule = CreateShaderModule(c_m2_fragNoDiscardSpv, sizeof(c_m2_fragNoDiscardSpv));
         m_m2FragCutDModule = CreateShaderModule(c_m2_fragCutDepthSpv, sizeof(c_m2_fragCutDepthSpv));
         m_m2FragLeanModule = CreateShaderModule(c_m2_fragLeanSpv, sizeof(c_m2_fragLeanSpv));
+        m_m2FragLeanCutModule = CreateShaderModule(c_m2_fragLeanCutSpv, sizeof(c_m2_fragLeanCutSpv));
         m_m2FragCutCModule = CreateShaderModule(c_m2_fragCutColorSpv, sizeof(c_m2_fragCutColorSpv));
 
         // 5. Create Pipelines
@@ -667,12 +669,18 @@ public:
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
             if (m_fastIndexCount > 0 && !(skip & 4)) {
                 // LEAN: the same opaque polygons through a shader holding only their path (occupancy).
-                const bool lean = arcadexr::config::GetInt("m2.lean", 1) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
+                const bool lean = (arcadexr::config::GetInt("m2.lean", 1) & 1) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lean ? m_m2PipelineFastLean : m_m2PipelineFast);
                 vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
             }
-            const bool cutNoWrite = (m_cutMode == 1);
-            if (m_cutMode == 2 && m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
+            const bool leanOn = (arcadexr::config::GetInt("m2.lean", 1) & 2) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
+            if (leanOn && m_secIndexStart > m_fastIndexCount && !(skip & 8)) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutLean);
+                vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
+            }
+            const int cutModeEff = leanOn ? -1 : m_cutMode;   // lean handled above
+            const bool cutNoWrite = (cutModeEff == 1);
+            if (cutModeEff == 2 && m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
                 // Cut-outs, depth pre-pass then colour of the visible sample only (before the background,
                 // which then only fills what nothing covered).
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutDepth);
@@ -680,7 +688,7 @@ public:
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutColor);
                 vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
             }
-            if (m_cutMode == 0) {
+            if (cutModeEff == 0) {
             if (m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineOpaque);
                     vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
@@ -754,7 +762,7 @@ public:
         static unsigned s_immFrames = 0;
         if ((s_immFrames++ % 120u) == 0u) {
             Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u lean=%d layers=%u lut=%d prims=%zu fast=%u cutEnd=%u opq=%u gls=%u res=%ux%u",
-                                             eye, int(arcadexr::config::GetInt("m2.lean", 1) != 0 && ubo_texArray(eye)), m_regions.LayerCount(), int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_secIndexStart, m_opaqueIndexCount, m_glassIndexCount,
+                                             eye, int(arcadexr::config::GetInt("m2.lean", 1)), m_regions.LayerCount(), int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_secIndexStart, m_opaqueIndexCount, m_glassIndexCount,
                                              renderAreaExtent.width, renderAreaExtent.height));
         }
 
@@ -765,7 +773,7 @@ public:
     // The LEAN shader assumes filter mode 5 + texture array + no edge fade + stage 0.
     bool ubo_texArray(uint32_t eye) const {
         const M2UniformBufferObject& u = *m_uboMappedF[m_fs][eye < 2 ? eye : 0][0];
-        return u.uFilterMode == 5 && (u.padEnd[2] & 2) != 0 && u.uTestStage == 0;
+        return u.uFilterMode == 5 && (u.padEnd[2] & 2) != 0 && (u.uTestStage == 0 || u.uTestStage >= 9);
     }
     void SetFrameSlot(int s) { m_fs = s & 1; m_regions.SetHalf(uint32_t(m_fs)); }
 
@@ -979,6 +987,7 @@ public:
         destroyPipe(m_m2PipelineCutNoWrite);
         destroyPipe(m_m2PipelineCutDepth);
         destroyPipe(m_m2PipelineFastLean);
+        destroyPipe(m_m2PipelineCutLean);
         destroyPipe(m_m2PipelineCutColor);
         destroyPipe(m_voidPipelineFar);
         destroyPipe(m_planePipelineFar);
@@ -1001,6 +1010,7 @@ public:
         destroyMod(m_m2FragNdModule);
         destroyMod(m_m2FragCutDModule);
         destroyMod(m_m2FragLeanModule);
+        destroyMod(m_m2FragLeanCutModule);
         destroyMod(m_m2FragCutCModule);
         destroyMod(m_quadFarVertModule);
         destroyMod(m_quadVertModule);
@@ -1250,6 +1260,9 @@ private:
             msCut.alphaToCoverageEnable = (m_samples != VK_SAMPLE_COUNT_1_BIT) ? VK_TRUE : VK_FALSE;
             pipeInfo.pMultisampleState = &msCut;
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineOpaque));
+            stages[1].module = m_m2FragLeanCutModule;   // same state (depth write, A2C), lean cut-out shader
+            XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineCutLean));
+            stages[1].module = m_m2FragModule;
             {   // same, depth test but NO depth write: early depth rejection stays on despite discard
                 VkPipelineDepthStencilStateCreateInfo dsCut = dsOpaque;
                 dsCut.depthWriteEnable = VK_FALSE;
@@ -1825,6 +1838,8 @@ private:
     VkShaderModule m_m2FragCutDModule = VK_NULL_HANDLE, m_m2FragCutCModule = VK_NULL_HANDLE;
     int m_cutMode = 2;
     VkPipeline m_m2PipelineFastLean = VK_NULL_HANDLE;
+    VkPipeline m_m2PipelineCutLean = VK_NULL_HANDLE;
+    VkShaderModule m_m2FragLeanCutModule = VK_NULL_HANDLE;
     VkShaderModule m_m2FragLeanModule = VK_NULL_HANDLE;
     unsigned m_secIndexStart = 0;
     VkFormat m_colorFormat = VK_FORMAT_UNDEFINED;

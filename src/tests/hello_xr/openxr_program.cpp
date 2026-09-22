@@ -994,7 +994,8 @@ struct OpenXrProgram : IOpenXrProgram {
                 swapchainCreateInfo.mipCount = 1;
                 swapchainCreateInfo.faceCount = 1;
                 swapchainCreateInfo.sampleCount = m_graphicsPlugin->GetSupportedSwapchainSampleCount(vp);
-                swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+                swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                                                 XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;   // debug dump of the eye image
                 // Vulkan fixed foveation: the swapchain must be created WITH a fragment density map.
                 XrSwapchainCreateInfoFoveationFB fovCreate{XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB};
                 const bool fdm = m_supportsFoveationVulkan && m_graphicsPlugin->WantsFoveationFdm() &&

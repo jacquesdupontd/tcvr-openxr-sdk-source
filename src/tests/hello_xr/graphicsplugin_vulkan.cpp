@@ -1157,6 +1157,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_cmdBuffer[s0].Clear();
             m_cmdBuffer[s0 + 1].Clear();
             ReadGpuTimestamps();
+            if (m_dumpState == 1 && m_cmdBuffer[m_dumpCb].state != CmdBuffer::CmdBufferState::Executing) WriteDump();
             m_m2Renderer.SetFrameSlot(int(m_frameSlot));
             if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m_m2SceneRequested = true;
@@ -1388,6 +1389,41 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         vkCmdEndRenderPass(cmd);
         }  // legacy pass (no immersive frame)
+        // Debug dump of the LEFT eye as rendered (debug.tcvr.dump=<tag>): copied into a host buffer,
+        // written as files/dump-<tag>-vkL.ppm after the fence. The compositor screencap is black
+        // while the headset is worn; this is the image the app really produced.
+        if (viewIndex == 0 && m_dumpState == 0) {
+            const std::string tag = arcadexr::config::GetString("dump", "0");
+            if (!tag.empty() && tag != "0" && tag != m_dumpDoneTag) {
+                const VkImage img = swapchainData->GetTypedImage(imageIndex).image;
+                const uint32_t w = swapchainData->Width(), h = swapchainData->Height();
+                const VkDeviceSize bytes = VkDeviceSize(w) * h * 4;
+                if (m_dumpBuf == VK_NULL_HANDLE || m_dumpSize < bytes) {
+                    if (m_dumpBuf) { vkDestroyBuffer(m_vkDevice, m_dumpBuf, nullptr); vkFreeMemory(m_vkDevice, m_dumpMem, nullptr); }
+                    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                    bi.size = bytes; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                    vkCreateBuffer(m_vkDevice, &bi, nullptr, &m_dumpBuf);
+                    VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(m_vkDevice, m_dumpBuf, &req);
+                    m_memAllocator.Allocate(req, &m_dumpMem);
+                    vkBindBufferMemory(m_vkDevice, m_dumpBuf, m_dumpMem, 0);
+                    m_dumpSize = bytes;
+                }
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+                VkBufferImageCopy r{};
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageExtent = {w, h, 1};
+                vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_dumpBuf, 1, &r);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+                m_dumpState = 1; m_dumpTag = tag; m_dumpW = w; m_dumpH = h; m_dumpCb = uint32_t(v);
+            }
+        }
         if (m_gpuQueryPool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_gpuQueryPool, uint32_t(v * 2 + 1));
             m_gpuQueryWritten[v] = true;
@@ -1446,6 +1482,33 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         v.assign(count, XrSwapchainImageFoveationVulkanFB{XR_TYPE_SWAPCHAIN_IMAGE_FOVEATION_VULKAN_FB});
         auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images->GetColorImageArray());
         for (uint32_t i = 0; i < count; ++i) arr[i].next = &v[i];
+    }
+
+    void WriteDump() {
+        m_dumpState = 0;
+        m_dumpDoneTag = m_dumpTag;
+        void* p = nullptr;
+        if (vkMapMemory(m_vkDevice, m_dumpMem, 0, m_dumpSize, 0, &p) != VK_SUCCESS) return;
+        const std::string dir = arcadexr::config::ExternalDirectory();
+        const std::string path = (dir.empty() ? std::string("/sdcard/Android/data/io.tcvr2.prototype.vulkan/files") : dir) +
+                                 "/dump-" + m_dumpTag + "-vkL.ppm";
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (f) {
+            std::fprintf(f, "P6\n%u %u\n255\n", m_dumpW, m_dumpH);
+            const uint8_t* px = static_cast<const uint8_t*>(p);
+            std::vector<uint8_t> row(size_t(m_dumpW) * 3);
+            for (uint32_t y = 0; y < m_dumpH; ++y) {
+                for (uint32_t x = 0; x < m_dumpW; ++x) {
+                    const uint8_t* s = px + (size_t(y) * m_dumpW + x) * 4;
+                    // swapchain may be BGRA or RGBA sRGB: written raw, channel order logged
+                    row[x * 3 + 0] = s[0]; row[x * 3 + 1] = s[1]; row[x * 3 + 2] = s[2];
+                }
+                std::fwrite(row.data(), 1, row.size(), f);
+            }
+            std::fclose(f);
+        }
+        vkUnmapMemory(m_vkDevice, m_dumpMem);
+        Log::Write(Log::Level::Info, Fmt("TCVR_DUMP wrote %s (%ux%u) %s", path.c_str(), m_dumpW, m_dumpH, f ? "ok" : "FAILED"));
     }
 
     void SetM2SceneMode(int mode) {
@@ -1602,6 +1665,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_m2SceneMode{-1};
     bool m_fdmEnabled{false};
     bool m_lastM2Drawn{false};
+    int m_dumpState{0};
+    std::string m_dumpTag, m_dumpDoneTag;
+    uint32_t m_dumpW{0}, m_dumpH{0}, m_dumpCb{0};
+    VkBuffer m_dumpBuf{VK_NULL_HANDLE};
+    VkDeviceMemory m_dumpMem{VK_NULL_HANDLE};
+    VkDeviceSize m_dumpSize{0};
     const tcvr_m2_frame* m_lastM2Frame{nullptr};
     float m_cpuWaitMs{0}, m_cpuPrepMs{0}, m_cpuSubmitMs{0}, m_cpuViewMs{0}, m_cpuPeriodMs{0};
     uint32_t m_cpuFrames{0};
