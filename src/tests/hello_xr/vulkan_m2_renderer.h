@@ -236,6 +236,14 @@ public:
     void PrepareFrame(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
         if (!m_initialized) return;
 
+        if (m_dbgMapped && (m_dbgMapped[0] | m_dbgMapped[1]) != 0u) {
+            static unsigned s_ov = 0;
+            if ((s_ov++ % 30u) == 0u)
+                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK overdraw frags opaque=%u other=%u eyePixels=%u -> opaque shaded x%.2f per eye pixel (MSAA counts once/pixel)",
+                                                 m_dbgMapped[0], m_dbgMapped[1], m_lastEyePixels,
+                                                 m_lastEyePixels ? double(m_dbgMapped[0]) / (2.0 * m_lastEyePixels) : 0.0));
+            m_dbgMapped[0] = m_dbgMapped[1] = 0u;
+        }
         if (frame.geometry_unchanged != 0u) {
             UploadLayers(frame, cmd);
             return;
@@ -562,6 +570,7 @@ public:
             ubo.uCountOverdraw = (m_useRegions && arcadexr::config::GetInt("m2.regions", 1) != 0) ? 1 : 0;  // = uUseRegions
         }
 
+        m_lastEyePixels = renderAreaExtent.width * renderAreaExtent.height;
         const float outW = float(renderAreaExtent.width);
         const float outH = float(renderAreaExtent.height);
 
@@ -1197,6 +1206,8 @@ private:
 
         void* dummyMapped = nullptr;
         createMappedBuffer(m_dummyBuffer, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &dummyMapped);
+        m_dbgMapped = reinterpret_cast<uint32_t*>(dummyMapped);
+        std::memset(m_dbgMapped, 0, 256);
 
         // 3. Geometry Buffers
         m_vboSize = 65536 * 5 * sizeof(float); // 32k verts
@@ -1680,6 +1691,8 @@ private:
     size_t m_gammaSize = 0;
 
     BufferAndMemory m_dummyBuffer;
+    uint32_t* m_dbgMapped = nullptr;
+    uint32_t m_lastEyePixels = 0;
 
     BufferAndMemory m_vboBuffer;
     float* m_vboMapped = nullptr;

@@ -67,7 +67,9 @@ layout(std430, set = 0, binding = 2) readonly buffer Palram    { uint palram[]; 
 layout(std430, set = 0, binding = 3) readonly buffer Colorxlat { uint colorxlat[]; };
 layout(std430, set = 0, binding = 4) readonly buffer Lumaram   { uint lumaram[]; };
 layout(std430, set = 0, binding = 5) readonly buffer Gamma     { uint gammaTab[]; };
-layout(std430, set = 0, binding = 6) readonly buffer Tex0      { uint tex0[]; };
+// Debug counters (uTestStage 3): [0] fragments shaded by the discard-free opaque pass (after the
+// early depth test), [1] by the others. Read back and reset by the renderer (TCVR_M2VK overdraw).
+layout(std430, set = 0, binding = 6) buffer DebugCounters { uint dbg[]; };
 layout(std430, set = 0, binding = 7) readonly buffer Tex1      { uint tex1[]; };
 
 // Texture sheets, one texel per byte, R8_UNORM holding t*17 (t = the 4-bit Model 2 texel):
@@ -441,8 +443,21 @@ Prim flatPrim() {
     return p;
 }
 
+#ifdef NO_DISCARD
+// No discard, no depth write from the shader: the depth test ALWAYS runs before shading, even
+// with the debug counter's side effect.
+layout(early_fragment_tests) in;
+#endif
+
 void main() {
     Prim p = flatPrim();
+    if (uTestStage == 3) {
+#ifdef NO_DISCARD
+        atomicAdd(dbg[0], 1u);
+#else
+        atomicAdd(dbg[1], 1u);
+#endif
+    }
 #ifndef NO_DISCARD
     ivec2 pix = (uImmersive != 0) ? ivec2(floor(vBoard)) : ivec2(gl_FragCoord.xy) / uScale;
     if ((uImmersive == 0 || vSecondary != 0u) && (pix.x < p.clip_l || pix.x > p.clip_r || pix.y < p.clip_t || pix.y > p.clip_b)) discard;
