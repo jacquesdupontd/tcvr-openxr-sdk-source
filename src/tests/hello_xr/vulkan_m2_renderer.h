@@ -78,7 +78,7 @@ public:
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32},
-            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * M2RegionTextures::kMaxSlots},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * M2RegionTextures::kMaxSlots + 8},
             {VK_DESCRIPTOR_TYPE_SAMPLER, 16}
         }};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -104,7 +104,7 @@ public:
             ssboBind.binding = b;
             ssboBind.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             ssboBind.descriptorCount = 1;
-            ssboBind.stageFlags = (b == 1) ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+            ssboBind.stageFlags = (b == 1 || b == 2) ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                                           : VK_SHADER_STAGE_FRAGMENT_BIT;
             m2Bindings.push_back(ssboBind);
         }
@@ -129,6 +129,10 @@ public:
             sb.binding = 13; sb.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             sb.descriptorCount = 4; sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
             m2Bindings.push_back(sb);
+            VkDescriptorSetLayoutBinding lb{};
+            lb.binding = 14; lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            lb.descriptorCount = 1; lb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            m2Bindings.push_back(lb);
         }
         VkDescriptorSetLayoutCreateInfo m2LayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         m2LayoutInfo.bindingCount = (uint32_t)m2Bindings.size();
@@ -542,7 +546,7 @@ public:
             ubo.uScale = 1;
             ubo.uStipple = 1;
             ubo.uPass = (pass == 0) ? 1 : 2;  // 1 = opaque, 2 = glass
-            ubo.uPrepassClass = 0;
+            ubo.uPrepassClass = (m_lutValid && arcadexr::config::GetInt("m2.lut", 0) != 0) ? 1 : 0;  // = uUseLut. OFF: measured SLOWER on the Adreno (3 texelFetch of a 64x32 table ~10 ms vs 7 SSBO loads ~5.8 ms, 22/09, interleaved A/B), even as a combined sampler
             ubo.uEdgeFade = 0.0f;
             ubo.uHorizonRow = m_horizonGeo;
             ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
@@ -635,8 +639,8 @@ public:
 
         static unsigned s_immFrames = 0;
         if ((s_immFrames++ % 120u) == 0u) {
-            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u prims=%zu fast=%u opq=%u gls=%u res=%ux%u",
-                                             eye, m_rawPrims.size(), m_fastIndexCount, m_opaqueIndexCount, m_glassIndexCount,
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u lut=%d prims=%zu fast=%u opq=%u gls=%u res=%ux%u",
+                                             eye, int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_opaqueIndexCount, m_glassIndexCount,
                                              renderAreaExtent.width, renderAreaExtent.height));
         }
 
@@ -1401,7 +1405,34 @@ private:
         }
     }
 
+    // gamma(colorxlat) for every (channel, 5-bit component, luma): 3 texel reads per pixel
+    // instead of 6 dependent storage-buffer reads. Rebuilt only when the tables change.
+    void BuildColourLut(const tcvr_m2_frame& frame) {
+        if (!frame.colorxlat || !frame.gamma || frame.colorxlat_entries < 0x6000u || frame.gamma_entries < 256u) return;
+        const size_t cxBytes = 0x6000u * sizeof(uint16_t);
+        if (m_lutValid && std::memcmp(m_lutSrcCx.data(), frame.colorxlat, cxBytes) == 0 &&
+            std::memcmp(m_lutSrcGamma.data(), frame.gamma, 256) == 0)
+            return;
+        m_lutSrcCx.assign(reinterpret_cast<const uint8_t*>(frame.colorxlat), reinterpret_cast<const uint8_t*>(frame.colorxlat) + cxBytes);
+        m_lutSrcGamma.assign(frame.gamma, frame.gamma + 256);
+        uint8_t lut[64 * 32 * 4];
+        for (uint32_t comp = 0; comp < 32; ++comp)
+            for (uint32_t luma = 0; luma < 64; ++luma) {
+                uint8_t* px = lut + (comp * 64 + luma) * 4;
+                for (uint32_t c = 0; c < 3; ++c) {
+                    const uint32_t idx = c * 0x2000u + (comp << 8) + luma;
+                    px[c] = frame.gamma[frame.colorxlat[idx] & 0xffu];
+                }
+                px[3] = 255;
+            }
+        m_regions.SetLut(lut);
+        m_lutValid = true;
+        static unsigned s_lutBuilds = 0;
+        if ((s_lutBuilds++ % 60u) == 0u) Log::Write(Log::Level::Info, Fmt("TCVR_M2VK colour LUT rebuilt (%u)", s_lutBuilds));
+    }
+
     void UploadColourChain(const tcvr_m2_frame& frame) {
+        BuildColourLut(frame);
         if (frame.palram && frame.palram_entries) {
             size_t bytes = std::min(size_t(frame.palram_entries) * sizeof(uint16_t), m_palramSize);
             memcpy(m_palramMapped, frame.palram, bytes);
@@ -1647,6 +1678,8 @@ private:
     uint32_t* m_sheetStagingMapped[4] = {nullptr, nullptr, nullptr, nullptr};
     std::vector<uint8_t> m_sheetCpu[2];
     M2RegionTextures m_regions;
+    std::vector<uint8_t> m_lutSrcCx, m_lutSrcGamma;
+    bool m_lutValid = false;
     bool m_useRegions = false;
     std::vector<uint32_t> m_primSlot;                       // unpacked t per texel, for the region scan
     std::unordered_map<uint64_t, bool> m_regionHasHoles;      // region key -> contains texel 15

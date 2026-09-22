@@ -52,6 +52,7 @@ struct Prim {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Prims { Prim prims[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Palram { uint palram[]; };
 
 layout(location = 0) out vec3 vParam;
 layout(location = 1) flat out uint vPrim;
@@ -62,7 +63,8 @@ layout(location = 3) out vec2 vBoard;
 layout(location = 4) flat out uvec4 vPA;   // texx, texy, texwidth | texheight << 16, flags
 layout(location = 5) flat out uvec4 vPB;   // utexx | utexy << 16, lumabase | luma << 16, colorbase, texlod
 layout(location = 6) flat out ivec4 vPC;   // clip l, t, r, b
-layout(location = 7) flat out uint vSlot;  // region texture slots: main | microtexture << 16 (0xffff = none)
+layout(location = 7) flat out uint vSlot;
+layout(location = 8) flat out uint vColor; // the polygon's palette entry (palram[colorbase + 0x1000]), 16 bits  // region texture slots: main | microtexture << 16 (0xffff = none)
 
 void main() {
     vPrim = aPrim;
@@ -75,7 +77,9 @@ void main() {
         vPA = uvec4(q.texx, q.texy, (q.texwidth & 0xffffu) | (q.texheight << 16), flags);
         vPB = uvec4((q.utexx & 0xffffu) | (q.utexy << 16), (q.lumabase & 0xffffu) | (q.luma << 16), q.colorbase, uint(q.texlod));
         vPC = ivec4(q.clip_l, q.clip_t, q.clip_r, q.clip_b);
-        vSlot = q.first_vertex;   // the renderer stores the region slots in this otherwise unused field
+        vSlot = q.first_vertex;
+        uint ci = q.colorbase + 0x1000u;
+        vColor = ((ci & 1u) == 0u) ? (palram[ci >> 1] & 0xffffu) : (palram[ci >> 1] >> 16);   // the renderer stores the region slots in this otherwise unused field
     }
     vSecondary = 0u;
     vBoard = aPos;

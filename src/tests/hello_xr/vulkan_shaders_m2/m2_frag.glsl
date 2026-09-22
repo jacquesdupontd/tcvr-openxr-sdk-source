@@ -11,6 +11,7 @@ layout(location = 4) flat in uvec4 vPA;
 layout(location = 5) flat in uvec4 vPB;
 layout(location = 6) flat in ivec4 vPC;
 layout(location = 7) flat in uint vSlot;
+layout(location = 8) flat in uint vColor;
 layout(location = 0) out vec4 oColor;
 
 layout(set = 0, binding = 0, std140) uniform M2Uniforms {
@@ -81,6 +82,8 @@ layout(set = 0, binding = 11) uniform sampler2D uCutTex1;
 // G = t*17*opaque, B = opaque. Samplers: [mirrorx | mirrory << 1], repeat otherwise, hw aniso.
 layout(set = 0, binding = 12) uniform texture2D uRegion[512];
 layout(set = 0, binding = 13) uniform sampler uRegionSmp[4];
+// gamma(colorxlat) per (luma = x, 5-bit component = y); .r/.g/.b = red/green/blue channel table.
+layout(set = 0, binding = 14) uniform sampler2D uColourLut;
 
 uint u16at(uint arr_index_hi_lo, uint packed) {
     return (arr_index_hi_lo == 0u) ? (packed & 0xffffu) : (packed >> 16);
@@ -405,11 +408,20 @@ vec4 region_sample(uint slot, uint smp, vec2 tc, vec2 size, vec2 gx, vec2 gy, fl
     return textureGrad(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, gx * k / size, gy * k / size);
 }
 
+// The polygon's colour at a given luma through the precomputed table: 3 texel reads.
+vec3 lut_colour(uint color, uint luma) {
+    float r = texelFetch(uColourLut, ivec2(int(luma), int(color & 31u)), 0).r;
+    float g = texelFetch(uColourLut, ivec2(int(luma), int((color >> 5) & 31u)), 0).g;
+    float b = texelFetch(uColourLut, ivec2(int(luma), int((color >> 10) & 31u)), 0).b;
+    return vec3(r, g, b);
+}
+
 // Colour chain, once: filtered t -> lumaram tone curve -> palette -> colorxlat -> gamma.
 vec3 tone(Prim p, float t) {
     uint t8 = min(uint(t * 16.0 + 0.5), 0xf0u);
-    uint luma = (lumaram8(p.lumabase + (t8 >> 1)) * p.luma) / 256u;
-    return shade(p, min(luma, 0x3fu), 0x7fffu);
+    uint luma = min((lumaram8(p.lumabase + (t8 >> 1)) * p.luma) / 256u, 0x3fu);
+    if (uPrepassClass != 0) return lut_colour(vColor, luma);
+    return shade(p, luma, 0x7fffu);
 }
 
 // The polygon, rebuilt from the flat inputs: registers, not a 120-byte load per pixel.
@@ -455,7 +467,7 @@ void main() {
 #ifndef NO_DISCARD
         if (p.translucent != 0u) discard;
 #endif
-        oColor = vec4(shade(p, p.luma >> 2, 0xffffu), outAlpha);
+        oColor = vec4((uPrepassClass != 0) ? lut_colour(vColor, min(p.luma >> 2, 63u)) : shade(p, p.luma >> 2, 0xffffu), outAlpha);
     } else {
 #ifdef NO_DISCARD
         bool translucent = false;   // routed here only when its texture has no transparent texel

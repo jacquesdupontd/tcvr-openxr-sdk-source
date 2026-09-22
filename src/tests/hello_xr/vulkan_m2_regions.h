@@ -53,6 +53,13 @@ public:
             si.maxLod = 16.0f;
             XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_samplers[m]));
         }
+        {   // nearest sampler for the colour table (combined image sampler, binding 14)
+            VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            si.magFilter = VK_FILTER_NEAREST; si.minFilter = VK_FILTER_NEAREST;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_lutSampler));
+        }
         // Staging, host visible, reused every frame (the previous frame's copies are fenced).
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = kStagingBytes;
@@ -66,13 +73,20 @@ public:
         // Dummy 1x1 image for every empty slot (no partially-bound descriptors needed).
         m_dummy = CreateImage(1, 1, 1);
         m_dummyPending = true;
+        m_lut = CreateImage(64, 32, 1);
+        {   // zeros until the first real table, so the image is always valid to bind
+            std::vector<uint8_t> z(64 * 32 * 4, 0);
+            SetLut(z.data());
+        }
     }
 
     void Destroy() {
         if (m_dev == VK_NULL_HANDLE) return;
         Clear();
         DestroyEntry(m_dummy);
+        DestroyEntry(m_lut);
         for (auto& s : m_samplers) if (s) { vkDestroySampler(m_dev, s, nullptr); s = VK_NULL_HANDLE; }
+        if (m_lutSampler) { vkDestroySampler(m_dev, m_lutSampler, nullptr); m_lutSampler = VK_NULL_HANDLE; }
         if (m_stagingPtr) { vkUnmapMemory(m_dev, m_stagingMem); m_stagingPtr = nullptr; }
         if (m_staging) vkDestroyBuffer(m_dev, m_staging, nullptr);
         if (m_stagingMem) vkFreeMemory(m_dev, m_stagingMem, nullptr);
@@ -128,8 +142,21 @@ public:
         return slot;
     }
 
+    // Colour table, 64 (luma) x 32 (5-bit component) RGBA8: texel.r/g/b = gamma(colorxlat) of the
+    // red / green / blue channel for that component and luma. Rebuilt by the caller when the
+    // board's tables change; uploaded at the next Flush.
+    void SetLut(const uint8_t* rgba) {
+        if (m_stagingUsed + 64 * 32 * 4 > kStagingBytes) return;
+        std::memcpy(m_stagingPtr + m_stagingUsed, rgba, 64 * 32 * 4);
+        m_lutOffset = m_stagingUsed;
+        m_lutPending = true;
+        m_stagingUsed += 64 * 32 * 4;
+    }
+    VkImageView LutView() const { return m_lut.view; }
+
     // Record uploads + mip chains of the regions created this frame. Call before the render pass.
     void Flush(VkCommandBuffer cmd) {
+        if (m_lutPending) { Upload(cmd, m_lut, m_lutOffset); m_lutPending = false; }
         if (m_dummyPending) {
             std::memset(m_stagingPtr + m_stagingUsed, 0, 4);
             Upload(cmd, m_dummy, m_stagingUsed);
@@ -162,6 +189,11 @@ public:
             ws.dstSet = set; ws.dstBinding = smpBinding; ws.descriptorCount = 4;
             ws.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; ws.pImageInfo = smp;
             writes.push_back(ws);
+            VkDescriptorImageInfo lut{m_lutSampler, m_lut.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet wl{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wl.dstSet = set; wl.dstBinding = 14; wl.descriptorCount = 1;
+            wl.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wl.pImageInfo = &lut;
+            writes.push_back(wl);
             vkUpdateDescriptorSets(m_dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
             return;
         }
@@ -273,11 +305,15 @@ private:
     VkDevice m_dev = VK_NULL_HANDLE;
     const MemoryAllocator* m_alloc = nullptr;
     VkSampler m_samplers[4] = {};
+    VkSampler m_lutSampler = VK_NULL_HANDLE;
     VkBuffer m_staging = VK_NULL_HANDLE;
     VkDeviceMemory m_stagingMem = VK_NULL_HANDLE;
     uint8_t* m_stagingPtr = nullptr;
     size_t m_stagingUsed = 0;
     Entry m_dummy;
+    Entry m_lut;
+    size_t m_lutOffset = 0;
+    bool m_lutPending = false;
     bool m_dummyPending = false;
     std::vector<Entry> m_slots;
     std::unordered_map<uint64_t, uint32_t> m_map;
