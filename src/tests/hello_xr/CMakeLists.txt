@@ -99,7 +99,7 @@ if(ANDROID)
     if(TCVR_VK_BAKE)
         # Vulkan Sega Rally immersive: the validated defaults are baked (no props needed after a reboot).
         target_compile_definitions(hello_xr PRIVATE TCVR_VK_BAKE=1)
-        message(STATUS "hello_xr: TCVR_VK_BAKE -> Vulkan immersive defaults baked (res 1.2, 90 Hz)")
+        message(STATUS "hello_xr: TCVR_VK_BAKE -> Vulkan immersive defaults baked (res 2.0, 90 Hz)")
     endif()
     if(TCVR_RAW_SHEET)
         target_compile_definitions(hello_xr PRIVATE TCVR_RAW_SHEET=1)

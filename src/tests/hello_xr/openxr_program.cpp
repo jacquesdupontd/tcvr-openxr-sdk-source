@@ -979,8 +979,9 @@ struct OpenXrProgram : IOpenXrProgram {
                 // This scale is the lever for that, and it is a setting rather
                 // than a constant because what it costs is a judgement call.
 #if defined(TCVR_VK_BAKE)
-                // Vulkan immersive: 1.2 holds 90 Hz locked with MSAA 4x (measured 22/09, 0% of seconds under 88).
-                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.2f);
+                // Vulkan immersive (GOLD 23/09): 2.0 = 3360x3520 per eye, MSAA 4x, 90 Hz, GPU ~9.2 ms both eyes
+                // (lean shaders + texture array). Validated in the headset by Guillaume.
+                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 2.0f);
 #else
                 float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.0f);
 #endif
