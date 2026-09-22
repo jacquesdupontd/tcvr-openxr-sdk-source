@@ -155,6 +155,7 @@ target_include_directories(
         "${PROJECT_SOURCE_DIR}/src/external/metal-cpp"
         # For including compiled shaders
         "${CMAKE_CURRENT_BINARY_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_shaders"
         # Backport of std::span functionality to pre-C++17
         ${PROJECT_SOURCE_DIR}/src/external/span-lite/include
 )

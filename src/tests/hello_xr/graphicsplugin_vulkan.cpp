@@ -33,6 +33,23 @@
 #define SPV_SUFFIX
 #endif
 
+#include "framebuffer_bridge.h"
+#include "virtual_screen.h"
+
+struct ScreenVertex {
+    XrVector3f Position;
+    XrVector2f TexCoord;
+};
+
+static constexpr ScreenVertex c_screenVertices[] = {
+    {{-0.5f, -0.5f, 0.0f}, {0.0f, 1.0f}},
+    {{ 0.5f, -0.5f, 0.0f}, {1.0f, 1.0f}},
+    {{ 0.5f,  0.5f, 0.0f}, {1.0f, 0.0f}},
+    {{-0.5f,  0.5f, 0.0f}, {0.0f, 0.0f}},
+};
+
+static constexpr uint16_t c_screenIndices[] = {0, 1, 2, 0, 2, 3};
+
 namespace {
 
 using nonstd::span;
@@ -740,6 +757,72 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         m_drawBuffer.UpdateIndices(span<const uint16_t>(Geometry::c_cubeIndices, numCubeIdicies), 0);
         m_drawBuffer.UpdateVertices(span<const Geometry::Vertex>(Geometry::c_cubeVertices, numCubeVerticies), 0);
+
+        // Screen shader program & pipeline layout
+        std::vector<uint32_t> screenVertexSPIRV = SPV_PREFIX
+#include "screen_vert.spv"
+            SPV_SUFFIX;
+        std::vector<uint32_t> screenFragmentSPIRV = SPV_PREFIX
+#include "screen_frag.spv"
+            SPV_SUFFIX;
+        m_screenShaderProgram.Init(m_vkDevice);
+        m_screenShaderProgram.LoadVertexShader(screenVertexSPIRV);
+        m_screenShaderProgram.LoadFragmentShader(screenFragmentSPIRV);
+
+        VkDescriptorSetLayoutBinding screenBinding{};
+        screenBinding.binding = 0;
+        screenBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        screenBinding.descriptorCount = 1;
+        screenBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo descLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        descLayoutInfo.bindingCount = 1;
+        descLayoutInfo.pBindings = &screenBinding;
+        XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_vkDevice, &descLayoutInfo, nullptr, &m_screenDescriptorSetLayout));
+
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pcr.offset = 0;
+        pcr.size = sizeof(XrMatrix4x4f);
+
+        VkPipelineLayoutCreateInfo pipeLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipeLayoutInfo.setLayoutCount = 1;
+        pipeLayoutInfo.pSetLayouts = &m_screenDescriptorSetLayout;
+        pipeLayoutInfo.pushConstantRangeCount = 1;
+        pipeLayoutInfo.pPushConstantRanges = &pcr;
+        XRC_CHECK_THROW_VKCMD(vkCreatePipelineLayout(m_vkDevice, &pipeLayoutInfo, nullptr, &m_screenPipelineLayout));
+
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = 1;
+
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_vkDevice, &poolInfo, nullptr, &m_screenDescriptorPool));
+
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = m_screenDescriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &m_screenDescriptorSetLayout;
+        XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_screenDescriptorSet));
+
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_vkDevice, &samplerInfo, nullptr, &m_screenSampler));
+
+        m_screenDrawBuffer.Init(m_vkDevice, &m_memAllocator,
+                                {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(ScreenVertex, Position)},
+                                 {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(ScreenVertex, TexCoord)}});
+        m_screenDrawBuffer.Create(6, 4);
+        m_screenDrawBuffer.UpdateIndices(span<const uint16_t>(c_screenIndices, 6), 0);
+        m_screenDrawBuffer.UpdateVertices(span<const ScreenVertex>(c_screenVertices, 4), 0);
 #if defined(USE_MIRROR_WINDOW)
         m_swapchain.Create(m_vkInstance, m_vkPhysicalDevice, m_vkDevice, m_graphicsBinding.queueFamilyIndex);
 
@@ -820,7 +903,157 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         vkCmdSetScissor(m_cmdBuffer.buf, 0, 1, &rect);
     }
 
-    void RenderView(uint32_t /*viewIndex*/, const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
+    void CreateScreenPipeline(VkRenderPass renderPass) {
+        VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamicState.dynamicStateCount = 2;
+        dynamicState.pDynamicStates = dynamicStates;
+
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &m_screenDrawBuffer.bindDesc;
+        vi.vertexAttributeDescriptionCount = (uint32_t)m_screenDrawBuffer.attrDesc.size();
+        vi.pVertexAttributeDescriptions = m_screenDrawBuffer.attrDesc.data();
+
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.primitiveRestartEnable = VK_FALSE;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+
+        VkPipelineColorBlendAttachmentState attachState{};
+        attachState.blendEnable = VK_FALSE;
+        attachState.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1;
+        cb.pAttachments = &attachState;
+
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1;
+        vp.scissorCount = 1;
+
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = VK_TRUE;
+        ds.depthWriteEnable = VK_TRUE;
+        ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkGraphicsPipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipeInfo.stageCount = (uint32_t)m_screenShaderProgram.shaderInfo.size();
+        pipeInfo.pStages = m_screenShaderProgram.shaderInfo.data();
+        pipeInfo.pVertexInputState = &vi;
+        pipeInfo.pInputAssemblyState = &ia;
+        pipeInfo.pViewportState = &vp;
+        pipeInfo.pRasterizationState = &rs;
+        pipeInfo.pMultisampleState = &ms;
+        pipeInfo.pDepthStencilState = &ds;
+        pipeInfo.pColorBlendState = &cb;
+        pipeInfo.pDynamicState = &dynamicState;
+        pipeInfo.layout = m_screenPipelineLayout;
+        pipeInfo.renderPass = renderPass;
+        pipeInfo.subpass = 0;
+
+        XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_screenPipeline));
+    }
+
+    void CreateOrUpdateScreenTexture(uint32_t width, uint32_t height) {
+        if (m_screenImage != VK_NULL_HANDLE && m_screenWidth == width && m_screenHeight == height) {
+            return;
+        }
+        if (m_screenImageView != VK_NULL_HANDLE) {
+            vkDestroyImageView(m_vkDevice, m_screenImageView, nullptr);
+            m_screenImageView = VK_NULL_HANDLE;
+        }
+        if (m_screenImage != VK_NULL_HANDLE) {
+            vkDestroyImage(m_vkDevice, m_screenImage, nullptr);
+            m_screenImage = VK_NULL_HANDLE;
+        }
+        if (m_screenImageMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(m_vkDevice, m_screenImageMemory, nullptr);
+            m_screenImageMemory = VK_NULL_HANDLE;
+        }
+        if (m_stagingBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_vkDevice, m_stagingBuffer, nullptr);
+            m_stagingBuffer = VK_NULL_HANDLE;
+        }
+        if (m_stagingBufferMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(m_vkDevice, m_stagingBufferMemory, nullptr);
+            m_stagingBufferMemory = VK_NULL_HANDLE;
+        }
+
+        m_screenWidth = width;
+        m_screenHeight = height;
+
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &imageInfo, nullptr, &m_screenImage));
+
+        VkMemoryRequirements memReq{};
+        vkGetImageMemoryRequirements(m_vkDevice, m_screenImage, &memReq);
+        m_memAllocator.Allocate(memReq, &m_screenImageMemory, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_vkDevice, m_screenImage, m_screenImageMemory, 0));
+
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = m_screenImage;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &viewInfo, nullptr, &m_screenImageView));
+
+        VkDeviceSize stagingSize = (VkDeviceSize)std::max(width, 1024u) * height * 4;
+        VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufInfo.size = stagingSize;
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        XRC_CHECK_THROW_VKCMD(vkCreateBuffer(m_vkDevice, &bufInfo, nullptr, &m_stagingBuffer));
+
+        vkGetBufferMemoryRequirements(m_vkDevice, m_stagingBuffer, &memReq);
+        m_memAllocator.Allocate(memReq, &m_stagingBufferMemory,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        XRC_CHECK_THROW_VKCMD(vkBindBufferMemory(m_vkDevice, m_stagingBuffer, m_stagingBufferMemory, 0));
+        m_stagingBufferSize = stagingSize;
+
+        VkDescriptorImageInfo descImageInfo{};
+        descImageInfo.sampler = m_screenSampler;
+        descImageInfo.imageView = m_screenImageView;
+        descImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet writeDesc{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writeDesc.dstSet = m_screenDescriptorSet;
+        writeDesc.dstBinding = 0;
+        writeDesc.dstArrayElement = 0;
+        writeDesc.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writeDesc.descriptorCount = 1;
+        writeDesc.pImageInfo = &descImageInfo;
+        vkUpdateDescriptorSets(m_vkDevice, 1, &writeDesc, 0, nullptr);
+
+        m_screenImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    void RenderView(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
                     int64_t /*swapchainFormat*/, const std::vector<Cube>& cubes) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
 
@@ -831,6 +1064,66 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         m_cmdBuffer.Clear();
         m_cmdBuffer.Begin();
+
+        // 1. If viewIndex == 0, check for new MAME frame and upload to m_screenImage via staging buffer
+        if (viewIndex == 0) {
+            arcadexr::video::FrameInfo info;
+            if (arcadexr::video::PeekLatestFrameInfo(info)) {
+                if (info.sequence != m_lastScreenSequence || (uint32_t)info.width != m_screenWidth || (uint32_t)info.height != m_screenHeight) {
+                    arcadexr::video::FrameInfo got;
+                    const std::uint32_t* pixels = arcadexr::video::AcquireLatestFrame(got);
+                    if (pixels) {
+                        CreateOrUpdateScreenTexture(got.width, got.height);
+                        void* mapped = nullptr;
+                        VkDeviceSize copySize = (VkDeviceSize)got.stride * got.height * 4;
+                        if (copySize <= m_stagingBufferSize) {
+                            XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, m_stagingBufferMemory, 0, copySize, 0, &mapped));
+                            memcpy(mapped, pixels, copySize);
+                            vkUnmapMemory(m_vkDevice, m_stagingBufferMemory);
+
+                            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                            barrier.srcAccessMask = (m_screenImageLayout == VK_IMAGE_LAYOUT_UNDEFINED) ? 0 : VK_ACCESS_SHADER_READ_BIT;
+                            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            barrier.oldLayout = m_screenImageLayout;
+                            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            barrier.image = m_screenImage;
+                            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                            vkCmdPipelineBarrier(m_cmdBuffer.buf,
+                                                 (m_screenImageLayout == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+                            VkBufferImageCopy region{};
+                            region.bufferOffset = 0;
+                            region.bufferRowLength = got.stride;
+                            region.bufferImageHeight = got.height;
+                            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                            region.imageOffset = {0, 0, 0};
+                            region.imageExtent = {(uint32_t)got.width, (uint32_t)got.height, 1};
+                            vkCmdCopyBufferToImage(m_cmdBuffer.buf, m_stagingBuffer, m_screenImage,
+                                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                            vkCmdPipelineBarrier(m_cmdBuffer.buf,
+                                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+                            m_screenImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                            m_lastScreenSequence = got.sequence;
+
+                            if (!m_loggedScreenUpload) {
+                                Log::Write(Log::Level::Info, Fmt("TCVR_VK screen texture upload seq=%llu size=%dx%d stride=%d",
+                                                                 static_cast<unsigned long long>(got.sequence), got.width, got.height, got.stride));
+                                m_loggedScreenUpload = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         const XrRect2Di& r = layerView.subImage.imageRect;
         VkRect2D renderArea = {{r.offset.x, r.offset.y}, {uint32_t(r.extent.width), uint32_t(r.extent.height)}};
@@ -854,8 +1147,6 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         vkCmdBeginRenderPass(m_cmdBuffer.buf, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-        swapchainData->BindPipeline(m_cmdBuffer.buf, imageArrayIndex);
-
         // Bind and clear eye render target
         static std::array<VkClearValue, 2> clearValues;
         clearValues[0].color.float32[0] = m_clearColor[0];
@@ -876,14 +1167,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         VkClearRect clearRect{renderArea, 0, 1};
         vkCmdClearAttachments(m_cmdBuffer.buf, 2, &clearAttachments[0], 1, &clearRect);
 
-        // Bind index and vertex buffers
-        vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_drawBuffer.vtx.buf, &offset);
-
         // Compute the view-projection transform.
-        // Note all matrixes (including OpenXR's) are column-major, right-handed.
         const auto& pose = layerView.pose;
         XrMatrix4x4f proj;
         XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_VULKAN, layerView.fov, 0.05f, 100.0f);
@@ -894,17 +1178,61 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f vp;
         XrMatrix4x4f_Multiply(&vp, &proj, &view);
 
-        // Render each cube
-        for (const Cube& cube : cubes) {
-            // Compute the model-view-projection transform and push it.
-            XrMatrix4x4f model;
-            XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
+        // Render Virtual Arcade Screen
+        arcadexr::gun::ScreenPlane screen;
+        if (m_screenImage != VK_NULL_HANDLE && arcadexr::video::GetVirtualScreen(screen)) {
+            if (m_screenPipeline == VK_NULL_HANDLE) {
+                CreateScreenPipeline(renderPassBeginInfo.renderPass);
+            }
+            if (m_screenWidth > 0 && m_screenHeight > 0) {
+                arcadexr::video::UpdateVirtualScreenAspect(static_cast<float>(m_screenWidth) / static_cast<float>(m_screenHeight));
+                arcadexr::video::GetVirtualScreen(screen);
+            }
+
+            XrMatrix4x4f model{};
+            model.m[0] = screen.right.x * screen.width;
+            model.m[1] = screen.right.y * screen.width;
+            model.m[2] = screen.right.z * screen.width;
+            model.m[4] = screen.up.x * screen.height;
+            model.m[5] = screen.up.y * screen.height;
+            model.m[6] = screen.up.z * screen.height;
+            model.m[8] = screen.normal.x;
+            model.m[9] = screen.normal.y;
+            model.m[10] = screen.normal.z;
+            model.m[12] = screen.center.x;
+            model.m[13] = screen.center.y;
+            model.m[14] = screen.center.z;
+            model.m[15] = 1.0f;
+
             XrMatrix4x4f mvp;
             XrMatrix4x4f_Multiply(&mvp, &vp, &model);
-            vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
 
-            // Draw the cube.
-            vkCmdDrawIndexed(m_cmdBuffer.buf, m_drawBuffer.count.idx, 1, 0, 0, 0);
+            vkCmdBindPipeline(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
+            vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
+                                    0, 1, &m_screenDescriptorSet, 0, nullptr);
+            vkCmdPushConstants(m_cmdBuffer.buf, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+
+            vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_screenDrawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+            VkDeviceSize vtxOffset = 0;
+            vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_screenDrawBuffer.vtx.buf, &vtxOffset);
+            vkCmdDrawIndexed(m_cmdBuffer.buf, 6, 1, 0, 0, 0);
+        }
+
+        // Render cubes
+        if (!cubes.empty()) {
+            swapchainData->BindPipeline(m_cmdBuffer.buf, imageArrayIndex);
+            vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_drawBuffer.vtx.buf, &offset);
+
+            for (const Cube& cube : cubes) {
+                XrMatrix4x4f model;
+                XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
+                XrMatrix4x4f mvp;
+                XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+                vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+                vkCmdDrawIndexed(m_cmdBuffer.buf, m_drawBuffer.count.idx, 1, 0, 0, 0);
+            }
         }
 
         vkCmdEndRenderPass(m_cmdBuffer.buf);
@@ -929,6 +1257,51 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     void SetClearColor(const std::array<float, 4> clearColor) override { m_clearColor = clearColor; }
 
+    ~VulkanGraphicsPlugin() override {
+        if (m_vkDevice != VK_NULL_HANDLE) {
+            if (m_screenPipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(m_vkDevice, m_screenPipeline, nullptr);
+                m_screenPipeline = VK_NULL_HANDLE;
+            }
+            if (m_screenPipelineLayout != VK_NULL_HANDLE) {
+                vkDestroyPipelineLayout(m_vkDevice, m_screenPipelineLayout, nullptr);
+                m_screenPipelineLayout = VK_NULL_HANDLE;
+            }
+            if (m_screenDescriptorPool != VK_NULL_HANDLE) {
+                vkDestroyDescriptorPool(m_vkDevice, m_screenDescriptorPool, nullptr);
+                m_screenDescriptorPool = VK_NULL_HANDLE;
+            }
+            if (m_screenDescriptorSetLayout != VK_NULL_HANDLE) {
+                vkDestroyDescriptorSetLayout(m_vkDevice, m_screenDescriptorSetLayout, nullptr);
+                m_screenDescriptorSetLayout = VK_NULL_HANDLE;
+            }
+            if (m_screenSampler != VK_NULL_HANDLE) {
+                vkDestroySampler(m_vkDevice, m_screenSampler, nullptr);
+                m_screenSampler = VK_NULL_HANDLE;
+            }
+            if (m_screenImageView != VK_NULL_HANDLE) {
+                vkDestroyImageView(m_vkDevice, m_screenImageView, nullptr);
+                m_screenImageView = VK_NULL_HANDLE;
+            }
+            if (m_screenImage != VK_NULL_HANDLE) {
+                vkDestroyImage(m_vkDevice, m_screenImage, nullptr);
+                m_screenImage = VK_NULL_HANDLE;
+            }
+            if (m_screenImageMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(m_vkDevice, m_screenImageMemory, nullptr);
+                m_screenImageMemory = VK_NULL_HANDLE;
+            }
+            if (m_stagingBuffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(m_vkDevice, m_stagingBuffer, nullptr);
+                m_stagingBuffer = VK_NULL_HANDLE;
+            }
+            if (m_stagingBufferMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(m_vkDevice, m_stagingBufferMemory, nullptr);
+                m_stagingBufferMemory = VK_NULL_HANDLE;
+            }
+        }
+    }
+
    protected:
     XrGraphicsBindingVulkan2KHR m_graphicsBinding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
     SwapchainImageDataMap<VulkanSwapchainImageData> m_swapchainImageDataMap;
@@ -948,6 +1321,28 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     PipelineLayout m_pipelineLayout{};
     VertexBuffer<Geometry::Vertex> m_drawBuffer{};
     std::array<float, 4> m_clearColor;
+
+    ShaderProgram m_screenShaderProgram{SHADER_PROGRAM_TYPE_GRAPHICS};
+    VkDescriptorSetLayout m_screenDescriptorSetLayout{VK_NULL_HANDLE};
+    VkPipelineLayout m_screenPipelineLayout{VK_NULL_HANDLE};
+    VkDescriptorPool m_screenDescriptorPool{VK_NULL_HANDLE};
+    VkDescriptorSet m_screenDescriptorSet{VK_NULL_HANDLE};
+    VkSampler m_screenSampler{VK_NULL_HANDLE};
+    VkPipeline m_screenPipeline{VK_NULL_HANDLE};
+    VertexBuffer<ScreenVertex> m_screenDrawBuffer{};
+
+    VkImage m_screenImage{VK_NULL_HANDLE};
+    VkDeviceMemory m_screenImageMemory{VK_NULL_HANDLE};
+    VkImageView m_screenImageView{VK_NULL_HANDLE};
+    VkImageLayout m_screenImageLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+    uint32_t m_screenWidth{0};
+    uint32_t m_screenHeight{0};
+    uint64_t m_lastScreenSequence{0};
+    bool m_loggedScreenUpload{false};
+
+    VkBuffer m_stagingBuffer{VK_NULL_HANDLE};
+    VkDeviceMemory m_stagingBufferMemory{VK_NULL_HANDLE};
+    VkDeviceSize m_stagingBufferSize{0};
 
     PipelineLayout m_computePipelineLayout{};
     VkDescriptorSet m_ComputeDescriptorSet;
