@@ -233,33 +233,24 @@ public:
         return true;
     }
 
+    // Legacy single call: build then commit.
     void PrepareFrame(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
-        if (!m_initialized) return;
+        BuildFrame(frame);
+        CommitFrame(frame, cmd);
+    }
 
-        if (m_dbgMapped && (m_dbgMapped[0] | m_dbgMapped[1]) != 0u) {
-            static unsigned s_ov = 0;
-            if ((s_ov++ % 30u) == 0u)
-                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK overdraw frags opaque=%u other=%u eyePixels=%u -> opaque shaded x%.2f per eye pixel (MSAA counts once/pixel)",
-                                                 m_dbgMapped[0], m_dbgMapped[1], m_lastEyePixels,
-                                                 m_lastEyePixels ? double(m_dbgMapped[0]) / (2.0 * m_lastEyePixels) : 0.0));
-            m_dbgMapped[0] = m_dbgMapped[1] = 0u;
-        }
-        if (frame.geometry_unchanged != 0u) {
-            UploadLayers(frame, cmd);
-            return;
-        }
-
+    // CPU half of the frame preparation: reads the emulator's scene and builds the CPU-side
+    // arrays (sort, triangulation, main view, texture region choice). Touches NO buffer the GPU
+    // may still be reading, so the plugin runs it BEFORE waiting for the previous frame's fence:
+    // it overlaps the GPU instead of leaving it idle (measured 22/09: wait 9 ms + prepare 3.7 ms
+    // back to back -> a 14 ms period, 71 fps, with the GPU only 73% busy).
+    void BuildFrame(const tcvr_m2_frame& frame) {
+        m_built = false;
+        if (!m_initialized || frame.geometry_unchanged != 0u) return;
         const bool haveClipped = frame.prim_count != 0 && frame.vertex_count != 0;
         const bool haveRaw = frame.raw_prim_count != 0 && frame.raw_vertex_count != 0;
         if (!haveClipped && !haveRaw) return;
-
-        // Upload colour chain & textures
-        UploadColourChain(frame);
-        const bool texChanged = UploadTextures(frame, cmd);
-        if (texChanged && m_regions.Count() > 0) {
-            vkDeviceWaitIdle(m_vkDevice);   // rare: the sheets changed (course / menu load)
-            m_regions.Clear();
-        }
+        m_built = true;
 
         // Fan-triangulate and sort primitives
         const tcvr_m2_prim* kp = frame.raw_prim_count ? frame.raw_prims : frame.prims;
@@ -421,7 +412,41 @@ public:
             }
             m_rawIdx.resize(io);
 
-            // Copy to host-visible buffers
+            // first_vertex is not read by any shader: it now carries the region slots
+            // (main | microtexture << 16) to the vertex stage, which hands them on flat.
+            for (std::uint32_t k = 0; k < n; k++) m_rawPrims[k].first_vertex = m_primSlot[k];
+        }
+    }
+
+    // GPU-visible half: after the fence. Colour tables, texture sheets, region uploads,
+    // descriptor updates, copies into the host-visible buffers, 2D layers.
+    void CommitFrame(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
+        if (!m_initialized) return;
+        if (m_dbgMapped && (m_dbgMapped[0] | m_dbgMapped[1]) != 0u) {
+            static unsigned s_ov = 0;
+            if ((s_ov++ % 30u) == 0u)
+                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK overdraw frags opaque=%u other=%u eyePixels=%u -> opaque shaded x%.2f per eye pixel (MSAA counts once/pixel)",
+                                                 m_dbgMapped[0], m_dbgMapped[1], m_lastEyePixels,
+                                                 m_lastEyePixels ? double(m_dbgMapped[0]) / (2.0 * m_lastEyePixels) : 0.0));
+            m_dbgMapped[0] = m_dbgMapped[1] = 0u;
+        }
+        if (frame.geometry_unchanged != 0u) {
+            UploadLayers(frame, cmd);
+            return;
+        }
+        if (!m_built) return;
+        UploadColourChain(frame);
+        const bool texChanged = UploadTextures(frame, cmd);
+        if (texChanged) {
+            // Rare (course / menu load): the regions were chosen on the old sheets -> rebuild.
+            if (m_regions.Count() > 0) {
+                vkDeviceWaitIdle(m_vkDevice);
+                m_regions.Clear();
+            }
+            BuildFrame(frame);
+            if (!m_built) return;
+        }
+        if (!m_rawPrims.empty()) {
             if (!m_rawVerts.empty()) {
                 size_t vertBytes = std::min(m_rawVerts.size() * sizeof(float), m_vboSize);
                 memcpy(m_vboMapped, m_rawVerts.data(), vertBytes);
@@ -434,9 +459,6 @@ public:
                 size_t idxBytes = std::min(m_rawIdx.size() * sizeof(uint32_t), m_iboSize);
                 memcpy(m_iboMapped, m_rawIdx.data(), idxBytes);
             }
-            // first_vertex is not read by any shader: it now carries the region slots
-            // (main | microtexture << 16) to the vertex stage, which hands them on flat.
-            for (std::uint32_t k = 0; k < n; k++) m_rawPrims[k].first_vertex = m_primSlot[k];
             {   // always: the descriptor array must be fully valid (dummy image) before any draw
                 m_regions.Flush(cmd);
                 const bool full = m_regions.NeedsFullDescriptorWrite();
@@ -448,12 +470,9 @@ public:
                 if ((s_regLog++ % 300u) == 0u)
                     Log::Write(Log::Level::Info, Fmt("TCVR_M2VK regions=%u created=%u", m_regions.Count(), m_regions.Created()));
             }
-            if (!m_rawPrims.empty()) {
-                size_t primBytes = std::min(m_rawPrims.size() * sizeof(tcvr_m2_prim), m_primsSize);
-                memcpy(m_primsMapped, m_rawPrims.data(), primBytes);
-            }
+            size_t primBytes = std::min(m_rawPrims.size() * sizeof(tcvr_m2_prim), m_primsSize);
+            memcpy(m_primsMapped, m_rawPrims.data(), primBytes);
         }
-
         UploadLayers(frame, cmd);
         m_preparedSeq = frame.sequence;
     }
@@ -555,7 +574,7 @@ public:
             ubo.uScale = 1;
             ubo.uStipple = 1;
             ubo.uPass = (pass == 0) ? 1 : 2;  // 1 = opaque, 2 = glass
-            ubo.uPrepassClass = (m_lutValid && arcadexr::config::GetInt("m2.lut", 0) != 0) ? 1 : 0;  // = uUseLut. OFF: measured SLOWER on the Adreno (3 texelFetch of a 64x32 table ~10 ms vs 7 SSBO loads ~5.8 ms, 22/09, interleaved A/B), even as a combined sampler
+            ubo.uPrepassClass = (m_lutValid && false) ? 1 : 0;  // colour table removed from the shader (slower on Adreno, see m2_frag.glsl)  // = uUseLut. OFF: measured SLOWER on the Adreno (3 texelFetch of a 64x32 table ~10 ms vs 7 SSBO loads ~5.8 ms, 22/09, interleaved A/B), even as a combined sampler
             ubo.uEdgeFade = 0.0f;
             ubo.uHorizonRow = m_horizonGeo;
             ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
@@ -915,6 +934,7 @@ public:
         m_lumaramBuffer.Reset(m_vkDevice);
         m_gammaBuffer.Reset(m_vkDevice);
         m_dummyBuffer.Reset(m_vkDevice);
+        m_lutBuffer.Reset(m_vkDevice);
         for (int i = 0; i < 4; ++i) {
             m_sheetStagingBuffer[i].Reset(m_vkDevice);
             m_sheetStagingMapped[i] = nullptr;
@@ -1206,6 +1226,12 @@ private:
 
         void* dummyMapped = nullptr;
         createMappedBuffer(m_dummyBuffer, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &dummyMapped);
+        {
+            void* lm = nullptr;
+            createMappedBuffer(m_lutBuffer, 64 * 32 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &lm);
+            m_lutMapped = reinterpret_cast<uint8_t*>(lm);
+            std::memset(m_lutMapped, 0, 64 * 32 * 4);
+        }
         m_dbgMapped = reinterpret_cast<uint32_t*>(dummyMapped);
         std::memset(m_dbgMapped, 0, 256);
 
@@ -1410,9 +1436,11 @@ private:
                 VkWriteDescriptorSet dum7Write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 dum7Write.dstSet = m_m2DescSet[e][p];
                 dum7Write.dstBinding = 7;
+                // binding 7 = the colour table as a storage buffer (uint RGBA per (component, luma))
+                VkDescriptorBufferInfo lutInfo{m_lutBuffer.buf, 0, 64 * 32 * 4};
                 dum7Write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 dum7Write.descriptorCount = 1;
-                dum7Write.pBufferInfo = &dummyInfo;
+                dum7Write.pBufferInfo = &lutInfo;
                 writes.push_back(dum7Write);
 
                 // Binding 8, 9: Sheet texture samplers
@@ -1467,6 +1495,7 @@ private:
                 px[3] = 255;
             }
         m_regions.SetLut(lut);
+        if (m_lutMapped) std::memcpy(m_lutMapped, lut, sizeof(lut));  // SSBO copy (binding 7), fenced
         m_lutValid = true;
         static unsigned s_lutBuilds = 0;
         if ((s_lutBuilds++ % 60u) == 0u) Log::Write(Log::Level::Info, Fmt("TCVR_M2VK colour LUT rebuilt (%u)", s_lutBuilds));
@@ -1692,7 +1721,10 @@ private:
 
     BufferAndMemory m_dummyBuffer;
     uint32_t* m_dbgMapped = nullptr;
+    BufferAndMemory m_lutBuffer;
+    uint8_t* m_lutMapped = nullptr;
     uint32_t m_lastEyePixels = 0;
+    bool m_built = false;
 
     BufferAndMemory m_vboBuffer;
     float* m_vboMapped = nullptr;

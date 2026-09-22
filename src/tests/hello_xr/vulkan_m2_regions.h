@@ -35,6 +35,9 @@ public:
     static constexpr uint32_t kMaxSlots = 512;
     static constexpr uint32_t kNone = 0xffffu;
     static constexpr uint32_t kStagingBytes = 16u * 1024u * 1024u;
+    // Two halves, alternated per frame: a frame's regions are written while the GPU may still
+    // be copying the previous frame's from the other half (the plugin builds before the fence).
+    static constexpr uint32_t kHalfBytes = kStagingBytes / 2;
 
     void Init(VkDevice device, const MemoryAllocator* alloc, float maxAniso) {
         m_dev = device;
@@ -102,6 +105,8 @@ public:
         m_pending.clear();
         m_dirtySlots.clear();
         m_resetDescriptors = true;
+        m_stagingUsed = 0;
+        m_lutPending = false;
     }
 
     // Slot of a region, creating it (this frame, within the staging budget) if new.
@@ -113,9 +118,9 @@ public:
         if (it != m_map.end()) return it->second;
         if (m_slots.size() >= kMaxSlots) return kNone;
         const size_t bytes = size_t(w) * h * 4;
-        if (m_stagingUsed + bytes > kStagingBytes) return kNone;  // next frame
+        if (m_stagingUsed + bytes > kHalfBytes) return kNone;  // next frame
         // Texels of the region, through the board's fold (x >= 1024 -> other half).
-        uint8_t* dst = m_stagingPtr + m_stagingUsed;
+        uint8_t* dst = m_stagingPtr + Base() + m_stagingUsed;
         const std::vector<uint8_t>& cpu = sheets[sheet & 1];
         for (uint32_t y = 0; y < h; ++y)
             for (uint32_t x = 0; x < w; ++x) {
@@ -136,7 +141,7 @@ public:
         const uint32_t slot = uint32_t(m_slots.size());
         m_slots.push_back(e);
         m_map.emplace(key, slot);
-        m_pending.push_back({slot, m_stagingUsed});
+        m_pending.push_back({slot, Base() + m_stagingUsed});
         m_dirtySlots.push_back(slot);
         m_stagingUsed += (bytes + 255) & ~size_t(255);
         return slot;
@@ -146,9 +151,9 @@ public:
     // red / green / blue channel for that component and luma. Rebuilt by the caller when the
     // board's tables change; uploaded at the next Flush.
     void SetLut(const uint8_t* rgba) {
-        if (m_stagingUsed + 64 * 32 * 4 > kStagingBytes) return;
-        std::memcpy(m_stagingPtr + m_stagingUsed, rgba, 64 * 32 * 4);
-        m_lutOffset = m_stagingUsed;
+        if (m_stagingUsed + 64 * 32 * 4 > kHalfBytes) return;
+        std::memcpy(m_stagingPtr + Base() + m_stagingUsed, rgba, 64 * 32 * 4);
+        m_lutOffset = Base() + m_stagingUsed;
         m_lutPending = true;
         m_stagingUsed += 64 * 32 * 4;
     }
@@ -158,8 +163,8 @@ public:
     void Flush(VkCommandBuffer cmd) {
         if (m_lutPending) { Upload(cmd, m_lut, m_lutOffset); m_lutPending = false; }
         if (m_dummyPending) {
-            std::memset(m_stagingPtr + m_stagingUsed, 0, 4);
-            Upload(cmd, m_dummy, m_stagingUsed);
+            std::memset(m_stagingPtr + Base() + m_stagingUsed, 0, 4);
+            Upload(cmd, m_dummy, Base() + m_stagingUsed);
             m_stagingUsed += 256;
             m_dummyPending = false;
         }
@@ -167,6 +172,7 @@ public:
         if (!m_pending.empty()) m_created += uint32_t(m_pending.size());
         m_pending.clear();
         m_stagingUsed = 0;
+        m_half ^= 1u;
     }
 
     // Descriptor writes for binding `imgBinding` (texture2D[kMaxSlots]) and `smpBinding`
@@ -310,6 +316,8 @@ private:
     VkDeviceMemory m_stagingMem = VK_NULL_HANDLE;
     uint8_t* m_stagingPtr = nullptr;
     size_t m_stagingUsed = 0;
+    uint32_t m_half = 0;
+    size_t Base() const { return size_t(m_half) * kHalfBytes; }
     Entry m_dummy;
     Entry m_lut;
     size_t m_lutOffset = 0;

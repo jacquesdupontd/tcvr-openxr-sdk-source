@@ -1130,9 +1130,28 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // Double-buffered command execution:
         // Wait for previous frame's GPU completion at the start of view 0,
         // allowing the CPU to record without blocking at the end of each eye.
+        using clk = std::chrono::steady_clock;
+        const auto tView0 = clk::now();
+        // Left eye: take the emulator's newest scene and BUILD it on the CPU first, while the GPU
+        // is still drawing the previous frame; only then wait for that frame's fence.
+        const tcvr_m2_frame* m2Frame = nullptr;
         if (viewIndex == 0) {
+            if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
+                m_m2SceneRequested = true;
+                SetM2SceneMode(1);
+            }
+            if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
+                m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
+                if (m2Frame) {
+                    const auto tp = clk::now();
+                    m_m2Renderer.BuildFrame(*m2Frame);
+                    m_cpuPrepMs += std::chrono::duration<float, std::milli>(clk::now() - tp).count();
+                }
+            }
+            const auto tw = clk::now();
             m_cmdBuffer[0].Wait();
             m_cmdBuffer[1].Wait();
+            m_cpuWaitMs += std::chrono::duration<float, std::milli>(clk::now() - tw).count();
             m_cmdBuffer[0].Clear();
             m_cmdBuffer[1].Clear();
             ReadGpuTimestamps();
@@ -1146,20 +1165,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_gpuQueryPool, uint32_t(v * 2));
         }
 
-        // 1. If viewIndex == 0, check for new MAME frame and upload to m_screenImage via staging buffer
+        // 1. If viewIndex == 0, commit the built scene (GPU-visible copies, uploads) and upload the MAME frame
         if (viewIndex == 0) {
-            if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
-                m_m2SceneRequested = true;
-                SetM2SceneMode(1);
-            }
-            if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
-                const tcvr_m2_frame* m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
-                if (m2Frame) {
-                    m_m2Renderer.PrepareFrame(*m2Frame, cmd);
-                }
-            }
+            if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);
             arcadexr::video::FrameInfo info;
-            if (arcadexr::video::PeekLatestFrameInfo(info)) {
+            // The flat framebuffer only feeds the screen fallback: skip its 760 KB copy while the
+            // immersive pass is the one drawing (it resumes the first frame the fallback runs).
+            if (!m_lastM2Drawn && arcadexr::video::PeekLatestFrameInfo(info)) {
                 if (info.sequence != m_lastScreenSequence || (uint32_t)info.width != m_screenWidth || (uint32_t)info.height != m_screenHeight) {
                     arcadexr::video::FrameInfo got;
                     const std::uint32_t* pixels = arcadexr::video::AcquireLatestFrame(got);
@@ -1364,13 +1376,33 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // dropped the emulation to ~53 fps and pitched the sound down). Only while the immersive
         // pass really drew a centred main view (a race); menus/intro keep mode 1 so the flat
         // fallback always has a fresh picture.
+        if (viewIndex == 0) m_lastM2Drawn = m2ImmersiveDrawn;
         if (viewIndex == 0 && m_m2SceneRequested) {
             const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 1) != 0;
             SetM2SceneMode((m2ImmersiveDrawn && m_m2Renderer.HaveMainView() && allowSkip) ? 2 : 1);
         }
 
         m_cmdBuffer[v].End();
+        const auto tSubmit = clk::now();
         m_cmdBuffer[v].Exec(m_vkQueue);
+        m_cpuSubmitMs += std::chrono::duration<float, std::milli>(clk::now() - tSubmit).count();
+        m_cpuViewMs += std::chrono::duration<float, std::milli>(clk::now() - tView0).count();
+        if (viewIndex == 1) {
+            ++m_cpuFrames;
+            // Frame-to-frame period of the render loop (includes xrWaitFrame / EndFrame outside us).
+            const auto now = clk::now();
+            if (m_cpuLastFrame.time_since_epoch().count() != 0)
+                m_cpuPeriodMs += std::chrono::duration<float, std::milli>(now - m_cpuLastFrame).count();
+            m_cpuLastFrame = now;
+            if (now - m_cpuLogAt >= std::chrono::seconds(2)) {
+                const float n = float(m_cpuFrames);
+                Log::Write(Log::Level::Info, Fmt("TCVR_VKCPU per frame (ms): period=%.2f inRenderView=%.2f waitFence=%.2f prepare=%.2f submit=%.2f frames=%u",
+                                                 m_cpuPeriodMs / n, m_cpuViewMs / n, m_cpuWaitMs / n, m_cpuPrepMs / n, m_cpuSubmitMs / n, m_cpuFrames));
+                m_cpuPeriodMs = m_cpuViewMs = m_cpuWaitMs = m_cpuPrepMs = m_cpuSubmitMs = 0.0f;
+                m_cpuFrames = 0;
+                m_cpuLogAt = now;
+            }
+        }
         // Fully asynchronous GPU execution:
         // Do NOT call m_cmdBuffer[v].Wait() here! Fences are waited at the start
         // of the next frame (viewIndex == 0).
@@ -1543,6 +1575,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool m_m2SceneRequested{false};
     int m_m2SceneMode{-1};
     bool m_fdmEnabled{false};
+    bool m_lastM2Drawn{false};
+    float m_cpuWaitMs{0}, m_cpuPrepMs{0}, m_cpuSubmitMs{0}, m_cpuViewMs{0}, m_cpuPeriodMs{0};
+    uint32_t m_cpuFrames{0};
+    std::chrono::steady_clock::time_point m_cpuLastFrame{}, m_cpuLogAt{};
     VkPhysicalDeviceFragmentDensityMapFeaturesEXT m_fdmFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
     std::map<const ISwapchainImageData*, std::vector<XrSwapchainImageFoveationVulkanFB>> m_fdmImages;
     VkQueryPool m_gpuQueryPool{VK_NULL_HANDLE};

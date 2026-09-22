@@ -70,7 +70,7 @@ layout(std430, set = 0, binding = 5) readonly buffer Gamma     { uint gammaTab[]
 // Debug counters (uTestStage 3): [0] fragments shaded by the discard-free opaque pass (after the
 // early depth test), [1] by the others. Read back and reset by the renderer (TCVR_M2VK overdraw).
 layout(std430, set = 0, binding = 6) buffer DebugCounters { uint dbg[]; };
-layout(std430, set = 0, binding = 7) readonly buffer Tex1      { uint tex1[]; };
+layout(std430, set = 0, binding = 7) readonly buffer Unused7 { uint unused7[]; };
 
 // Texture sheets, one texel per byte, R8_UNORM holding t*17 (t = the 4-bit Model 2 texel):
 // texelFetch gives the exact texel back, and the SAME image can be sampled with the
@@ -84,8 +84,9 @@ layout(set = 0, binding = 11) uniform sampler2D uCutTex1;
 // G = t*17*opaque, B = opaque. Samplers: [mirrorx | mirrory << 1], repeat otherwise, hw aniso.
 layout(set = 0, binding = 12) uniform texture2D uRegion[512];
 layout(set = 0, binding = 13) uniform sampler uRegionSmp[4];
-// gamma(colorxlat) per (luma = x, 5-bit component = y); .r/.g/.b = red/green/blue channel table.
-layout(set = 0, binding = 14) uniform sampler2D uColourLut;
+// binding 14 (colour table image) is still declared by the renderer but unused: a precomputed
+// gamma(colorxlat) table, as a texture (~2x) or as a storage buffer (~3x), made the WHOLE shader
+// slower on the Adreno 740 (measured 22/09, interleaved A/B). Kept out of the shader on purpose.
 
 uint u16at(uint arr_index_hi_lo, uint packed) {
     return (arr_index_hi_lo == 0u) ? (packed & 0xffffu) : (packed >> 16);
@@ -187,6 +188,14 @@ int fast_log2(float value) {
 
 vec3 shade(Prim p, uint luma, uint palmask) {
     uint color = palram16(p.colorbase + 0x1000u) & palmask;
+    uint r = colorxlat16((0x0000u / 2u) + (((color >>  0) & 0x1fu) << 8) + luma) & 0xffu;
+    uint g = colorxlat16((0x4000u / 2u) + (((color >>  5) & 0x1fu) << 8) + luma) & 0xffu;
+    uint b = colorxlat16((0x8000u / 2u) + (((color >> 10) & 0x1fu) << 8) + luma) & 0xffu;
+    return vec3(float(gamma8(r)), float(gamma8(g)), float(gamma8(b))) / 255.0;
+}
+
+// Same as shade(), with the polygon's palette colour handed in flat by the vertex stage.
+vec3 shade_c(uint color, uint luma) {
     uint r = colorxlat16((0x0000u / 2u) + (((color >>  0) & 0x1fu) << 8) + luma) & 0xffu;
     uint g = colorxlat16((0x4000u / 2u) + (((color >>  5) & 0x1fu) << 8) + luma) & 0xffu;
     uint b = colorxlat16((0x8000u / 2u) + (((color >> 10) & 0x1fu) << 8) + luma) & 0xffu;
@@ -411,19 +420,11 @@ vec4 region_sample(uint slot, uint smp, vec2 tc, vec2 size, vec2 gx, vec2 gy, fl
 }
 
 // The polygon's colour at a given luma through the precomputed table: 3 texel reads.
-vec3 lut_colour(uint color, uint luma) {
-    float r = texelFetch(uColourLut, ivec2(int(luma), int(color & 31u)), 0).r;
-    float g = texelFetch(uColourLut, ivec2(int(luma), int((color >> 5) & 31u)), 0).g;
-    float b = texelFetch(uColourLut, ivec2(int(luma), int((color >> 10) & 31u)), 0).b;
-    return vec3(r, g, b);
-}
-
 // Colour chain, once: filtered t -> lumaram tone curve -> palette -> colorxlat -> gamma.
 vec3 tone(Prim p, float t) {
     uint t8 = min(uint(t * 16.0 + 0.5), 0xf0u);
     uint luma = min((lumaram8(p.lumabase + (t8 >> 1)) * p.luma) / 256u, 0x3fu);
-    if (uPrepassClass != 0) return lut_colour(vColor, luma);
-    return shade(p, luma, 0x7fffu);
+    return shade_c(vColor & 0x7fffu, luma);
 }
 
 // The polygon, rebuilt from the flat inputs: registers, not a 120-byte load per pixel.
@@ -482,7 +483,7 @@ void main() {
 #ifndef NO_DISCARD
         if (p.translucent != 0u) discard;
 #endif
-        oColor = vec4((uPrepassClass != 0) ? lut_colour(vColor, min(p.luma >> 2, 63u)) : shade(p, p.luma >> 2, 0xffffu), outAlpha);
+        oColor = vec4(shade_c(vColor, p.luma >> 2), outAlpha);
     } else {
 #ifdef NO_DISCARD
         bool translucent = false;   // routed here only when its texture has no transparent texel
