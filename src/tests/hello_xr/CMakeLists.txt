@@ -99,6 +99,9 @@ if(ANDROID)
     if(TCVR_VK_BAKE)
         # Vulkan Sega Rally immersive: the validated defaults are baked (no props needed after a reboot).
         target_compile_definitions(hello_xr PRIVATE TCVR_VK_BAKE=1)
+        # The Gradle debug variant builds this target at -O0: measured 23/09, the System 22 scene
+        # preparation took 3-6 ms per frame on the render thread. Optimise it, keep the debug info.
+        target_compile_options(hello_xr PRIVATE -O2)
         message(STATUS "hello_xr: TCVR_VK_BAKE -> Vulkan immersive defaults baked (res 2.0, 90 Hz)")
     endif()
     if(TCVR_RAW_SHEET)

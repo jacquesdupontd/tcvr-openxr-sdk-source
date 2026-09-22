@@ -1212,7 +1212,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // 1. If viewIndex == 0, commit the built scene (GPU-visible copies, uploads) and upload the MAME frame
         if (viewIndex == 0) {
             if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);   // frozen: same built arrays re-committed
-            PrepareSystem22(cmd, swapchainData);
+            {
+                const auto tp = clk::now();
+                PrepareSystem22(cmd, swapchainData);
+                m_cpuPrepMs += std::chrono::duration<float, std::milli>(clk::now() - tp).count();
+            }
             // SCREEN presentation of a Model 2 game: the GPU draws it in the board's projection (MAME can
             // stop rasterising, like in immersive). Falls back to MAME's framebuffer when it cannot.
             m_flatDrawn = false;
@@ -1224,6 +1228,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     EnsureM2Renderer(swapchainData);
                     if (m_m2Renderer.HasGeometry() && m_m2Renderer.RenderFlat(cmd)) {
                         m_flatDrawn = true;
+                        m_flatW = m_m2Renderer.FlatWidth(); m_flatH = m_m2Renderer.FlatHeight();
                         if (m_m2Renderer.FlatView() != m_flatBoundView) {
                             VkDescriptorImageInfo di{m_flatSampler, m_m2Renderer.FlatView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                             VkWriteDescriptorSet wd{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1233,6 +1238,24 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                             vkUpdateDescriptorSets(m_vkDevice, 1, &wd, 0, nullptr);
                             m_flatBoundView = m_m2Renderer.FlatView();
                         }
+                    }
+                }
+            }
+            if (m_s22FlatWanted && m_s22Prepared) {
+                arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
+                st.texSamples = 1;
+                const float scale = std::max(1.0f, std::min(4.0f, arcadexr::config::GetFloat("s22.flatScale", 2.0f)));
+                if (m_s22.RenderFlat(cmd, scale, st)) {
+                    m_flatDrawn = true;
+                    m_flatW = m_s22.FlatWidth(); m_flatH = m_s22.FlatHeight();
+                    if (m_s22.FlatView() != m_flatBoundView) {
+                        VkDescriptorImageInfo di{m_flatSampler, m_s22.FlatView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                        VkWriteDescriptorSet wd{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        wd.dstSet = m_flatDescriptorSet; wd.dstBinding = 0; wd.descriptorCount = 1;
+                        wd.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wd.pImageInfo = &di;
+                        vkDeviceWaitIdle(m_vkDevice);   // rare: only when the flat target is (re)created
+                        vkUpdateDescriptorSets(m_vkDevice, 1, &wd, 0, nullptr);
+                        m_flatBoundView = m_s22.FlatView();
                     }
                 }
             }
@@ -1421,7 +1444,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 const auto aim = arcadexr::gun::GetAimState();
                 spc.aim[0] = aim.normalized_x; spc.aim[1] = aim.normalized_y;
                 spc.srcSize[0] = float(m_screenWidth); spc.srcSize[1] = float(m_screenHeight);
-                if (m_flatDrawn) { spc.srcSize[0] = float(m_m2Renderer.FlatWidth()); spc.srcSize[1] = float(m_m2Renderer.FlatHeight()); }
+                if (m_flatDrawn) { spc.srcSize[0] = float(m_flatW); spc.srcSize[1] = float(m_flatH); }
                 spc.aimVisible = aim.show_crosshair ? 1 : 0;
                 spc.calibrating = aim.calibrating ? 1 : 0;
                 // "edge" / "catmull" -> Catmull-Rom (the GLES edge pass adds FXAA on top: not ported yet)
@@ -1613,17 +1636,22 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     void PrepareSystem22(VkCommandBuffer cmd, VulkanSwapchainImageData* swapchainData) {
         namespace s22 = arcadexr::hardware::namco_system22;
         m_s22Active = false;
+        m_s22Prepared = false;
         const bool isS22 = arcadexr::profiles::IsSystem22() && s22::HaveSceneSource();
         const bool want = isS22 && arcadexr::profiles::GetString("render", "cpu") == "gpu" &&
                           arcadexr::profiles::GetString("presentation", "screen") == "immersive" &&
                           arcadexr::config::GetInt("s22.vk", 1) != 0;
-        const int mode = want ? (arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
+        // SCREEN presentation drawn by the GPU too (s22.vkFlat=0 returns to MAME's CPU framebuffer).
+        const bool wantFlat = isS22 && !want && arcadexr::profiles::GetString("presentation", "screen") != "immersive" &&
+                              arcadexr::config::GetInt("s22.vkFlat", 1) != 0;
+        m_s22FlatWanted = wantFlat;
+        const int mode = (want || wantFlat) ? (arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
         if (isS22 && mode != m_s22SceneMode) {
             m_s22SceneMode = mode;
             s22::EnableScene(mode);
             Log::Write(Log::Level::Info, Fmt("TCVR_S22VK scene recording mode %d", mode));
         }
-        if (!want) return;
+        if (!want && !wantFlat) return;
         if (!m_s22.Ready()) {
             const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("immersive.msaa", 4)));
             m_s22.Init(m_vkDevice, &m_memAllocator, VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt), msaa);
@@ -1632,15 +1660,21 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         const std::string game = arcadexr::profiles::CurrentGame();
         if (game != m_s22Game) { m_s22.ResetAssets(); m_s22Game = game; }
-        const tcvr_scene_frame* f = s22::AcquireScene();
-        if (f) m_s22Frame = f;
+        // Bench: s22.freeze=1 keeps redrawing the same scene (valid until the next acquire).
+        if (!m_s22Frame || arcadexr::config::GetInt("s22.freeze", 0) == 0) {
+            const tcvr_scene_frame* f = s22::AcquireScene();
+            if (f) m_s22Frame = f;
+        }
         if (!m_s22Frame || m_s22Frame->width <= 0 || m_s22Frame->height <= 0) return;
         if (!m_s22.AssetsReady()) {
             tcvr_scene_assets assets{};
             if (!s22::SceneAssets(assets) || !m_s22.UploadAssets(cmd, assets)) return;
         }
+        m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
-        m_s22.RenderDepthMap(cmd);
+        m_s22Prepared = true;
+        if (!want) return;   // flat: drawn after the Model 2 flat block (RenderSystem22Flat)
+        if ((arcadexr::config::GetInt("s22.skip", 0) & 8) == 0) m_s22.RenderDepthMap(cmd);
         m_s22Active = true;
     }
 
@@ -1677,6 +1711,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
         arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
         st.depthTest = arcadexr::profiles::GetInt("immersive.depthTest", 1) != 0;
+        st.lean = arcadexr::config::GetInt("s22.lean", 1);
+        st.skip = arcadexr::config::GetInt("s22.skip", 0);
         st.depthBias = arcadexr::profiles::GetFloat("immersive.depthBias", 4e-8f);
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");
@@ -1920,6 +1956,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkDescriptorSet m_flatDescriptorSet{VK_NULL_HANDLE};
     VkSampler m_flatSampler{VK_NULL_HANDLE};
     VkImageView m_flatBoundView{VK_NULL_HANDLE};
+    uint32_t m_flatW{0}, m_flatH{0};
+    bool m_s22FlatWanted{false}, m_s22Prepared{false};
     arcadexr::vulkan::VulkanOverlay m_overlay;
     bool m_overlayInit{false};
     XrPosef m_menuFramePose{};

@@ -22,21 +22,28 @@ void main() {
     int Immersive = Flags.x;
     vec4 t0 = P(vPrim, 0);
     vec4 t1 = P(vPrim, 1);
+#ifndef POLY3D
     vec2 sp = (Immersive != 0) ? vScreen : gl_FragCoord.xy / ScreenOut.zw;
     if ((Immersive == 0 || t0.x > 0.5 || t0.y > 0.5) &&
         (sp.x < t1.x || sp.x >= t1.z + 1.0 || sp.y < t1.y || sp.y >= t1.w + 1.0)) discard;
+#endif
     vec4 t2 = P(vPrim, 2), t3 = P(vPrim, 3), t4 = P(vPrim, 4), t5 = P(vPrim, 5);
     vec4 t6 = P(vPrim, 6), t7 = P(vPrim, 7), t8 = P(vPrim, 8), t9 = P(vPrim, 9);
     uint pensOff = uint(t2.x + 0.5);
     uvec3 c; uint pen; float srcWeight = 1.0;
     uvec3 fogc = uvec3(t5.xyz + 0.5);
     int fogMode = int(t3.w + 0.5);
+#ifndef POLY3D
     if (t0.x < 0.5) {
+#else
+    {
+#endif
         pen = 0u;
         int bn = int(t2.y + 0.5);
         uint pshift = uint(t2.w + 0.5), pmask = uint(t2.z + 0.5);
         if (t3.x > 0.5) {
             pen = texPen(vTex.xy, bn);
+#ifndef NO_TEXAA
             int ts = Flags.z;
             if (ts > 1) {
                 vec2 fx = dFdx(vTex.xy), fy = dFdy(vTex.xy);
@@ -48,7 +55,9 @@ void main() {
                     acc += vec3(penRGB(pensOff + ((texPen(vTex.xy + fx * o.x + fy * o.y, bn) >> pshift) & pmask)));
                 }
                 c = uvec3(acc / float(n * n) + 0.5);
-            } else {
+            } else
+#endif
+            {
                 c = penRGB(pensOff + ((pen >> pshift) & pmask));
             }
         } else {
@@ -71,7 +80,9 @@ void main() {
         if (t5.w > 0.5) { int f = int(t6.w + 0.5); if (f != 0) c = blend(c, uvec3(t6.xyz + 0.5), uint(255 - f)); }
         int a = int(t8.y + 0.5);
         if (a != 0 && (t8.x > 0.5 || pen == uint(t4.w + 0.5))) srcWeight = float(255 - a) / 256.0;
-    } else {
+    }
+#ifndef POLY3D
+    else {
         int code = int(t8.z + 0.5);
         int tx = clamp(int(vTex.x - t8.w), 0, Sprite.x - 1);
         int ty = clamp(int(vTex.y - t9.x), 0, Sprite.y - 1);
@@ -84,6 +95,7 @@ void main() {
         int a = int(t8.y + 0.5);
         if (a != 0xff && (t8.x > 0.5 || pen == uint(t4.w + 0.5))) srcWeight = float(a) / 256.0;
     }
+#endif
     oColor = vec4(vec3(c) / 255.0, srcWeight);
     oPri = vec4(t3.z / 255.0, 0.0, 0.0, 1.0);
 }

@@ -28,6 +28,8 @@
 #include "s22_init_frag_spv.h"
 #include "s22_scene_vert_spv.h"
 #include "s22_scene_frag_spv.h"
+#include "s22_scene_frag_p3_spv.h"
+#include "s22_scene_frag_p3n_spv.h"
 #include "s22_depth_frag_spv.h"
 #include "s22_comp_frag_spv.h"
 
@@ -55,6 +57,8 @@ public:
 
     struct Settings {
         bool depthTest = true;
+        int lean = 1;
+        int skip = 0;   // bench: 1 init, 2 polygons, 4 composite
         float depthBias = 4e-8f;
         int voidMode = 0;              // 0 game bg, 1 fog colour (slate if black), 2 fixed
         unsigned voidRGB[3] = {28, 30, 38};
@@ -86,11 +90,12 @@ public:
         ResetAssets();
         for (auto& f : m_compFbs) { vkDestroyFramebuffer(m_dev, f.fb, nullptr); vkDestroyImageView(m_dev, f.view, nullptr); }
         m_compFbs.clear();
-        for (int e = 0; e < 2; ++e) DestroyEyeTarget(m_eye[e]);
+        for (int e = 0; e < 3; ++e) DestroyEyeTarget(m_eye[e]);
+        DestroyFlatOut();
         DestroyDepthMap();
         for (int s = 0; s < kFrames; ++s) DestroySlot(s);
         auto dp = [&](VkPipeline& p) { if (p) vkDestroyPipeline(m_dev, p, nullptr); p = VK_NULL_HANDLE; };
-        dp(m_pInit); dp(m_pScene3D); dp(m_pSceneHud); dp(m_pDepth); dp(m_pComp);
+        dp(m_pInit); dp(m_pScene3D); dp(m_pP3); dp(m_pP3NoAa); dp(m_pSceneHud); dp(m_pDepth); dp(m_pComp);
         auto drp = [&](VkRenderPass& r) { if (r) vkDestroyRenderPass(m_dev, r, nullptr); r = VK_NULL_HANDLE; };
         drp(m_rpDepth); drp(m_rpScene); drp(m_rpComp);
         if (m_layout) vkDestroyPipelineLayout(m_dev, m_layout, nullptr);
@@ -154,7 +159,8 @@ public:
         if (!m_ready || !m_assetsReady) return false;
         m_slot = slot & 1;
         Slot& S = m_slots[m_slot];
-        m_vertexData.clear(); m_indexData.clear(); m_primData.clear(); m_runs.clear();
+        const auto tBuild = std::chrono::steady_clock::now();
+        m_vertexData.clear(); m_indexData.clear(); m_primData.clear(); m_runs.clear(); m_ranges.clear();
         std::uint32_t lastPolyIndex = 0; (void)lastPolyIndex;
         bool anyPoly = false;
         m_fogBgValid = false;
@@ -194,9 +200,11 @@ public:
                 if (!m_runs.empty()) m_runs.back().count = uint32_t(m_indexData.size()) - m_runs.back().first;
                 m_runs.push_back({uint32_t(m_indexData.size()), 0, hud});
             }
+            const uint32_t idx0 = uint32_t(m_indexData.size());
             for (uint32_t i = 1; i + 1 < pr.vertex_count; ++i) {
                 m_indexData.push_back(base); m_indexData.push_back(base + i); m_indexData.push_back(base + i + 1);
             }
+            m_ranges.push_back({idx0, uint32_t(m_indexData.size()) - idx0, pr.alpha == 0});
             const float row[64] = {
                 float(pr.kind), float(pr.direct), float(pr.cx), float(pr.cy),
                 float(pr.clip_l), float(pr.clip_t), float(pr.clip_r), float(pr.clip_b),
@@ -213,8 +221,10 @@ public:
             m_primData.insert(m_primData.end(), row, row + 64);
         }
         if (!m_runs.empty()) m_runs.back().count = uint32_t(m_indexData.size()) - m_runs.back().first;
+        if (m_reorder) ReorderOpaqueFrontToBack();
         m_lastPrims = uint32_t(m_primData.size() / 64);
         m_lastIndices = uint32_t(m_indexData.size());
+        const auto tCopy = std::chrono::steady_clock::now();
         // Copies into this slot (bounded by the buffer capacities).
         auto put = [](void* dst, size_t cap, const void* src, size_t n) { if (src && n) std::memcpy(dst, src, std::min(cap, n)); };
         put(S.vboMap, kVboBytes, m_vertexData.data(), m_vertexData.size() * sizeof(float));
@@ -238,6 +248,17 @@ public:
             uint8_t* d = static_cast<uint8_t*>(S.priMap);
             if (f.pri) for (size_t y = 0; y < th; ++y) std::memcpy(d + y * tw, f.pri + y * f.pri_stride, tw);
             else std::memset(d, 0, tw * th);
+        }
+        {
+            const auto tEnd = std::chrono::steady_clock::now();
+            static double accB = 0, accC = 0; static int n = 0; static auto last = tEnd;
+            accB += std::chrono::duration<double, std::milli>(tCopy - tBuild).count();
+            accC += std::chrono::duration<double, std::milli>(tEnd - tCopy).count(); ++n;
+            if (tEnd - last > std::chrono::seconds(2)) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22PREP ms/frame build=%.2f copy=%.2f prims=%u verts=%zu", accB / n, accC / n,
+                                                 f.prim_count, m_vertexData.size() / 8));
+                accB = accC = 0; n = 0; last = tEnd;
+            }
         }
         m_frame = f;   // scalars for the uniforms (pointers not used later)
         m_havePrepared = true;
@@ -310,12 +331,14 @@ public:
         SetVp(cmd, rw, rh);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[eye], 0, nullptr);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pInit);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        if (m_lastIndices > 0) {
+        if ((st.skip & 1) == 0) vkCmdDraw(cmd, 3, 1, 0, 0);
+        if (m_lastIndices > 0 && (st.skip & 2) == 0) {
             BindGeometry(cmd, S);
             for (const Run& r : m_runs) {
                 if (!r.count) continue;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (r.hud || !st.depthTest) ? m_pSceneHud : m_pScene3D);
+                VkPipeline pl = (r.hud || !st.depthTest) ? m_pSceneHud
+                               : (st.lean == 0 ? m_pScene3D : (st.texSamples > 1 ? m_pP3 : m_pP3NoAa));
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
                 vkCmdDrawIndexed(cmd, r.count, 1, r.first, 0, 0);
             }
         }
@@ -349,10 +372,67 @@ public:
         vkCmdSetScissor(cmd, 0, 1, &area);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pComp);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[3 + eye], 0, nullptr);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+        if ((st.skip & 4) == 0) vkCmdDraw(cmd, 3, 1, 0, 0);
         vkCmdEndRenderPass(cmd);
         return true;
     }
+
+    // SCREEN presentation: the board's own projection, painter order exactly like the hardware (no depth
+    // test), drawn at `scale` x the board size, text + gamma composited into a sampled image that the
+    // virtual screen shows. MAME no longer rasterises (scene mode 2): that is what keeps it at 60 Hz.
+    bool RenderFlat(VkCommandBuffer cmd, float scale, const Settings& st) {
+        if (!m_havePrepared || !m_assetsReady || m_frame.width <= 0 || m_frame.height <= 0) return false;
+        Slot& S = m_slots[m_slot];
+        const uint32_t w = uint32_t(float(m_frame.width) * scale), h = uint32_t(float(m_frame.height) * scale);
+        EyeTarget& T = m_eye[2];
+        if (T.w != w || T.h != h) {
+            vkDeviceWaitIdle(m_dev); DestroyEyeTarget(T); CreateEyeTarget(T, w, h); DestroyFlatOut(); CreateFlatOut(w, h);
+            m_setsDirty = true;
+        }
+        UpdateSetsIfDirty();
+        m_settings = st;
+        Ubo u{};
+        FillCommonUbo(u, nullptr, nullptr, float(w), float(h));
+        std::memcpy(S.uboMap[5], &u, sizeof(u));
+        VkClearValue cv[5]{};
+        cv[2].depthStencil = {1.0f, 0};
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = m_rpScene; bi.framebuffer = T.fb; bi.renderArea = {{0, 0}, {w, h}};
+        bi.clearValueCount = IsMsaa() ? 5 : 3; bi.pClearValues = cv;
+        vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        SetVp(cmd, w, h);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[5], 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pInit);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        if (m_lastIndices > 0) {
+            BindGeometry(cmd, S);
+            // 3D runs with the depth test: the recorded order is NOT the painter order (and the opaque
+            // polygons are re-sorted front to back anyway); the board projection gives a monotonic depth.
+            for (const Run& r : m_runs) {
+                if (!r.count) continue;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.hud ? m_pSceneHud : m_pScene3D);
+                vkCmdDrawIndexed(cmd, r.count, 1, r.first, 0, 0);
+            }
+        }
+        vkCmdEndRenderPass(cmd);
+        Ubo uc = u;
+        std::memcpy(S.uboMap[6], &uc, sizeof(uc));
+        VkRenderPassBeginInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        ci.renderPass = m_rpComp; ci.framebuffer = m_flatOutFb; ci.renderArea = {{0, 0}, {w, h}};
+        vkCmdBeginRenderPass(cmd, &ci, VK_SUBPASS_CONTENTS_INLINE);
+        SetVp(cmd, w, h);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pComp);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[6], 0, nullptr);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+        Barrier(cmd, m_flatOut.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        return true;
+    }
+    VkImageView FlatView() const { return m_flatOut.view; }
+    uint32_t FlatWidth() const { return m_eye[2].w; }
+    uint32_t FlatHeight() const { return m_eye[2].h; }
 
     // Immersive aim (port of SceneRenderer::RayCast): march the ray in board camera space until it meets
     // the depth map. False when it leaves the screen or meets nothing.
@@ -389,12 +469,40 @@ private:
 
     struct Img { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
     struct Run { uint32_t first, count; bool hud; };
+    struct Range { uint32_t first, count; bool opaque; };
+    std::vector<Range> m_ranges;
+    std::vector<uint32_t> m_reorderTmp;
+    bool m_reorder = true;
+public:
+    void SetReorder(bool on) { m_reorder = on; }
+private:
+    // The board paints back to front. Depth already encodes that order (per-primitive bias in the vertex
+    // stage), so the opaque result is order independent: draw the opaque polygons of each 3D run front to
+    // back (early-Z rejects what is hidden, instead of shading every layer), then its translucent ones in
+    // the original order on top. HUD runs, and the order between runs, are untouched.
+    void ReorderOpaqueFrontToBack() {
+        size_t ri = 0;
+        for (const Run& run : m_runs) {
+            const uint32_t end = run.first + run.count;
+            const size_t r0 = ri;
+            while (ri < m_ranges.size() && m_ranges[ri].first < end) ++ri;
+            if (run.hud || run.count == 0) continue;
+            m_reorderTmp.clear();
+            for (size_t k = ri; k-- > r0;)
+                if (m_ranges[k].opaque) m_reorderTmp.insert(m_reorderTmp.end(), m_indexData.begin() + m_ranges[k].first,
+                                                             m_indexData.begin() + m_ranges[k].first + m_ranges[k].count);
+            for (size_t k = r0; k < ri; ++k)
+                if (!m_ranges[k].opaque) m_reorderTmp.insert(m_reorderTmp.end(), m_indexData.begin() + m_ranges[k].first,
+                                                             m_indexData.begin() + m_ranges[k].first + m_ranges[k].count);
+            if (m_reorderTmp.size() == run.count) std::copy(m_reorderTmp.begin(), m_reorderTmp.end(), m_indexData.begin() + run.first);
+        }
+    }
     struct GroupAcc { float x = 0, y = 0, n = 0; };
     struct Slot {
-        BufferAndMemory vbo, ibo, prim, pens, cz, spot, gamma, text, pri, ubo[5], depthRead;
+        BufferAndMemory vbo, ibo, prim, pens, cz, spot, gamma, text, pri, ubo[7], depthRead;
         void *vboMap = nullptr, *iboMap = nullptr, *primMap = nullptr, *pensMap = nullptr, *czMap = nullptr, *spotMap = nullptr,
-             *gammaMap = nullptr, *textMap = nullptr, *priMap = nullptr, *uboMap[5] = {}, *depthReadMap = nullptr;
-        VkDescriptorSet set[5] = {};   // eye0, eye1, depth map, composite eye0, composite eye1
+             *gammaMap = nullptr, *textMap = nullptr, *priMap = nullptr, *uboMap[7] = {}, *depthReadMap = nullptr;
+        VkDescriptorSet set[7] = {};   // eye0, eye1, depth map, composite eye0, composite eye1, flat scene, flat composite
         bool depthReadValid = false;
     };
     struct EyeTarget {
@@ -476,10 +584,10 @@ private:
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1; pli.pSetLayouts = &m_setLayout;
         XRC_CHECK_THROW_VKCMD(vkCreatePipelineLayout(m_dev, &pli, nullptr, &m_layout));
-        VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 96},
-                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 96}};
+        VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
+                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 128}};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.maxSets = 12; pi.poolSizeCount = 3; pi.pPoolSizes = ps;
+        pi.maxSets = 16; pi.poolSizeCount = 3; pi.pPoolSizes = ps;
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_dev, &pi, nullptr, &m_pool));
     }
 
@@ -621,6 +729,13 @@ private:
         make(qv, ifr, &viNone, &msN, &dsOff, &cbInit, m_rpScene, &m_pInit);
         make(sv, sf, &viScene, &msN, &dsTest, &cbScene, m_rpScene, &m_pScene3D);
         make(sv, sf, &viScene, &msN, &dsOff, &cbScene, m_rpScene, &m_pSceneHud);
+        // Lean variants for the 3D polygon runs (no discard, no sprite path): the uber-shader keeps the
+        // Adreno from overlapping texture latency (same lesson as the Model 2 GOLD).
+        VkShaderModule p3 = Mod(c_s22SceneFragP3Spv, sizeof(c_s22SceneFragP3Spv));
+        VkShaderModule p3n = Mod(c_s22SceneFragP3NoAaSpv, sizeof(c_s22SceneFragP3NoAaSpv));
+        make(sv, p3, &viScene, &msN, &dsTest, &cbScene, m_rpScene, &m_pP3);
+        make(sv, p3n, &viScene, &msN, &dsTest, &cbScene, m_rpScene, &m_pP3NoAa);
+        vkDestroyShaderModule(m_dev, p3, nullptr); vkDestroyShaderModule(m_dev, p3n, nullptr);
         make(sv, df, &viScene, &ms1, &dsLess, &cbOne, m_rpDepth, &m_pDepth);
         make(qv, cf, &viNone, &ms1, &dsOff, &cbOne, m_rpComp, &m_pComp);
         for (VkShaderModule m : {qv, ifr, sv, sf, df, cf}) vkDestroyShaderModule(m_dev, m, nullptr);
@@ -708,11 +823,11 @@ private:
         mk(S.gamma, &S.gammaMap, kGammaBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         mk(S.text, &S.textMap, kTextBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         mk(S.pri, &S.priMap, kPriBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        for (int i = 0; i < 5; ++i) mk(S.ubo[i], &S.uboMap[i], sizeof(Ubo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        for (int i = 0; i < 7; ++i) mk(S.ubo[i], &S.uboMap[i], sizeof(Ubo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         mk(S.depthRead, &S.depthReadMap, 1024 * 1024 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        VkDescriptorSetLayout ls[5] = {m_setLayout, m_setLayout, m_setLayout, m_setLayout, m_setLayout};
+        VkDescriptorSetLayout ls[7] = {m_setLayout, m_setLayout, m_setLayout, m_setLayout, m_setLayout, m_setLayout, m_setLayout};
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = m_pool; ai.descriptorSetCount = 5; ai.pSetLayouts = ls;
+        ai.descriptorPool = m_pool; ai.descriptorSetCount = 7; ai.pSetLayouts = ls;
         XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_dev, &ai, S.set));
         m_setsDirty = true;
     }
@@ -766,6 +881,18 @@ private:
         XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_dev, &fi, nullptr, &T.fb));
         Log::Write(Log::Level::Info, Fmt("TCVR_S22VK eye target %ux%u MSAA x%d", w, h, int(m_samples)));
     }
+    void CreateFlatOut(uint32_t w, uint32_t h) {
+        m_flatOut = NewImage(m_eyeFormat, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = m_rpComp; fi.attachmentCount = 1; fi.pAttachments = &m_flatOut.view;
+        fi.width = w; fi.height = h; fi.layers = 1;
+        XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_dev, &fi, nullptr, &m_flatOutFb));
+    }
+    void DestroyFlatOut() {
+        if (m_flatOutFb) vkDestroyFramebuffer(m_dev, m_flatOutFb, nullptr);
+        m_flatOutFb = VK_NULL_HANDLE;
+        DestroyImage(m_flatOut);
+    }
     void DestroyEyeTarget(EyeTarget& T) {
         if (T.fb) vkDestroyFramebuffer(m_dev, T.fb, nullptr);
         DestroyImage(T.msColor); DestroyImage(T.msPri); DestroyImage(T.depth); DestroyImage(T.color); DestroyImage(T.pri);
@@ -777,7 +904,7 @@ private:
         vkDeviceWaitIdle(m_dev);   // rare: new assets or new targets
         for (int s = 0; s < kFrames; ++s) {
             Slot& S = m_slots[s];
-            for (int k = 0; k < 5; ++k) {
+            for (int k = 0; k < 7; ++k) {
                 std::vector<VkWriteDescriptorSet> w;
                 VkDescriptorBufferInfo bufs[8] = {
                     {S.ubo[k].buf, 0, sizeof(Ubo)}, {S.prim.buf, 0, kPrimBytes}, {S.pens.buf, 0, kPensBytes}, {S.cz.buf, 0, kCzBytes},
@@ -789,7 +916,7 @@ private:
                     x.pBufferInfo = &bufs[b];
                     w.push_back(x);
                 }
-                const int eye = (k == 3) ? 0 : (k == 4 ? 1 : 0);
+                const int eye = (k == 4) ? 1 : (k == 6 ? 2 : 0);   // composite sets read their eye's scene
                 VkImageView dm = m_dmView ? m_dmView : m_dummyF.view;
                 VkImageView sc = m_eye[eye].color.view ? m_eye[eye].color.view : m_dummyF.view;
                 VkImageView spv = m_eye[eye].pri.view ? m_eye[eye].pri.view : m_dummyF.view;
@@ -823,14 +950,15 @@ private:
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkDescriptorPool m_pool = VK_NULL_HANDLE;
     VkRenderPass m_rpDepth = VK_NULL_HANDLE, m_rpScene = VK_NULL_HANDLE, m_rpComp = VK_NULL_HANDLE;
-    VkPipeline m_pInit = VK_NULL_HANDLE, m_pScene3D = VK_NULL_HANDLE, m_pSceneHud = VK_NULL_HANDLE, m_pDepth = VK_NULL_HANDLE, m_pComp = VK_NULL_HANDLE;
+    VkPipeline m_pInit = VK_NULL_HANDLE, m_pScene3D = VK_NULL_HANDLE, m_pP3 = VK_NULL_HANDLE, m_pP3NoAa = VK_NULL_HANDLE, m_pSceneHud = VK_NULL_HANDLE, m_pDepth = VK_NULL_HANDLE, m_pComp = VK_NULL_HANDLE;
     VkSampler m_nearest = VK_NULL_HANDLE, m_linear = VK_NULL_HANDLE;
     Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dmDepth;
     std::vector<BufferAndMemory> m_stagings;
     int m_spriteW = 1, m_spriteH = 1, m_spritesPerRow = 1;
     Slot m_slots[kFrames];
     int m_slot = 0;
-    EyeTarget m_eye[2];
+    EyeTarget m_eye[3];   // left eye, right eye, flat (board projection)
+    Img m_flatOut; VkFramebuffer m_flatOutFb = VK_NULL_HANDLE;
     std::vector<CompFb> m_compFbs;
     VkImage m_dmImage = VK_NULL_HANDLE;
     VkDeviceMemory m_dmMem = VK_NULL_HANDLE;
