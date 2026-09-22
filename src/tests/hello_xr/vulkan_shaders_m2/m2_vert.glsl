@@ -57,9 +57,26 @@ layout(location = 0) out vec3 vParam;
 layout(location = 1) flat out uint vPrim;
 layout(location = 2) flat out uint vSecondary;
 layout(location = 3) out vec2 vBoard;
+// The polygon's constant state, handed to the fragment stage once per VERTEX instead of
+// being reloaded from the storage buffer for every pixel (120 bytes per fragment before).
+layout(location = 4) flat out uvec4 vPA;   // texx, texy, texwidth | texheight << 16, flags
+layout(location = 5) flat out uvec4 vPB;   // utexx | utexy << 16, lumabase | luma << 16, colorbase, texlod
+layout(location = 6) flat out ivec4 vPC;   // clip l, t, r, b
+layout(location = 7) flat out uint vSlot;  // region texture slots: main | microtexture << 16 (0xffff = none)
 
 void main() {
     vPrim = aPrim;
+    {
+        Prim q = prims[aPrim];
+        uint flags = (q.texsheet & 1u) | ((q.texwrapx & 1u) << 1) | ((q.texwrapy & 1u) << 2) |
+                     ((q.texmirrorx & 1u) << 3) | ((q.texmirrory & 1u) << 4) | ((q.translucent != 0u ? 1u : 0u) << 5) |
+                     ((q.textured != 0u ? 1u : 0u) << 6) | ((q.checker != 0u ? 1u : 0u) << 7) | ((q.utex != 0u ? 1u : 0u) << 8) |
+                     ((q.utexminlod & 15u) << 9);
+        vPA = uvec4(q.texx, q.texy, (q.texwidth & 0xffffu) | (q.texheight << 16), flags);
+        vPB = uvec4((q.utexx & 0xffffu) | (q.utexy << 16), (q.lumabase & 0xffffu) | (q.luma << 16), q.colorbase, uint(q.texlod));
+        vPC = ivec4(q.clip_l, q.clip_t, q.clip_r, q.clip_b);
+        vSlot = q.first_vertex;   // the renderer stores the region slots in this otherwise unused field
+    }
     vSecondary = 0u;
     vBoard = aPos;
     if (uImmersive != 0) {

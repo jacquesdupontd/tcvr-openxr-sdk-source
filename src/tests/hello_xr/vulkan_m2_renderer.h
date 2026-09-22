@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include <vector>
+#include <unordered_map>
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include "game_profile.h"
 #include "virtual_screen.h"
 #include "m2_pipeline_types.h"
+#include "vulkan_m2_regions.h"
 
 #include "m2_vert_spv.h"
 #include "m2_frag_spv.h"
@@ -57,18 +59,27 @@ public:
     VulkanModel2Renderer() = default;
     ~VulkanModel2Renderer() { Cleanup(); }
 
-    bool Initialize(VkDevice device, const MemoryAllocator* allocator, VkRenderPass renderPass) {
+    // The immersive renderer owns its render pass: MSAA colour + depth that live only in the
+    // tile memory (transient, lazily allocated, never stored), resolved on-chip into the
+    // swapchain image. On the Adreno this is what makes 4x MSAA nearly free.
+    bool Initialize(VkDevice device, const MemoryAllocator* allocator, VkFormat colorFormat, uint32_t samples) {
         if (m_initialized) return true;
         m_vkDevice = device;
         m_memAllocator = allocator;
+        m_colorFormat = colorFormat;
+        m_samples = (samples >= 4) ? VK_SAMPLE_COUNT_4_BIT : (samples >= 2 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT);
+        CreateRenderPass();
+        VkRenderPass renderPass = m_pass;
 
         Log::Write(Log::Level::Info, "TCVR_M2VK: Initializing Model 2 native Vulkan immersive renderer");
 
         // 1. Create Descriptor Pool
-        std::array<VkDescriptorPoolSize, 3> poolSizes{{
+        std::array<VkDescriptorPoolSize, 5> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16}
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * M2RegionTextures::kMaxSlots},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 16}
         }};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.maxSets = 16;
@@ -98,7 +109,7 @@ public:
             m2Bindings.push_back(ssboBind);
         }
         // Bindings 8, 9: Sheet texture samplers
-        for (uint32_t b = 8; b <= 9; ++b) {
+        for (uint32_t b = 8; b <= 11; ++b) {
             VkDescriptorSetLayoutBinding texBind{};
             texBind.binding = b;
             texBind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -107,6 +118,18 @@ public:
             m2Bindings.push_back(texBind);
         }
 
+        // Binding 12: every texture region as its own image (texture2D[kMaxSlots]); 13: 4 samplers
+        // (repeat / mirrored per axis, hardware anisotropy). Indexed per polygon (nonuniformEXT).
+        {
+            VkDescriptorSetLayoutBinding rb{};
+            rb.binding = 12; rb.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            rb.descriptorCount = M2RegionTextures::kMaxSlots; rb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            m2Bindings.push_back(rb);
+            VkDescriptorSetLayoutBinding sb{};
+            sb.binding = 13; sb.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            sb.descriptorCount = 4; sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            m2Bindings.push_back(sb);
+        }
         VkDescriptorSetLayoutCreateInfo m2LayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         m2LayoutInfo.bindingCount = (uint32_t)m2Bindings.size();
         m2LayoutInfo.pBindings = m2Bindings.data();
@@ -191,6 +214,13 @@ public:
 
         // 7. Allocate Host-Visible Buffers and Texture Storage
         AllocateBuffers();
+        {
+            const float an = g_m2SamplerAnisotropy ? float(std::max(1, std::min(16, arcadexr::config::GetInt("m2.hwAniso", 4)))) : 1.0f;
+            m_regions.Init(m_vkDevice, m_memAllocator, an);
+            m_useRegions = g_m2DescriptorIndexing;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK region textures: %s, hw anisotropy x%.0f",
+                                             m_useRegions ? "ON (descriptor indexing)" : "OFF (no indexing)", an));
+        }
         AllocateTextures();
 
         m_initialized = true;
@@ -212,7 +242,11 @@ public:
 
         // Upload colour chain & textures
         UploadColourChain(frame);
-        UploadTextures(frame, cmd);
+        const bool texChanged = UploadTextures(frame, cmd);
+        if (texChanged && m_regions.Count() > 0) {
+            vkDeviceWaitIdle(m_vkDevice);   // rare: the sheets changed (course / menu load)
+            m_regions.Clear();
+        }
 
         // Fan-triangulate and sort primitives
         const tcvr_m2_prim* kp = frame.raw_prim_count ? frame.raw_prims : frame.prims;
@@ -283,6 +317,7 @@ public:
             std::sort(m_rawKeys.begin(), m_rawKeys.end());
 
             m_rawPrims.resize(n);
+            m_primSlot.assign(n, 0xffffffffu);
             std::size_t vcount = 0, icount = 0;
             for (std::uint32_t k = 0; k < n; k++) {
                 const tcvr_m2_prim& p = frame.raw_prims[0xffffu - (m_rawKeys[k] & 0xffffu)];
@@ -316,6 +351,15 @@ public:
                 q.vertex_count = vc;
                 q.zsort = intra_bucket_rank;
                 m_rawPrims[k] = q;
+                {
+                    uint32_t slot = M2RegionTextures::kNone, micro = M2RegionTextures::kNone;
+                    if (m_useRegions && q.textured != 0u) {
+                        slot = m_regions.Slot(m_sheetCpu, q.texsheet & 1u, (q.texx - 2048u) & 2047u, (q.texy - 1024u) & 1023u,
+                                              q.texwidth, q.texheight);
+                        if (q.utex != 0u) micro = m_regions.Slot(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
+                    }
+                    m_primSlot[k] = slot | (micro << 16);
+                }
 
                 for (std::uint32_t v = 0; v < vc; v++) {
                     const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
@@ -331,7 +375,7 @@ public:
                 // Untextured + translucent draws NOTHING on the board (draw_scanline_solid returns).
                 const bool invisible = q.textured == 0u && q.translucent != 0u;
                 // Discard-free: opaque, no stipple, main camera (secondary views need the clip test).
-                const bool fast = !isGlass && q.translucent == 0u && isMain;
+                const bool fast = !isGlass && isMain && (q.translucent == 0u || !RegionHasHoles(q));
                 if (invisible) {
                 } else if (!isGlass && !fast) {
                     for (std::uint32_t t = 1; t + 1 < vc; t++) {
@@ -376,6 +420,20 @@ public:
             if (!m_rawIdx.empty()) {
                 size_t idxBytes = std::min(m_rawIdx.size() * sizeof(uint32_t), m_iboSize);
                 memcpy(m_iboMapped, m_rawIdx.data(), idxBytes);
+            }
+            // first_vertex is not read by any shader: it now carries the region slots
+            // (main | microtexture << 16) to the vertex stage, which hands them on flat.
+            for (std::uint32_t k = 0; k < n; k++) m_rawPrims[k].first_vertex = m_primSlot[k];
+            {   // always: the descriptor array must be fully valid (dummy image) before any draw
+                m_regions.Flush(cmd);
+                const bool full = m_regions.NeedsFullDescriptorWrite();
+                if (full || m_regions.HasDirty())
+                    for (int e = 0; e < 2; ++e)
+                        for (int ps = 0; ps < 2; ++ps) m_regions.WriteDescriptors(m_m2DescSet[e][ps], 12, 13, full);
+                m_regions.DescriptorsDone();
+                static unsigned s_regLog = 0;
+                if ((s_regLog++ % 300u) == 0u)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M2VK regions=%u created=%u", m_regions.Count(), m_regions.Created()));
             }
             if (!m_rawPrims.empty()) {
                 size_t primBytes = std::min(m_rawPrims.size() * sizeof(tcvr_m2_prim), m_primsSize);
@@ -489,14 +547,14 @@ public:
             ubo.uHorizonRow = m_horizonGeo;
             ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
             ubo.uGround[0] = m_groundColor[0]; ubo.uGround[1] = m_groundColor[1]; ubo.uGround[2] = m_groundColor[2];
-            ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 4)));
+            ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1)));
             ubo.uFilterMode = std::max(0, std::min(5, arcadexr::config::GetInt("m2.filter", 5)));
             ubo.uMipBias = std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0)));
-            ubo.uAlphaCoverage = arcadexr::config::GetInt("m2.alphaCoverage", 0);
+            ubo.uAlphaCoverage = IsMsaa() ? arcadexr::config::GetInt("m2.alphaCoverage", 1) : 0;
             ubo.uContrast = arcadexr::config::GetFloat("contrast", 1.2f);
             ubo.uBright = arcadexr::config::GetFloat("bright", -0.02f);
-            ubo.uTestStage = 0;
-            ubo.uCountOverdraw = 0;
+            ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
+            ubo.uCountOverdraw = (m_useRegions && arcadexr::config::GetInt("m2.regions", 1) != 0) ? 1 : 0;  // = uUseRegions
         }
 
         const float outW = float(renderAreaExtent.width);
@@ -587,11 +645,175 @@ public:
 
     bool HaveMainView() const { return m_haveMainView; }
 
+    // Does this polygon's texture (level 0 region) contain the transparent index 15 at all?
+    // A "translucent" polygon whose texture has no hole can never discard a pixel, so it is
+    // drawn with the discard-free pipeline. Scanned once per region, texture RAM is static in a race.
+    bool RegionHasHoles(const tcvr_m2_prim& p) {
+        if (p.textured == 0u || m_sheetCpu[0].empty()) return true;
+        const uint32_t w = p.texwidth, h = p.texheight;
+        if (w == 0 || h == 0 || w > 2048 || h > 1024) return true;
+        const uint32_t ox = (p.texx - 2048u) & 2047u, oy = (p.texy - 1024u) & 1023u, sh = p.texsheet & 1u;
+        const uint64_t key = (uint64_t(sh) << 63) | (uint64_t(ox) << 40) | (uint64_t(oy) << 24) | (uint64_t(w) << 12) | uint64_t(h);
+        auto it = m_regionHasHoles.find(key);
+        if (it != m_regionHasHoles.end()) return it->second;
+        const std::vector<uint8_t>& cpu = m_sheetCpu[sh];
+        bool holes = false;
+        for (uint32_t y = 0; y < h && !holes; ++y)
+            for (uint32_t x = 0; x < w; ++x) {
+                int x2 = int(ox + x), y2 = int(oy + y);
+                if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
+                const size_t at = size_t(y2) * 1024 + size_t(x2);
+                if (at >= cpu.size() || cpu[at] == 15) { holes = true; break; }
+            }
+        m_regionHasHoles.emplace(key, holes);
+        return holes;
+    }
+    bool HasGeometry() const { return m_initialized && m_opaqueIndexCount > 0; }
+    bool IsMsaa() const { return m_samples != VK_SAMPLE_COUNT_1_BIT; }
+
+    // Begin the immersive render pass on swapchain image `target` (eye `eye`).
+    void BeginPass(VkCommandBuffer cmd, uint32_t eye, VkImage target, VkExtent2D ext, const VkRect2D& area, const float clear[4]) {
+        eye = eye < 2 ? eye : 0;
+        EyeTargets& et = m_eyeTargets[eye];
+        if (et.ext.width != ext.width || et.ext.height != ext.height) DestroyEyeTargets(et), CreateEyeTargets(et, ext);
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        for (auto& f : m_fbs) if (f.image == target && f.eye == eye) fb = f.fb;
+        if (fb == VK_NULL_HANDLE) {
+            FbEntry e{};
+            e.image = target; e.eye = eye;
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = target; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = m_colorFormat;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &vi, nullptr, &e.view));
+            std::array<VkImageView, 3> att{};
+            uint32_t n = 0;
+            if (IsMsaa()) { att[n++] = et.colorView; att[n++] = et.depthView; att[n++] = e.view; }
+            else { att[n++] = e.view; att[n++] = et.depthView; }
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = m_pass; fi.attachmentCount = n; fi.pAttachments = att.data();
+            fi.width = ext.width; fi.height = ext.height; fi.layers = 1;
+            XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_vkDevice, &fi, nullptr, &e.fb));
+            m_fbs.push_back(e);
+            fb = e.fb;
+        }
+        std::array<VkClearValue, 3> cv{};
+        for (int i = 0; i < 4; i++) cv[0].color.float32[i] = clear[i];
+        cv[0].color.float32[3] = 1.0f;
+        cv[1].depthStencil = {1.0f, 0};
+        cv[2] = cv[0];
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = m_pass; bi.framebuffer = fb; bi.renderArea = area;
+        bi.clearValueCount = IsMsaa() ? 3u : 2u; bi.pClearValues = cv.data();
+        vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    }
+
+    void CreateRenderPass() {
+        std::array<VkAttachmentDescription, 3> at{};
+        const bool ms = IsMsaa();
+        // 0: colour (MSAA transient, or the swapchain itself at 1x)
+        at[0].format = m_colorFormat; at[0].samples = m_samples;
+        at[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        at[0].storeOp = ms ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        at[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        // 1: depth, transient, never stored
+        at[1].format = kDepthFormat; at[1].samples = m_samples;
+        at[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        // 2: resolve target = the swapchain image (MSAA only)
+        at[2].format = m_colorFormat; at[2].samples = VK_SAMPLE_COUNT_1_BIT;
+        at[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        at[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[2].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference resolveRef{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sp{};
+        sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sp.colorAttachmentCount = 1; sp.pColorAttachments = &colorRef;
+        sp.pResolveAttachments = ms ? &resolveRef : nullptr;
+        sp.pDepthStencilAttachment = &depthRef;
+        VkSubpassDependency dep{};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ri.attachmentCount = ms ? 3u : 2u; ri.pAttachments = at.data();
+        ri.subpassCount = 1; ri.pSubpasses = &sp;
+        ri.dependencyCount = 1; ri.pDependencies = &dep;
+        XRC_CHECK_THROW_VKCMD(vkCreateRenderPass(m_vkDevice, &ri, nullptr, &m_pass));
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK render pass: MSAA x%d, transient colour/depth, on-tile resolve", int(m_samples)));
+    }
+
+    struct EyeTargets {
+        VkExtent2D ext{0, 0};
+        VkImage color = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
+        VkDeviceMemory colorMem = VK_NULL_HANDLE, depthMem = VK_NULL_HANDLE;
+        VkImageView colorView = VK_NULL_HANDLE, depthView = VK_NULL_HANDLE;
+    };
+    struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; };
+    static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+    void AllocTransient(VkImage img, VkDeviceMemory* mem) {
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(m_vkDevice, img, &req);
+        try {
+            m_memAllocator->Allocate(req, mem, VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT);
+        } catch (...) {
+            m_memAllocator->Allocate(req, mem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
+        XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_vkDevice, img, *mem, 0));
+    }
+
+    void CreateEyeTargets(EyeTargets& et, VkExtent2D ext) {
+        et.ext = ext;
+        auto mk = [&](VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkImage* img, VkDeviceMemory* mem, VkImageView* view) {
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {ext.width, ext.height, 1};
+            ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = m_samples; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = usage | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &ii, nullptr, img));
+            AllocTransient(*img, mem);
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = *img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt;
+            vi.subresourceRange = {aspect, 0, 1, 0, 1};
+            XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &vi, nullptr, view));
+        };
+        if (IsMsaa()) mk(m_colorFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &et.color, &et.colorMem, &et.colorView);
+        mk(kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, &et.depth, &et.depthMem, &et.depthView);
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK eye targets %ux%u MSAA x%d", ext.width, ext.height, int(m_samples)));
+    }
+
+    void DestroyEyeTargets(EyeTargets& et) {
+        if (et.ext.width == 0) return;
+        vkDeviceWaitIdle(m_vkDevice);
+        // framebuffers reference these views: drop them all, they are rebuilt lazily
+        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
+        m_fbs.clear();
+        if (et.colorView) vkDestroyImageView(m_vkDevice, et.colorView, nullptr);
+        if (et.depthView) vkDestroyImageView(m_vkDevice, et.depthView, nullptr);
+        if (et.color) vkDestroyImage(m_vkDevice, et.color, nullptr);
+        if (et.depth) vkDestroyImage(m_vkDevice, et.depth, nullptr);
+        if (et.colorMem) vkFreeMemory(m_vkDevice, et.colorMem, nullptr);
+        if (et.depthMem) vkFreeMemory(m_vkDevice, et.depthMem, nullptr);
+        et = EyeTargets{};
+    }
+
     void Cleanup() {
         if (!m_initialized) return;
         m_initialized = false;
 
         vkDeviceWaitIdle(m_vkDevice);
+        m_regions.Destroy();
+        DestroyEyeTargets(m_eyeTargets[0]);
+        DestroyEyeTargets(m_eyeTargets[1]);
+        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
+        m_fbs.clear();
+        if (m_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(m_vkDevice, m_pass, nullptr); m_pass = VK_NULL_HANDLE; }
 
         if (m_descriptorPool != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(m_vkDevice, m_descriptorPool, nullptr);
@@ -626,6 +848,11 @@ public:
         destroyMod(m_planeFragModule);
 
         if (m_sheetSampler != VK_NULL_HANDLE) { vkDestroySampler(m_vkDevice, m_sheetSampler, nullptr); m_sheetSampler = VK_NULL_HANDLE; }
+        for (int i = 2; i < 4; ++i) {
+            if (m_sheetView[i] != VK_NULL_HANDLE) { vkDestroyImageView(m_vkDevice, m_sheetView[i], nullptr); m_sheetView[i] = VK_NULL_HANDLE; }
+            if (m_sheetImage[i] != VK_NULL_HANDLE) { vkDestroyImage(m_vkDevice, m_sheetImage[i], nullptr); m_sheetImage[i] = VK_NULL_HANDLE; }
+            if (m_sheetMem[i] != VK_NULL_HANDLE) { vkFreeMemory(m_vkDevice, m_sheetMem[i], nullptr); m_sheetMem[i] = VK_NULL_HANDLE; }
+        }
         for (int i = 0; i < 2; ++i) {
             if (m_layerSampler[i] != VK_NULL_HANDLE) { vkDestroySampler(m_vkDevice, m_layerSampler[i], nullptr); m_layerSampler[i] = VK_NULL_HANDLE; }
             if (m_sheetView[i] != VK_NULL_HANDLE) { vkDestroyImageView(m_vkDevice, m_sheetView[i], nullptr); m_sheetView[i] = VK_NULL_HANDLE; }
@@ -645,7 +872,7 @@ public:
         m_lumaramBuffer.Reset(m_vkDevice);
         m_gammaBuffer.Reset(m_vkDevice);
         m_dummyBuffer.Reset(m_vkDevice);
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 4; ++i) {
             m_sheetStagingBuffer[i].Reset(m_vkDevice);
             m_sheetStagingMapped[i] = nullptr;
         }
@@ -687,7 +914,7 @@ private:
         rasterState.lineWidth = 1.0f;
 
         VkPipelineMultisampleStateCreateInfo msState{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        msState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        msState.rasterizationSamples = m_samples;
 
         // --- 1. Void Pipeline ---
         {
@@ -855,7 +1082,13 @@ private:
             pipeInfo.layout = m_m2PipelineLayout;
             pipeInfo.renderPass = renderPass;
 
+            // Cut-outs (trees, fences, decals with holes): alpha-to-coverage spreads the edge over
+            // the MSAA samples instead of a binary per-pixel discard that crawls frame to frame.
+            VkPipelineMultisampleStateCreateInfo msCut = msState;
+            msCut.alphaToCoverageEnable = (m_samples != VK_SAMPLE_COUNT_1_BIT) ? VK_TRUE : VK_FALSE;
+            pipeInfo.pMultisampleState = &msCut;
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineOpaque));
+            pipeInfo.pMultisampleState = &msState;
             // Same state, fragment shader compiled WITHOUT any discard: the Adreno keeps its
             // early depth rejection (LRZ) on for these, so hidden fragments are never shaded.
             stages[1].module = m_m2FragNdModule;
@@ -945,8 +1178,8 @@ private:
                            reinterpret_cast<void**>(&m_iboMapped));
 
         // 4. Staging Buffers
-        for (int i = 0; i < 2; ++i) {
-            createMappedBuffer(m_sheetStagingBuffer[i], 1024 * 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        for (int i = 0; i < 4; ++i) {
+            createMappedBuffer(m_sheetStagingBuffer[i], (i < 2 ? 1u : 2u) * 1024 * 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                reinterpret_cast<void**>(&m_sheetStagingMapped[i]));
         }
 
@@ -957,8 +1190,9 @@ private:
     }
 
     void AllocateTextures() {
-        // Sheet textures: 2 images, 1024x4096, R8_UINT
-        for (int s = 0; s < 2; ++s) {
+        // Sheet textures: 1024x4096, [0..1] R8 t*17, [2..3] RG8 premultiplied cut-out form
+        for (int s = 0; s < 4; ++s) {
+            const VkFormat sheetFmt = (s < 2) ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8_UNORM;
             VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             imgInfo.imageType = VK_IMAGE_TYPE_2D;
             imgInfo.extent.width = 1024;
@@ -966,7 +1200,7 @@ private:
             imgInfo.extent.depth = 1;
             imgInfo.mipLevels = 1;
             imgInfo.arrayLayers = 1;
-            imgInfo.format = VK_FORMAT_R8_UNORM;
+            imgInfo.format = sheetFmt;
             imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -982,7 +1216,7 @@ private:
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = m_sheetImage[s];
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = VK_FORMAT_R8_UNORM;
+            viewInfo.format = sheetFmt;
             viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             viewInfo.subresourceRange.baseMipLevel = 0;
             viewInfo.subresourceRange.levelCount = 1;
@@ -1155,6 +1389,13 @@ private:
                 s1Write.pImageInfo = &sheet1Info;
                 writes.push_back(s1Write);
 
+                VkDescriptorImageInfo cut0Info{m_sheetSampler, m_sheetView[2], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                VkDescriptorImageInfo cut1Info{m_sheetSampler, m_sheetView[3], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                VkWriteDescriptorSet c0Write = s1Write; c0Write.dstBinding = 10; c0Write.pImageInfo = &cut0Info;
+                VkWriteDescriptorSet c1Write = s1Write; c1Write.dstBinding = 11; c1Write.pImageInfo = &cut1Info;
+                writes.push_back(c0Write);
+                writes.push_back(c1Write);
+
                 vkUpdateDescriptorSets(m_vkDevice, (uint32_t)writes.size(), writes.data(), 0, nullptr);
             }
         }
@@ -1179,8 +1420,8 @@ private:
         }
     }
 
-    void UploadTextures(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
-        if (!frame.textureram[0] || !frame.textureram[1] || frame.textureram_words == 0) return;
+    bool UploadTextures(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
+        if (!frame.textureram[0] || !frame.textureram[1] || frame.textureram_words == 0) return false;
 
         // Model 2B (Sega Rally) does not update dirty_generation.
         // Fingerprint both sheets using FNV-1a hash (sampling every 4 words)
@@ -1201,7 +1442,7 @@ private:
         }
 
         const bool needsUpload = !m_texturesUploaded || hashChanged;
-        if (!needsUpload) return;
+        if (!needsUpload) return false;
 
         Log::Write(Log::Level::Info, Fmt("TCVR_M2VK: Uploading texture sheets (hashChanged=%d, words=%u)",
                                          hashChanged ? 1 : 0, frame.textureram_words));
@@ -1211,66 +1452,58 @@ private:
             const uint32_t wordCount = frame.textureram_words;
             if (!words || wordCount == 0) continue;
 
-            uint8_t* dst = reinterpret_cast<uint8_t*>(m_sheetStagingMapped[sheet]);
+            std::vector<uint8_t>& cpu = m_sheetCpu[sheet];
+            cpu.assign(size_t(1024) * 4096, 0);
             const uint32_t totalWords = std::min(wordCount, 524288u);
             for (uint32_t word_idx = 0; word_idx < totalWords; ++word_idx) {
                 const uint32_t w = words[word_idx];
-                const uint32_t off0 = word_idx * 2;
-                const uint32_t yh0 = off0 / 512;
-                const uint32_t xh0 = off0 % 512;
-                const uint32_t x0 = xh0 * 2;
-                const uint32_t y0 = yh0 * 2;
-                const uint32_t w0 = w & 0xffff;
-                dst[y0 * 1024 + x0] = ((w0 >> 12) & 0xf) * 17;
-                dst[y0 * 1024 + (x0 + 1)] = ((w0 >> 8) & 0xf) * 17;
-                dst[(y0 + 1) * 1024 + x0] = ((w0 >> 4) & 0xf) * 17;
-                dst[(y0 + 1) * 1024 + (x0 + 1)] = (w0 & 0xf) * 17;
-
-                const uint32_t off1 = off0 + 1;
-                const uint32_t yh1 = off1 / 512;
-                const uint32_t xh1 = off1 % 512;
-                const uint32_t x1 = xh1 * 2;
-                const uint32_t y1 = yh1 * 2;
-                const uint32_t w1 = (w >> 16) & 0xffff;
-                dst[y1 * 1024 + x1] = ((w1 >> 12) & 0xf) * 17;
-                dst[y1 * 1024 + (x1 + 1)] = ((w1 >> 8) & 0xf) * 17;
-                dst[(y1 + 1) * 1024 + x1] = ((w1 >> 4) & 0xf) * 17;
-                dst[(y1 + 1) * 1024 + (x1 + 1)] = (w1 & 0xf) * 17;
+                for (uint32_t half = 0; half < 2; ++half) {
+                    const uint32_t off = word_idx * 2 + half;
+                    const uint32_t x0 = (off % 512) * 2, y0 = (off / 512) * 2;
+                    const uint32_t hw = (w >> (16 * half)) & 0xffff;
+                    cpu[y0 * 1024 + x0] = (hw >> 12) & 0xf;
+                    cpu[y0 * 1024 + x0 + 1] = (hw >> 8) & 0xf;
+                    cpu[(y0 + 1) * 1024 + x0] = (hw >> 4) & 0xf;
+                    cpu[(y0 + 1) * 1024 + x0 + 1] = hw & 0xf;
+                }
             }
-
-            // Barrier: UNDEFINED or SHADER_READ_ONLY -> TRANSFER_DST
+            uint8_t* dst = reinterpret_cast<uint8_t*>(m_sheetStagingMapped[sheet]);
+            uint8_t* cut = reinterpret_cast<uint8_t*>(m_sheetStagingMapped[sheet + 2]);
+            for (size_t i = 0; i < cpu.size(); ++i) {
+                const uint8_t t = cpu[i];
+                dst[i] = uint8_t(t * 17);
+                cut[2 * i] = (t == 15) ? 0 : uint8_t(t * 17);
+                cut[2 * i + 1] = (t == 15) ? 0 : 255;
+            }
+            for (int img = sheet; img < 4; img += 2) {
             VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            barrier.srcAccessMask = (m_sheetLayout[sheet] == VK_IMAGE_LAYOUT_UNDEFINED) ? 0 : VK_ACCESS_SHADER_READ_BIT;
+            barrier.srcAccessMask = (m_sheetLayout[img] == VK_IMAGE_LAYOUT_UNDEFINED) ? 0 : VK_ACCESS_SHADER_READ_BIT;
             barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.oldLayout = m_sheetLayout[sheet];
+            barrier.oldLayout = m_sheetLayout[img];
             barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.image = m_sheetImage[sheet];
+            barrier.image = m_sheetImage[img];
             barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdPipelineBarrier(cmd,
-                                 (m_sheetLayout[sheet] == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 (m_sheetLayout[img] == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
             VkBufferImageCopy region{};
-            region.bufferOffset = 0;
             region.bufferRowLength = 1024;
             region.bufferImageHeight = 4096;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.imageOffset = {0, 0, 0};
             region.imageExtent = {1024, 4096, 1};
-            vkCmdCopyBufferToImage(cmd, m_sheetStagingBuffer[sheet].buf, m_sheetImage[sheet],
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
+            vkCmdCopyBufferToImage(cmd, m_sheetStagingBuffer[img].buf, m_sheetImage[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            m_sheetLayout[sheet] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            m_sheetLayout[img] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
         }
         m_texturesUploaded = true;
         m_sheetGeneration = frame.dirty_generation;
+        m_regionHasHoles.clear();
+        return true;
     }
 
     void UploadLayers(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
@@ -1342,6 +1575,11 @@ private:
     VkShaderModule m_m2FragModule = VK_NULL_HANDLE;
     VkShaderModule m_m2FragNdModule = VK_NULL_HANDLE;
     VkPipeline m_m2PipelineFast = VK_NULL_HANDLE;
+    VkFormat m_colorFormat = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;
+    VkRenderPass m_pass = VK_NULL_HANDLE;
+    EyeTargets m_eyeTargets[2];
+    std::vector<FbEntry> m_fbs;
     VkShaderModule m_quadFarVertModule = VK_NULL_HANDLE;
     VkPipeline m_voidPipelineFar = VK_NULL_HANDLE;
     VkPipeline m_planePipelineFar = VK_NULL_HANDLE;
@@ -1398,12 +1636,20 @@ private:
     VkDescriptorSet m_layerDescSet[2] = {};
 
     // Textures
-    VkImage m_sheetImage[2] = {};
-    VkDeviceMemory m_sheetMem[2] = {};
-    VkImageView m_sheetView[2] = {};
-    VkImageLayout m_sheetLayout[2] = {};
-    BufferAndMemory m_sheetStagingBuffer[2];
-    uint32_t* m_sheetStagingMapped[2] = {nullptr, nullptr};
+    // [0],[1]: sheets as R8 (t*17). [2],[3]: the same sheets as RG8 for cut-outs:
+    // R = t*17 premultiplied by opacity, G = opacity (texel != 15). Filtering those two in
+    // hardware and dividing gives MAME's "a transparent texel borrows its neighbour" for free.
+    VkImage m_sheetImage[4] = {};
+    VkDeviceMemory m_sheetMem[4] = {};
+    VkImageView m_sheetView[4] = {};
+    VkImageLayout m_sheetLayout[4] = {};
+    BufferAndMemory m_sheetStagingBuffer[4];
+    uint32_t* m_sheetStagingMapped[4] = {nullptr, nullptr, nullptr, nullptr};
+    std::vector<uint8_t> m_sheetCpu[2];
+    M2RegionTextures m_regions;
+    bool m_useRegions = false;
+    std::vector<uint32_t> m_primSlot;                       // unpacked t per texel, for the region scan
+    std::unordered_map<uint64_t, bool> m_regionHasHoles;      // region key -> contains texel 15
     uint64_t m_sheetGeneration = 0;
     uint64_t m_texHash = 0;
     bool m_texturesUploaded = false;

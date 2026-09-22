@@ -599,7 +599,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         appInfo.applicationVersion = 1;
         appInfo.pEngineName = "hello_xr";
         appInfo.engineVersion = 1;
-        appInfo.apiVersion = VK_API_VERSION_1_0;
+        appInfo.apiVersion = VK_API_VERSION_1_1;  // vkGetPhysicalDeviceFeatures2 (descriptor indexing probe)
 
         VkInstanceCreateInfo instInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instInfo.pNext = &debugInfo;
@@ -650,7 +650,39 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         std::vector<const char*> deviceExtensions;
 
         VkPhysicalDeviceFeatures features{};
-        // features.samplerAnisotropy = VK_TRUE;
+        // Model 2 renderer: every texture region becomes its own GPU image, all indexed from one
+        // descriptor array by a per-polygon (non-uniform) index -> VK_EXT_descriptor_indexing.
+        // Hardware anisotropy for those images -> samplerAnisotropy.
+        VkPhysicalDeviceDescriptorIndexingFeaturesEXT indexing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+        {
+            uint32_t n = 0;
+            vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &n, nullptr);
+            std::vector<VkExtensionProperties> exts(n);
+            vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &n, exts.data());
+            bool haveIndexing = false;
+            for (auto& e : exts) if (strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) haveIndexing = true;
+            VkPhysicalDeviceDescriptorIndexingFeaturesEXT q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &q;
+            // Android API 26 libvulkan does not export the 1.1 symbol: fetch it from the instance.
+            auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(m_vkInstance, "vkGetPhysicalDeviceFeatures2"));
+            if (!getFeatures2)
+                getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                    vkGetInstanceProcAddr(m_vkInstance, "vkGetPhysicalDeviceFeatures2KHR"));
+            if (getFeatures2) getFeatures2(m_vkPhysicalDevice, &f2);
+            else vkGetPhysicalDeviceFeatures(m_vkPhysicalDevice, &f2.features);
+            features.samplerAnisotropy = f2.features.samplerAnisotropy;
+            if (haveIndexing && q.shaderSampledImageArrayNonUniformIndexing) {
+                deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+                indexing.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+                arcadexr::vulkan::g_m2DescriptorIndexing = true;
+            }
+            arcadexr::vulkan::g_m2SamplerAnisotropy = f2.features.samplerAnisotropy == VK_TRUE;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK device: descriptor indexing ext=%d nonUniformSampled=%d samplerAnisotropy=%d",
+                                             int(haveIndexing), int(q.shaderSampledImageArrayNonUniformIndexing),
+                                             int(f2.features.samplerAnisotropy)));
+        }
 
 #if defined(USE_MIRROR_WINDOW)
         deviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -664,6 +696,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         deviceInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
         deviceInfo.pEnabledFeatures = &features;
+        if (arcadexr::vulkan::g_m2DescriptorIndexing) deviceInfo.pNext = &indexing;
 
         XrVulkanDeviceCreateInfoKHR deviceCreateInfo{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
         deviceCreateInfo.systemId = systemId;
@@ -1166,6 +1199,29 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         const XrRect2Di& r = layerView.subImage.imageRect;
         VkRect2D renderArea = {{r.offset.x, r.offset.y}, {uint32_t(r.extent.width), uint32_t(r.extent.height)}};
+
+        // Model 2 Native Immersive Rendering, in the renderer's OWN render pass (MSAA resolved
+        // on-tile into this swapchain image). Falls back to the plain pass below if it drew nothing.
+        const std::string presentation = arcadexr::profiles::GetString("presentation", "immersive");
+        const bool immersiveAllowed = (presentation == "immersive" && arcadexr::profiles::GetInt("m2.immersive", 1) != 0);
+        bool m2ImmersiveDrawn = false;
+        if (immersiveAllowed) {
+            if (!m_m2RendererInitialized) {
+                const VkFormat fmt = VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt);
+                const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("m2.msaa", 4)));
+                m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, fmt, uint32_t(msaa));
+                m_m2RendererInitialized = true;
+            }
+            if (m_m2Renderer.HasGeometry()) {
+                const float clear[4] = {m_clearColor[0], m_clearColor[1], m_clearColor[2], 1.0f};
+                const VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
+                m_m2Renderer.BeginPass(cmd, viewIndex, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, clear);
+                SetViewportAndScissor(cmd, renderArea);
+                m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, cmd, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
+                vkCmdEndRenderPass(cmd);
+            }
+        }
+        if (!m2ImmersiveDrawn) {
         SetViewportAndScissor(cmd, renderArea);
 
         // may be depth, stencil, or both
@@ -1207,18 +1263,6 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f_InvertRigidBody(&view, &toView);
         XrMatrix4x4f vp;
         XrMatrix4x4f_Multiply(&vp, &proj, &view);
-
-        // Model 2 Native Immersive Rendering
-        const std::string presentation = arcadexr::profiles::GetString("presentation", "immersive");
-        const bool immersiveAllowed = (presentation == "immersive" && arcadexr::profiles::GetInt("m2.immersive", 1) != 0);
-        bool m2ImmersiveDrawn = false;
-        if (immersiveAllowed) {
-            if (!m_m2RendererInitialized) {
-                m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, renderPassBeginInfo.renderPass);
-                m_m2RendererInitialized = true;
-            }
-            m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, cmd, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
-        }
 
         // Render Virtual Arcade Screen fallback
         if (!m2ImmersiveDrawn) {
@@ -1280,6 +1324,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
 
         vkCmdEndRenderPass(cmd);
+        }  // legacy pass (no immersive frame)
         if (m_gpuQueryPool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_gpuQueryPool, uint32_t(v * 2 + 1));
             m_gpuQueryWritten[v] = true;

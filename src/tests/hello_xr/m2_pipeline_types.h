@@ -6,6 +6,10 @@
 
 namespace arcadexr::vulkan {
 
+// Set at device creation (graphicsplugin_vulkan.cpp), read by the Model 2 renderer.
+inline bool g_m2DescriptorIndexing = false;
+inline bool g_m2SamplerAnisotropy = false;
+
 // Layout matching std140 UBO in m2_vert.glsl and m2_frag.glsl
 struct M2UniformBufferObject {
     float uMvp[16];          // 64 bytes, offset 0

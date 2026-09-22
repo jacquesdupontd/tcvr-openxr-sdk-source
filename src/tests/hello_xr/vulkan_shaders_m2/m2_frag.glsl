@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : require
 precision highp float;
 precision highp int;
 
@@ -6,6 +7,10 @@ layout(location = 0) in vec3 vParam;
 layout(location = 1) flat in uint vPrim;
 layout(location = 2) flat in uint vSecondary;
 layout(location = 3) in vec2 vBoard;
+layout(location = 4) flat in uvec4 vPA;
+layout(location = 5) flat in uvec4 vPB;
+layout(location = 6) flat in ivec4 vPC;
+layout(location = 7) flat in uint vSlot;
 layout(location = 0) out vec4 oColor;
 
 layout(set = 0, binding = 0, std140) uniform M2Uniforms {
@@ -69,6 +74,13 @@ layout(std430, set = 0, binding = 7) readonly buffer Tex1      { uint tex1[]; };
 // hardware bilinear filter, which is what the new path (uFilterMode 5) does.
 layout(set = 0, binding = 8) uniform sampler2D uSheetTex0;
 layout(set = 0, binding = 9) uniform sampler2D uSheetTex1;
+// Cut-out form of the same sheets, RG8: R = t*17 premultiplied by opacity, G = opacity.
+layout(set = 0, binding = 10) uniform sampler2D uCutTex0;
+layout(set = 0, binding = 11) uniform sampler2D uCutTex1;
+// Every texture region as its own mipmapped image (see vulkan_m2_regions.h): R = t*17,
+// G = t*17*opaque, B = opaque. Samplers: [mirrorx | mirrory << 1], repeat otherwise, hw aniso.
+layout(set = 0, binding = 12) uniform texture2D uRegion[512];
+layout(set = 0, binding = 13) uniform sampler uRegionSmp[4];
 
 uint u16at(uint arr_index_hi_lo, uint packed) {
     return (arr_index_hi_lo == 0u) ? (packed & 0xffffu) : (packed >> 16);
@@ -321,8 +333,9 @@ ivec2 sheet_at(int x2, int y2) {
     return ivec2(x2, y2);
 }
 
-// Filtered t (0..15) of one mip level at continuous LEVEL-0 texel coordinate tc.
-float level_t(Prim p, int L, vec2 tc) {
+// One mip level at continuous LEVEL-0 texel coordinate tc. Returns (t, 1) for an opaque
+// texture, or (t premultiplied by opacity, opacity) for a cut-out: the caller divides.
+vec2 level_s(Prim p, int L, vec2 tc, bool cut) {
     uint w = p.texwidth >> uint(L), h = p.texheight >> uint(L);
     int ox = int(((p.texx - 2048u) >> uint(L)) & 2047u);
     int oy = int(((p.texy - 1024u) >> uint(L)) & 1023u);
@@ -340,8 +353,12 @@ float level_t(Prim p, int L, vec2 tc) {
     ivec2 b1 = sheet_at(ox + u0 + 1, oy + v0 + 1);
     if (u0 + 1 < int(w) && v0 + 1 < int(h) && b1 == b0 + ivec2(1)) {
         vec2 uv = (vec2(b0) + 0.5 + f) / vec2(1024.0, 4096.0);
+        if (cut) {
+            vec2 rg = (sheet == 0u) ? textureLod(uCutTex0, uv, 0.0).rg : textureLod(uCutTex1, uv, 0.0).rg;
+            return vec2(rg.r * 15.0, rg.g);
+        }
         float r = (sheet == 0u) ? textureLod(uSheetTex0, uv, 0.0).r : textureLod(uSheetTex1, uv, 0.0).r;
-        return r * 15.0;
+        return vec2(r * 15.0, 1.0);
     }
     // Seam of a tiled / clamped region: the board's own 4 taps (wrap, or clamp when off).
     int u1 = (u0 + 1) % int(w), v1 = (v0 + 1) % int(h);
@@ -351,8 +368,12 @@ float level_t(Prim p, int L, vec2 tc) {
     float t01 = float(get_texel(uint(ox), uint(oy), u1, v0, sheet));
     float t10 = float(get_texel(uint(ox), uint(oy), u0, v1, sheet));
     float t11 = float(get_texel(uint(ox), uint(oy), u1, v1, sheet));
-    return mix(mix(t00, t01, f.x), mix(t10, t11, f.x), f.y);
+    if (!cut) return vec2(mix(mix(t00, t01, f.x), mix(t10, t11, f.x), f.y), 1.0);
+    vec4 a = vec4(t00 != 15.0, t01 != 15.0, t10 != 15.0, t11 != 15.0);
+    vec4 tv = vec4(t00, t01, t10, t11) * a;
+    return vec2(mix(mix(tv.x, tv.y, f.x), mix(tv.z, tv.w, f.x), f.y), mix(mix(a.x, a.y, f.x), mix(a.z, a.w, f.x), f.y));
 }
+float level_t(Prim p, int L, vec2 tc) { return level_s(p, L, tc, false).x; }
 
 // Microtexture (detail texture, 128x128 on the other sheet) at level-0 coordinate tc.
 float micro_t(Prim p, vec2 tc) {
@@ -368,13 +389,20 @@ float micro_t(Prim p, vec2 tc) {
     return mix(mix(t00, t01, f.x), mix(t10, t11, f.x), f.y);
 }
 
-// Trilinear t at coordinate tc for a fractional level lod (already clamped >= 0).
-float tri_t(Prim p, vec2 tc, float lod, int max_level) {
+// Trilinear sample at coordinate tc for a fractional level lod (already clamped >= 0).
+vec2 tri_s(Prim p, vec2 tc, float lod, int max_level, bool cut) {
     int L = min(int(lod), max_level);
-    float t = level_t(p, L, tc);
+    vec2 t = level_s(p, L, tc, cut);
     float fr = lod - float(L);
-    if (L < max_level && fr > 0.004) t = mix(t, level_t(p, L + 1, tc), fr);
+    if (L < max_level && fr > 0.004) t = mix(t, level_s(p, L + 1, tc, cut), fr);
     return t;
+}
+
+// Region path: one hardware trilinear(+anisotropic) sample of the region's own image.
+// grads are the level-0 texel-space derivatives; bias in mip levels.
+vec4 region_sample(uint slot, uint smp, vec2 tc, vec2 size, vec2 gx, vec2 gy, float bias) {
+    float k = exp2(bias);
+    return textureGrad(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, gx * k / size, gy * k / size);
 }
 
 // Colour chain, once: filtered t -> lumaram tone curve -> palette -> colorxlat -> gamma.
@@ -384,8 +412,25 @@ vec3 tone(Prim p, float t) {
     return shade(p, min(luma, 0x3fu), 0x7fffu);
 }
 
+// The polygon, rebuilt from the flat inputs: registers, not a 120-byte load per pixel.
+Prim flatPrim() {
+    Prim p;
+    p.first_vertex = 0u; p.vertex_count = 0u;
+    p.clip_l = vPC.x; p.clip_t = vPC.y; p.clip_r = vPC.z; p.clip_b = vPC.w;
+    uint fl = vPA.w;
+    p.textured = (fl >> 6) & 1u; p.translucent = (fl >> 5) & 1u; p.checker = (fl >> 7) & 1u;
+    p.colorbase = vPB.z; p.lumabase = vPB.y & 0xffffu; p.luma = vPB.y >> 16;
+    p.texlod = int(vPB.w);
+    p.texsheet = fl & 1u;
+    p.texwidth = vPA.z & 0xffffu; p.texheight = vPA.z >> 16; p.texx = vPA.x; p.texy = vPA.y;
+    p.texwrapx = (fl >> 1) & 1u; p.texwrapy = (fl >> 2) & 1u; p.texmirrorx = (fl >> 3) & 1u; p.texmirrory = (fl >> 4) & 1u;
+    p.utex = (fl >> 8) & 1u; p.utexminlod = (fl >> 9) & 15u; p.utexx = vPB.x & 0xffffu; p.utexy = vPB.x >> 16;
+    p.center_x = 0; p.center_y = 0; p.zsort = 0u;
+    return p;
+}
+
 void main() {
-    Prim p = prims[vPrim];
+    Prim p = flatPrim();
 #ifndef NO_DISCARD
     ivec2 pix = (uImmersive != 0) ? ivec2(floor(vBoard)) : ivec2(gl_FragCoord.xy) / uScale;
     if ((uImmersive == 0 || vSecondary != 0u) && (pix.x < p.clip_l || pix.x > p.clip_r || pix.y < p.clip_t || pix.y > p.clip_b)) discard;
@@ -412,36 +457,86 @@ void main() {
 #endif
         oColor = vec4(shade(p, p.luma >> 2, 0xffffu), outAlpha);
     } else {
+#ifdef NO_DISCARD
+        bool translucent = false;   // routed here only when its texture has no transparent texel
+#else
         bool translucent = (p.translucent != 0u);
+#endif
         uint texmin = min(p.texwidth, p.texheight);
         int max_level = (texmin == 0u) ? 0 : max(findMSB(texmin) - 1, 0);
         int u = int(tc.x * 256.0), v = int(tc.y * 256.0);
-        if (uFilterMode == 5 && mainView && !translucent) {
+        if (uFilterMode == 5 && mainView && uTestStage == 1) {
+            oColor = vec4(0.5, 0.5, 0.5, outAlpha);
+        } else if (uFilterMode == 5 && mainView && uCountOverdraw != 0 && (vSlot & 0xffffu) != 0xffffu) {
+            // Every texture its own GPU image: repeat, mips and anisotropy done by the texture unit.
+            uint smp = ((vPA.w >> 3) & 1u) | (((vPA.w >> 4) & 1u) << 1);
+            vec2 size = vec2(float(p.texwidth), float(p.texheight));
+            float bias = float(uMipBias) / 128.0;
+            vec4 c = region_sample(vSlot & 0xffffu, smp, tc, size, dx, dy, bias);
+            vec2 ts = translucent ? vec2(c.g * 15.0, c.b) : vec2(c.r * 15.0, 1.0);
+            uint ms = vSlot >> 16;
+            if (!translucent && p.utex != 0u && ms != 0xffffu) {
+                // Close up the board fades its 128x128 microtexture in, by how far below mip 0.
+                float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-12)) + bias;
+                if (lod < 0.0) {
+                    float sc = float(1 << (1 << int(p.utexminlod)));
+                    float mt = region_sample(ms, 0u, tc * sc, vec2(128.0), dx * sc, dy * sc, 0.0).r * 15.0;
+                    float w = min(-lod * 128.0 / float(1 << int(p.utexminlod)), 127.0) / 256.0;
+                    ts.x = mix(ts.x, mt, w);
+                }
+            }
+            float t = translucent ? ts.x / max(ts.y, 1e-4) : ts.x;
+            if (uTestStage == 2) oColor = vec4(vec3(t / 15.0), outAlpha);
+            else oColor = vec4(tone(p, t), outAlpha);
+#ifndef NO_DISCARD
+            if (translucent) {
+                float a = clamp((ts.y - 0.5) / max(fwidth(ts.y), 1.0 / 255.0) + 0.5, 0.0, 1.0);
+                if (a <= 0.0) discard;
+                if (uAlphaCoverage == 0 && a < 0.5) discard;
+                oColor.a = (uAlphaCoverage != 0) ? a : 1.0;
+            }
+#endif
+        } else if (uFilterMode == 5 && mainView) {
             float lx = dot(dx, dx), ly = dot(dy, dy);
             vec2 maj = (lx >= ly) ? dx : dy;
             float majL = sqrt(max(lx, ly)), minL = sqrt(max(min(lx, ly), 1e-12));
             float n = clamp(ceil(majL / minL), 1.0, float(max(uAniso, 1)));
             float lod = log2(max(majL / n, minL)) + float(uMipBias) / 128.0;
-            float t;
-            if (lod < 0.0 && p.utex != 0u) {
+            vec2 ts;
+            if (lod < 0.0 && p.utex != 0u && !translucent) {
                 // Close up: the board fades its microtexture in, weighted by how far below level 0.
                 float tb = level_t(p, 0, tc);
                 float w = min(-lod * 128.0 / float(1 << int(p.utexminlod)), 127.0) / 256.0;
-                t = mix(tb, micro_t(p, tc), w);
+                ts = vec2(mix(tb, micro_t(p, tc), w), 1.0);
             } else {
                 float l = max(lod, 0.0);
                 if (n <= 1.0) {
-                    t = tri_t(p, tc, l, max_level);
+                    ts = tri_s(p, tc, l, max_level, translucent);
                 } else {
-                    t = 0.0;
+                    ts = vec2(0.0);
                     for (int i = 0; i < 8; i++) {
                         if (float(i) >= n) break;
-                        t += tri_t(p, tc + maj * ((float(i) + 0.5) / n - 0.5), l, max_level);
+                        ts += tri_s(p, tc + maj * ((float(i) + 0.5) / n - 0.5), l, max_level, translucent);
                     }
-                    t /= n;
+                    ts /= n;
                 }
             }
-            oColor = vec4(tone(p, t), outAlpha);
+            float t = translucent ? ts.x / max(ts.y, 1e-4) : ts.x;
+            // uTestStage (debug.tcvr.m2_stage), cost breakdown: 1 = flat colour, no texture;
+            // 2 = texture only (t as grey, no colour chain); 0 = full.
+            if (uTestStage == 1) oColor = vec4(0.5, 0.5, 0.5, outAlpha);
+            else if (uTestStage == 2) oColor = vec4(vec3(t / 15.0), outAlpha);
+            else oColor = vec4(tone(p, t), outAlpha);
+#ifndef NO_DISCARD
+            if (translucent) {
+                // Filtered opacity, sharpened to a ~1 pixel ramp around 0.5 so mips cannot
+                // thin a sparse cut-out away at distance; alpha-to-coverage spreads it on MSAA.
+                float a = clamp((ts.y - 0.5) / max(fwidth(ts.y), 1.0 / 255.0) + 0.5, 0.0, 1.0);
+                if (a <= 0.0) discard;
+                if (uAlphaCoverage == 0 && a < 0.5) discard;
+                oColor.a = (uAlphaCoverage != 0) ? a : 1.0;
+            }
+#endif
         } else {
             // Board path (cut-outs, secondary views, legacy modes): MAME's taps and alpha reject.
             int mml;
@@ -496,5 +591,9 @@ void main() {
         oColor.rgb = mix((vBoard.y > hr) ? uGround : uSky, oColor.rgb, fe);
     }
     if (uImmersive != 0) oColor.rgb = clamp((oColor.rgb - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0);
+#ifdef NO_DISCARD
+    oColor.a = 1.0;
+#else
     if (!glass && !(uAlphaCoverage != 0 && mainView && p.translucent != 0u)) oColor.a = 1.0;
+#endif
 }
