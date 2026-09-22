@@ -62,11 +62,12 @@ public:
     // The immersive renderer owns its render pass: MSAA colour + depth that live only in the
     // tile memory (transient, lazily allocated, never stored), resolved on-chip into the
     // swapchain image. On the Adreno this is what makes 4x MSAA nearly free.
-    bool Initialize(VkDevice device, const MemoryAllocator* allocator, VkFormat colorFormat, uint32_t samples) {
+    bool Initialize(VkDevice device, const MemoryAllocator* allocator, VkFormat colorFormat, uint32_t samples, bool useFdm = false) {
         if (m_initialized) return true;
         m_vkDevice = device;
         m_memAllocator = allocator;
         m_colorFormat = colorFormat;
+        m_useFdm = useFdm;
         m_samples = (samples >= 4) ? VK_SAMPLE_COUNT_4_BIT : (samples >= 2 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT);
         CreateRenderPass();
         VkRenderPass renderPass = m_pass;
@@ -676,7 +677,8 @@ public:
     bool IsMsaa() const { return m_samples != VK_SAMPLE_COUNT_1_BIT; }
 
     // Begin the immersive render pass on swapchain image `target` (eye `eye`).
-    void BeginPass(VkCommandBuffer cmd, uint32_t eye, VkImage target, VkExtent2D ext, const VkRect2D& area, const float clear[4]) {
+    void BeginPass(VkCommandBuffer cmd, uint32_t eye, VkImage target, VkExtent2D ext, const VkRect2D& area, const float clear[4],
+                   VkImage fdmImage = VK_NULL_HANDLE, VkExtent2D fdmExt = {0, 0}) {
         eye = eye < 2 ? eye : 0;
         EyeTargets& et = m_eyeTargets[eye];
         if (et.ext.width != ext.width || et.ext.height != ext.height) DestroyEyeTargets(et), CreateEyeTargets(et, ext);
@@ -689,10 +691,23 @@ public:
             vi.image = target; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = m_colorFormat;
             vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &vi, nullptr, &e.view));
-            std::array<VkImageView, 3> att{};
+            std::array<VkImageView, 4> att{};
             uint32_t n = 0;
             if (IsMsaa()) { att[n++] = et.colorView; att[n++] = et.depthView; att[n++] = e.view; }
             else { att[n++] = e.view; att[n++] = et.depthView; }
+            if (m_useFdm) {
+                // The runtime's density map for this image: the periphery is shaded at a lower rate.
+                VkImageViewCreateInfo fv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                fv.image = fdmImage; fv.viewType = VK_IMAGE_VIEW_TYPE_2D; fv.format = VK_FORMAT_R8G8_UNORM;
+                fv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                if (fdmImage == VK_NULL_HANDLE || vkCreateImageView(m_vkDevice, &fv, nullptr, &e.fdmView) != VK_SUCCESS) {
+                    Log::Write(Log::Level::Error, "TCVR_M2VK FDM view missing -> foveation off for this image");
+                } else {
+                    att[n++] = e.fdmView;
+                    static bool s_logged = false;
+                    if (!s_logged) { s_logged = true; Log::Write(Log::Level::Info, Fmt("TCVR_M2VK foveation: density map %ux%u", fdmExt.width, fdmExt.height)); }
+                }
+            }
             VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
             fi.renderPass = m_pass; fi.attachmentCount = n; fi.pAttachments = att.data();
             fi.width = ext.width; fi.height = ext.height; fi.layers = 1;
@@ -733,6 +748,17 @@ public:
         VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
         VkAttachmentReference resolveRef{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        // Fragment density map (fixed foveation): last attachment, read-only for the whole pass.
+        std::array<VkAttachmentDescription, 4> at4{};
+        for (int i = 0; i < 3; ++i) at4[i] = at[i];
+        const uint32_t fdmIndex = ms ? 3u : 2u;
+        at4[fdmIndex].format = VK_FORMAT_R8G8_UNORM; at4[fdmIndex].samples = VK_SAMPLE_COUNT_1_BIT;
+        at4[fdmIndex].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at4[fdmIndex].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at4[fdmIndex].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at4[fdmIndex].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at4[fdmIndex].initialLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+        at4[fdmIndex].finalLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+        VkRenderPassFragmentDensityMapCreateInfoEXT fdmInfo{VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT};
+        fdmInfo.fragmentDensityMapAttachment = {fdmIndex, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT};
         VkSubpassDescription sp{};
         sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         sp.colorAttachmentCount = 1; sp.pColorAttachments = &colorRef;
@@ -745,11 +771,13 @@ public:
         dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-        ri.attachmentCount = ms ? 3u : 2u; ri.pAttachments = at.data();
+        ri.attachmentCount = (ms ? 3u : 2u) + (m_useFdm ? 1u : 0u); ri.pAttachments = at4.data();
+        if (m_useFdm) ri.pNext = &fdmInfo;
         ri.subpassCount = 1; ri.pSubpasses = &sp;
         ri.dependencyCount = 1; ri.pDependencies = &dep;
         XRC_CHECK_THROW_VKCMD(vkCreateRenderPass(m_vkDevice, &ri, nullptr, &m_pass));
-        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK render pass: MSAA x%d, transient colour/depth, on-tile resolve", int(m_samples)));
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK render pass: MSAA x%d, transient colour/depth, on-tile resolve, foveation %s",
+                                         int(m_samples), m_useFdm ? "ON (density map)" : "off"));
     }
 
     struct EyeTargets {
@@ -758,7 +786,7 @@ public:
         VkDeviceMemory colorMem = VK_NULL_HANDLE, depthMem = VK_NULL_HANDLE;
         VkImageView colorView = VK_NULL_HANDLE, depthView = VK_NULL_HANDLE;
     };
-    struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; };
+    struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; VkImageView fdmView = VK_NULL_HANDLE; };
     static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
     void AllocTransient(VkImage img, VkDeviceMemory* mem) {
@@ -779,6 +807,8 @@ public:
             ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {ext.width, ext.height, 1};
             ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = m_samples; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = usage | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+            // With foveation, the attachments must be SUBSAMPLED or the driver may render them at full density.
+            if (m_useFdm && arcadexr::config::GetInt("m2.fdmSubsampled", 1) != 0) ii.flags |= VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT;
             ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &ii, nullptr, img));
             AllocTransient(*img, mem);
@@ -796,7 +826,7 @@ public:
         if (et.ext.width == 0) return;
         vkDeviceWaitIdle(m_vkDevice);
         // framebuffers reference these views: drop them all, they are rebuilt lazily
-        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
+        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); }
         m_fbs.clear();
         if (et.colorView) vkDestroyImageView(m_vkDevice, et.colorView, nullptr);
         if (et.depthView) vkDestroyImageView(m_vkDevice, et.depthView, nullptr);
@@ -815,7 +845,7 @@ public:
         m_regions.Destroy();
         DestroyEyeTargets(m_eyeTargets[0]);
         DestroyEyeTargets(m_eyeTargets[1]);
-        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
+        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); }
         m_fbs.clear();
         if (m_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(m_vkDevice, m_pass, nullptr); m_pass = VK_NULL_HANDLE; }
 
@@ -1609,6 +1639,7 @@ private:
     VkFormat m_colorFormat = VK_FORMAT_UNDEFINED;
     VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;
     VkRenderPass m_pass = VK_NULL_HANDLE;
+    bool m_useFdm = false;
     EyeTargets m_eyeTargets[2];
     std::vector<FbEntry> m_fbs;
     VkShaderModule m_quadFarVertModule = VK_NULL_HANDLE;

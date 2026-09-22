@@ -69,6 +69,12 @@ struct IGraphicsPlugin {
     // based on the blend mode selected / available.
     virtual void SetClearColor(const std::array<float, 4> clearColor) = 0;
 
+    // Fixed foveated rendering through a fragment density map (Vulkan, XR_FB_foveation_vulkan):
+    // does this plugin render with the runtime's density maps, and chain the structs that
+    // receive them to each swapchain image before xrEnumerateSwapchainImages. No-op elsewhere.
+    virtual bool WantsFoveationFdm() const { return false; }
+    virtual void ChainFoveationImages(ISwapchainImageData* /*images*/, uint32_t /*count*/) {}
+
     // AppSW (XR_FB_space_warp) first light: fill a motion-vector swapchain image
     // with zero. For a driving game the world is static in world space, so
     // depth + head-pose reprojection already reconstructs its screen motion;

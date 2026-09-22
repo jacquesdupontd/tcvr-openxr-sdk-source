@@ -41,6 +41,7 @@
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_renderer.h"
 #include <chrono>
+#include <map>
 #include <algorithm>
 #include <algorithm>
 #include <cmath>
@@ -659,11 +660,16 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &n, nullptr);
             std::vector<VkExtensionProperties> exts(n);
             vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &n, exts.data());
-            bool haveIndexing = false;
-            for (auto& e : exts) if (strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) haveIndexing = true;
+            bool haveIndexing = false, haveFdm = false;
+            for (auto& e : exts) {
+                if (strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) haveIndexing = true;
+                if (strcmp(e.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) == 0) haveFdm = true;
+            }
+            VkPhysicalDeviceFragmentDensityMapFeaturesEXT qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
             VkPhysicalDeviceDescriptorIndexingFeaturesEXT q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
             VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             f2.pNext = &q;
+            q.pNext = &qf;
             // Android API 26 libvulkan does not export the 1.1 symbol: fetch it from the instance.
             auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
                 vkGetInstanceProcAddr(m_vkInstance, "vkGetPhysicalDeviceFeatures2"));
@@ -679,6 +685,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 arcadexr::vulkan::g_m2DescriptorIndexing = true;
             }
             arcadexr::vulkan::g_m2SamplerAnisotropy = f2.features.samplerAnisotropy == VK_TRUE;
+            // Fixed foveation (fragment density map), used by the Model 2 immersive render pass.
+            if (haveFdm && qf.fragmentDensityMap) {
+                deviceExtensions.push_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
+                m_fdmFeature.fragmentDensityMap = VK_TRUE;
+                m_fdmEnabled = true;
+            }
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK device: fragment density map ext=%d feature=%d", int(haveFdm), int(qf.fragmentDensityMap)));
             Log::Write(Log::Level::Info, Fmt("TCVR_M2VK device: descriptor indexing ext=%d nonUniformSampled=%d samplerAnisotropy=%d",
                                              int(haveIndexing), int(q.shaderSampledImageArrayNonUniformIndexing),
                                              int(f2.features.samplerAnisotropy)));
@@ -696,7 +709,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         deviceInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
         deviceInfo.pEnabledFeatures = &features;
-        if (arcadexr::vulkan::g_m2DescriptorIndexing) deviceInfo.pNext = &indexing;
+        {   // pNext chain: descriptor indexing, fragment density map
+            const void* chain = nullptr;
+            if (m_fdmEnabled) { m_fdmFeature.pNext = const_cast<void*>(chain); chain = &m_fdmFeature; }
+            if (arcadexr::vulkan::g_m2DescriptorIndexing) { indexing.pNext = const_cast<void*>(chain); chain = &indexing; }
+            deviceInfo.pNext = chain;
+        }
 
         XrVulkanDeviceCreateInfoKHR deviceCreateInfo{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
         deviceCreateInfo.systemId = systemId;
@@ -1209,13 +1227,24 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (!m_m2RendererInitialized) {
                 const VkFormat fmt = VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt);
                 const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("m2.msaa", 4)));
-                m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, fmt, uint32_t(msaa));
+                // Foveation on this swapchain? (it was created with a density map iff foveation > 0)
+                const bool useFdm = m_fdmEnabled && arcadexr::config::GetInt("foveation", 0) > 0 &&
+                                    !m_fdmImages.empty();
+                m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, fmt, uint32_t(msaa), useFdm);
                 m_m2RendererInitialized = true;
             }
             if (m_m2Renderer.HasGeometry()) {
                 const float clear[4] = {m_clearColor[0], m_clearColor[1], m_clearColor[2], 1.0f};
                 const VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
-                m_m2Renderer.BeginPass(cmd, viewIndex, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, clear);
+                VkImage fdmImage = VK_NULL_HANDLE;
+                VkExtent2D fdmExt{0, 0};
+                auto fit = m_fdmImages.find(static_cast<const ISwapchainImageData*>(swapchainData));
+                if (fit != m_fdmImages.end() && imageIndex < fit->second.size()) {
+                    fdmImage = fit->second[imageIndex].image;
+                    fdmExt = {fit->second[imageIndex].width, fit->second[imageIndex].height};
+                }
+                m_m2Renderer.BeginPass(cmd, viewIndex, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, clear,
+                                       fdmImage, fdmExt);
                 SetViewportAndScissor(cmd, renderArea);
                 m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, cmd, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
                 vkCmdEndRenderPass(cmd);
@@ -1354,6 +1383,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_swapchain.Present(m_vkQueue);
         }
 #endif
+    }
+
+    bool WantsFoveationFdm() const override { return m_fdmEnabled; }
+
+    void ChainFoveationImages(ISwapchainImageData* images, uint32_t count) override {
+        auto& v = m_fdmImages[images];
+        v.assign(count, XrSwapchainImageFoveationVulkanFB{XR_TYPE_SWAPCHAIN_IMAGE_FOVEATION_VULKAN_FB});
+        auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images->GetColorImageArray());
+        for (uint32_t i = 0; i < count; ++i) arr[i].next = &v[i];
     }
 
     void SetM2SceneMode(int mode) {
@@ -1503,6 +1541,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool m_m2RendererInitialized{false};
     bool m_m2SceneRequested{false};
     int m_m2SceneMode{-1};
+    bool m_fdmEnabled{false};
+    VkPhysicalDeviceFragmentDensityMapFeaturesEXT m_fdmFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
+    std::map<const ISwapchainImageData*, std::vector<XrSwapchainImageFoveationVulkanFB>> m_fdmImages;
     VkQueryPool m_gpuQueryPool{VK_NULL_HANDLE};
     bool m_gpuQueryWritten[2]{false, false};
     float m_timestampPeriodNs{0.0f};

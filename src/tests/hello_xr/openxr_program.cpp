@@ -279,6 +279,8 @@ struct OpenXrProgram : IOpenXrProgram {
             bool f2 = enableIfPresent(XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME);
             bool f3 = enableIfPresent(XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME);
             m_supportsFoveation = f1 && f2 && f3;
+            // Vulkan: density-map foveation needs this one too (harmless for GLES).
+            m_supportsFoveationVulkan = m_supportsFoveation && enableIfPresent("XR_FB_foveation_vulkan");
             Log::Write(Log::Level::Info, Fmt("TCVR_FOV foveation extensions %s", m_supportsFoveation ? "supported" : "absent"));
         }
 
@@ -988,11 +990,20 @@ struct OpenXrProgram : IOpenXrProgram {
                 swapchainCreateInfo.faceCount = 1;
                 swapchainCreateInfo.sampleCount = m_graphicsPlugin->GetSupportedSwapchainSampleCount(vp);
                 swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+                // Vulkan fixed foveation: the swapchain must be created WITH a fragment density map.
+                XrSwapchainCreateInfoFoveationFB fovCreate{XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB};
+                const bool fdm = m_supportsFoveationVulkan && m_graphicsPlugin->WantsFoveationFdm() &&
+                                 arcadexr::config::GetInt("foveation", 0) > 0;
+                if (fdm) {
+                    fovCreate.flags = XR_SWAPCHAIN_CREATE_FOVEATION_FRAGMENT_DENSITY_MAP_BIT_FB;
+                    swapchainCreateInfo.next = &fovCreate;
+                }
                 Swapchain swapchain;
                 swapchain.width = swapchainCreateInfo.width;
                 swapchain.height = swapchainCreateInfo.height;
                 CHECK_XRCMD(xrCreateSwapchain(m_session, &swapchainCreateInfo, &swapchain.handle));
-                Log::Write(Log::Level::Info, Fmt("TCVR_M0 xrCreateSwapchain succeeded: view=%d", i));
+                swapchainCreateInfo.next = nullptr;
+                Log::Write(Log::Level::Info, Fmt("TCVR_M0 xrCreateSwapchain succeeded: view=%d fdm=%d", i, int(fdm)));
 
                 // REFONTE jalon 2 : applique un profil de foveation a cette swapchain.
                 // debug.tcvr.foveation : 0=off, 1=low, 2=medium, 3=high, 4=high+dynamic.
@@ -1059,6 +1070,7 @@ struct OpenXrProgram : IOpenXrProgram {
 
                     ISwapchainImageData* swapchainImages = m_graphicsPlugin->AllocateSwapchainImageDataWithDepthSwapchain(
                         imageCount, swapchainCreateInfo, depthSwapchain.handle, depthSwapchainCreateInfo);
+                    if (fdm) m_graphicsPlugin->ChainFoveationImages(swapchainImages, imageCount);
                     CHECK_XRCMD(xrEnumerateSwapchainImages(swapchain.handle, imageCount, &imageCount,
                                                            swapchainImages->GetColorImageArray()));
 
@@ -1069,6 +1081,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 } else {
                     ISwapchainImageData* swapchainImages =
                         m_graphicsPlugin->AllocateSwapchainImageData(imageCount, swapchainCreateInfo);
+                    if (fdm) m_graphicsPlugin->ChainFoveationImages(swapchainImages, imageCount);
                     CHECK_XRCMD(xrEnumerateSwapchainImages(swapchain.handle, imageCount, &imageCount,
                                                            swapchainImages->GetColorImageArray()));
 
@@ -1998,6 +2011,7 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_supportsDepthLayer{false};
     bool m_supportsDisplayRefreshRate{false};
     bool m_supportsFoveation{false};
+    bool m_supportsFoveationVulkan{false};
     bool m_supportsPerformanceSettings{false};
     bool m_supportsThreadSettings{false};
     bool m_spaceWarpRequested{false};
