@@ -76,14 +76,14 @@ public:
 
         // 1. Create Descriptor Pool
         std::array<VkDescriptorPoolSize, 5> poolSizes{{
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32},
-            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * M2RegionTextures::kMaxSlots + 8},
-            {VK_DESCRIPTOR_TYPE_SAMPLER, 16}
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * M2RegionTextures::kMaxSlots + 16},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 40}
         }};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        poolInfo.maxSets = 16;
+        poolInfo.maxSets = 24;
         poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
         poolInfo.pPoolSizes = poolSizes.data();
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_vkDevice, &poolInfo, nullptr, &m_descriptorPool));
@@ -449,29 +449,40 @@ public:
         if (!m_rawPrims.empty()) {
             if (!m_rawVerts.empty()) {
                 size_t vertBytes = std::min(m_rawVerts.size() * sizeof(float), m_vboSize);
-                memcpy(m_vboMapped, m_rawVerts.data(), vertBytes);
+                memcpy(m_vboMappedF[m_fs], m_rawVerts.data(), vertBytes);
             }
             if (!m_rawPrimOfVertex.empty()) {
                 size_t primOfVertBytes = std::min(m_rawPrimOfVertex.size() * sizeof(uint32_t), m_primIndexSize);
-                memcpy(m_primIndexMapped, m_rawPrimOfVertex.data(), primOfVertBytes);
+                memcpy(m_primIndexMappedF[m_fs], m_rawPrimOfVertex.data(), primOfVertBytes);
             }
             if (!m_rawIdx.empty()) {
                 size_t idxBytes = std::min(m_rawIdx.size() * sizeof(uint32_t), m_iboSize);
-                memcpy(m_iboMapped, m_rawIdx.data(), idxBytes);
+                memcpy(m_iboMappedF[m_fs], m_rawIdx.data(), idxBytes);
             }
             {   // always: the descriptor array must be fully valid (dummy image) before any draw
                 m_regions.Flush(cmd);
-                const bool full = m_regions.NeedsFullDescriptorWrite();
-                if (full || m_regions.HasDirty())
+                // New regions go into THIS slot's sets now, and into the other slot's sets the next
+                // time that slot is recorded (its sets may still be in use by the GPU right now).
+                const bool fullNow = m_regions.NeedsFullDescriptorWrite();
+                std::vector<uint32_t> dirty = m_regions.TakeDirty();
+                const int other = 1 - m_fs;
+                const bool full = fullNow || m_fullPend[m_fs];
+                std::vector<uint32_t> slots = m_pendSlots[m_fs];
+                slots.insert(slots.end(), dirty.begin(), dirty.end());
+                if (full || !slots.empty())
                     for (int e = 0; e < 2; ++e)
-                        for (int ps = 0; ps < 2; ++ps) m_regions.WriteDescriptors(m_m2DescSet[e][ps], 12, 13, full);
+                        for (int ps = 0; ps < 2; ++ps) m_regions.WriteDescriptors(m_m2DescSetF[m_fs][e][ps], 12, 13, full, slots);
+                m_fullPend[m_fs] = false;
+                m_pendSlots[m_fs].clear();
+                if (fullNow) { m_fullPend[other] = true; m_pendSlots[other].clear(); }
+                else m_pendSlots[other].insert(m_pendSlots[other].end(), dirty.begin(), dirty.end());
                 m_regions.DescriptorsDone();
                 static unsigned s_regLog = 0;
                 if ((s_regLog++ % 300u) == 0u)
                     Log::Write(Log::Level::Info, Fmt("TCVR_M2VK regions=%u created=%u", m_regions.Count(), m_regions.Created()));
             }
             size_t primBytes = std::min(m_rawPrims.size() * sizeof(tcvr_m2_prim), m_primsSize);
-            memcpy(m_primsMapped, m_rawPrims.data(), primBytes);
+            memcpy(m_primsMappedF[m_fs], m_rawPrims.data(), primBytes);
         }
         UploadLayers(frame, cmd);
         m_preparedSeq = frame.sequence;
@@ -555,7 +566,7 @@ public:
         // Update UBO slices for this eye
         const uint32_t eye = (viewIndex < 2) ? viewIndex : 0;
         for (uint32_t pass = 0; pass < 2; ++pass) {
-            M2UniformBufferObject& ubo = *m_uboMapped[eye][pass];
+            M2UniformBufferObject& ubo = *m_uboMappedF[m_fs][eye][pass];
             memcpy(ubo.uMvp, mvp.m, sizeof(mvp.m));
             memcpy(ubo.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
             ubo.uViewport[0] = 496.0f; ubo.uViewport[1] = 384.0f;
@@ -599,13 +610,13 @@ public:
         const bool bgFar = true;  // background is drawn after the geometry: far-plane, depth-tested
         // 3. Draw Model 2 Geometry
         if (m_opaqueIndexCount > 0) {
-            VkBuffer vtxBufs[2] = { m_vboBuffer.buf, m_primIndexBuffer.buf };
+            VkBuffer vtxBufs[2] = { m_vboBufferF[m_fs].buf, m_primIndexBufferF[m_fs].buf };
             VkDeviceSize offsets[2] = { 0, 0 };
             vkCmdBindVertexBuffers(cmd, 0, 2, vtxBufs, offsets);
-            vkCmdBindIndexBuffer(cmd, m_iboBuffer.buf, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindIndexBuffer(cmd, m_iboBufferF[m_fs].buf, 0, VK_INDEX_TYPE_UINT32);
 
             // Pass 1: Opaque
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSet[eye][0], 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
             if (m_fastIndexCount > 0 && !(skip & 4)) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineFast);
                 vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
@@ -648,7 +659,7 @@ public:
             // Pass 2: Glass (after the background: it blends over what is really behind it)
             if (m_glassIndexCount > 0 && !(skip & 16)) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineGlass);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSet[eye][1], 0, nullptr);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][1], 0, nullptr);
                 vkCmdDrawIndexed(cmd, m_glassIndexCount, 1, m_opaqueIndexCount, 0, 0);
             }
         }
@@ -677,6 +688,7 @@ public:
     }
 
     bool HaveMainView() const { return m_haveMainView; }
+    void SetFrameSlot(int s) { m_fs = s & 1; m_regions.SetHalf(uint32_t(m_fs)); }
 
     // Does this polygon's texture (level 0 region) contain the transparent index 15 at all?
     // A "translucent" polygon whose texture has no hole can never discard a pixel, so it is
@@ -925,29 +937,30 @@ public:
             if (m_layerMem[i] != VK_NULL_HANDLE) { vkFreeMemory(m_vkDevice, m_layerMem[i], nullptr); m_layerMem[i] = VK_NULL_HANDLE; }
         }
 
-        m_vboBuffer.Reset(m_vkDevice);
-        m_primIndexBuffer.Reset(m_vkDevice);
-        m_iboBuffer.Reset(m_vkDevice);
-        m_primsBuffer.Reset(m_vkDevice);
-        m_palramBuffer.Reset(m_vkDevice);
-        m_colorxlatBuffer.Reset(m_vkDevice);
-        m_lumaramBuffer.Reset(m_vkDevice);
-        m_gammaBuffer.Reset(m_vkDevice);
+        for (m_fs = 0; m_fs < kFrames; ++m_fs) {
+        m_vboBufferF[m_fs].Reset(m_vkDevice);
+        m_primIndexBufferF[m_fs].Reset(m_vkDevice);
+        m_iboBufferF[m_fs].Reset(m_vkDevice);
+        m_primsBufferF[m_fs].Reset(m_vkDevice);
+        m_palramBufferF[m_fs].Reset(m_vkDevice);
+        m_colorxlatBufferF[m_fs].Reset(m_vkDevice);
+        m_lumaramBufferF[m_fs].Reset(m_vkDevice);
+        m_gammaBufferF[m_fs].Reset(m_vkDevice);
+        for (int i = 0; i < 2; ++i) m_layerStagingBufferF[m_fs][i].Reset(m_vkDevice);
+        for (int e = 0; e < 2; ++e)
+            for (int p = 0; p < 2; ++p) m_uboBufferF[m_fs][e][p].Reset(m_vkDevice);
+        }
+        m_fs = 0;
         m_dummyBuffer.Reset(m_vkDevice);
         m_lutBuffer.Reset(m_vkDevice);
         for (int i = 0; i < 4; ++i) {
             m_sheetStagingBuffer[i].Reset(m_vkDevice);
             m_sheetStagingMapped[i] = nullptr;
         }
-        for (int i = 0; i < 2; ++i) m_layerStagingBuffer[i].Reset(m_vkDevice);
         m_texturesUploaded = false;
         m_texHash = 0;
 
-        for (int e = 0; e < 2; ++e) {
-            for (int p = 0; p < 2; ++p) {
-                m_uboBuffer[e][p].Reset(m_vkDevice);
-            }
-        }
+
     }
 
 private:
@@ -1195,35 +1208,55 @@ private:
             XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, bam.mem, 0, size, 0, mapped));
         };
 
+        for (m_fs = 0; m_fs < kFrames; ++m_fs) {
         // 1. UBO buffers: 4 slices (2 eyes x 2 passes)
         for (int e = 0; e < 2; ++e) {
             for (int p = 0; p < 2; ++p) {
-                createMappedBuffer(m_uboBuffer[e][p], sizeof(M2UniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                   reinterpret_cast<void**>(&m_uboMapped[e][p]));
+                createMappedBuffer(m_uboBufferF[m_fs][e][p], sizeof(M2UniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                   reinterpret_cast<void**>(&m_uboMappedF[m_fs][e][p]));
             }
         }
 
         // 2. SSBOs
         m_primsSize = 4096 * sizeof(tcvr_m2_prim);
-        createMappedBuffer(m_primsBuffer, m_primsSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_primsMapped));
+        createMappedBuffer(m_primsBufferF[m_fs], m_primsSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_primsMappedF[m_fs]));
 
         m_palramSize = 65536 * sizeof(uint32_t);
-        createMappedBuffer(m_palramBuffer, m_palramSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_palramMapped));
+        createMappedBuffer(m_palramBufferF[m_fs], m_palramSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_palramMappedF[m_fs]));
 
         m_colorxlatSize = 16384 * sizeof(uint32_t);
-        createMappedBuffer(m_colorxlatBuffer, m_colorxlatSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_colorxlatMapped));
+        createMappedBuffer(m_colorxlatBufferF[m_fs], m_colorxlatSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_colorxlatMappedF[m_fs]));
 
         m_lumaramSize = 4096 * sizeof(uint32_t);
-        createMappedBuffer(m_lumaramBuffer, m_lumaramSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_lumaramMapped));
+        createMappedBuffer(m_lumaramBufferF[m_fs], m_lumaramSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_lumaramMappedF[m_fs]));
 
         m_gammaSize = 256 * sizeof(uint32_t);
-        createMappedBuffer(m_gammaBuffer, m_gammaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_gammaMapped));
+        createMappedBuffer(m_gammaBufferF[m_fs], m_gammaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_gammaMappedF[m_fs]));
 
+        // 3. Geometry Buffers
+        m_vboSize = 65536 * 5 * sizeof(float); // 32k verts
+        createMappedBuffer(m_vboBufferF[m_fs], m_vboSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_vboMappedF[m_fs]));
+
+        m_primIndexSize = 65536 * sizeof(uint32_t);
+        createMappedBuffer(m_primIndexBufferF[m_fs], m_primIndexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_primIndexMappedF[m_fs]));
+
+        m_iboSize = 131072 * sizeof(uint32_t); // 65k indices
+        createMappedBuffer(m_iboBufferF[m_fs], m_iboSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_iboMappedF[m_fs]));
+
+        for (int i = 0; i < 2; ++i) {
+            createMappedBuffer(m_layerStagingBufferF[m_fs][i], 512 * 384 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               reinterpret_cast<void**>(&m_layerStagingMappedF[m_fs][i]));
+        }
+        }
+        m_fs = 0;
         void* dummyMapped = nullptr;
         createMappedBuffer(m_dummyBuffer, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &dummyMapped);
         {
@@ -1235,29 +1268,13 @@ private:
         m_dbgMapped = reinterpret_cast<uint32_t*>(dummyMapped);
         std::memset(m_dbgMapped, 0, 256);
 
-        // 3. Geometry Buffers
-        m_vboSize = 65536 * 5 * sizeof(float); // 32k verts
-        createMappedBuffer(m_vboBuffer, m_vboSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_vboMapped));
-
-        m_primIndexSize = 65536 * sizeof(uint32_t);
-        createMappedBuffer(m_primIndexBuffer, m_primIndexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_primIndexMapped));
-
-        m_iboSize = 131072 * sizeof(uint32_t); // 65k indices
-        createMappedBuffer(m_iboBuffer, m_iboSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                           reinterpret_cast<void**>(&m_iboMapped));
-
         // 4. Staging Buffers
         for (int i = 0; i < 4; ++i) {
             createMappedBuffer(m_sheetStagingBuffer[i], (i < 2 ? 1u : 2u) * 1024 * 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                reinterpret_cast<void**>(&m_sheetStagingMapped[i]));
         }
 
-        for (int i = 0; i < 2; ++i) {
-            createMappedBuffer(m_layerStagingBuffer[i], 512 * 384 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                               reinterpret_cast<void**>(&m_layerStagingMapped[i]));
-        }
+
     }
 
     void AllocateTextures() {
@@ -1352,21 +1369,22 @@ private:
             vkUpdateDescriptorSets(m_vkDevice, 1, &writeDesc, 0, nullptr);
         }
 
-        // Allocate Model 2 descriptor sets (2 eyes x 2 passes = 4 sets)
+        // Allocate Model 2 descriptor sets (2 eyes x 2 passes = 4 sets) per frame slot
+        for (m_fs = 0; m_fs < kFrames; ++m_fs)
         for (int e = 0; e < 2; ++e) {
             for (int p = 0; p < 2; ++p) {
                 VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
                 allocInfo.descriptorPool = m_descriptorPool;
                 allocInfo.descriptorSetCount = 1;
                 allocInfo.pSetLayouts = &m_m2DescLayout;
-                XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_m2DescSet[e][p]));
+                XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_m2DescSetF[m_fs][e][p]));
 
                 std::vector<VkWriteDescriptorSet> writes;
 
                 // Binding 0: UBO
-                VkDescriptorBufferInfo uboInfo{m_uboBuffer[e][p].buf, 0, sizeof(M2UniformBufferObject)};
+                VkDescriptorBufferInfo uboInfo{m_uboBufferF[m_fs][e][p].buf, 0, sizeof(M2UniformBufferObject)};
                 VkWriteDescriptorSet uboWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                uboWrite.dstSet = m_m2DescSet[e][p];
+                uboWrite.dstSet = m_m2DescSetF[m_fs][e][p];
                 uboWrite.dstBinding = 0;
                 uboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
                 uboWrite.descriptorCount = 1;
@@ -1374,9 +1392,9 @@ private:
                 writes.push_back(uboWrite);
 
                 // Binding 1: Prims
-                VkDescriptorBufferInfo primsInfo{m_primsBuffer.buf, 0, m_primsSize};
+                VkDescriptorBufferInfo primsInfo{m_primsBufferF[m_fs].buf, 0, m_primsSize};
                 VkWriteDescriptorSet primsWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                primsWrite.dstSet = m_m2DescSet[e][p];
+                primsWrite.dstSet = m_m2DescSetF[m_fs][e][p];
                 primsWrite.dstBinding = 1;
                 primsWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 primsWrite.descriptorCount = 1;
@@ -1384,9 +1402,9 @@ private:
                 writes.push_back(primsWrite);
 
                 // Binding 2: Palram
-                VkDescriptorBufferInfo palramInfo{m_palramBuffer.buf, 0, m_palramSize};
+                VkDescriptorBufferInfo palramInfo{m_palramBufferF[m_fs].buf, 0, m_palramSize};
                 VkWriteDescriptorSet palramWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                palramWrite.dstSet = m_m2DescSet[e][p];
+                palramWrite.dstSet = m_m2DescSetF[m_fs][e][p];
                 palramWrite.dstBinding = 2;
                 palramWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 palramWrite.descriptorCount = 1;
@@ -1394,9 +1412,9 @@ private:
                 writes.push_back(palramWrite);
 
                 // Binding 3: Colorxlat
-                VkDescriptorBufferInfo colInfo{m_colorxlatBuffer.buf, 0, m_colorxlatSize};
+                VkDescriptorBufferInfo colInfo{m_colorxlatBufferF[m_fs].buf, 0, m_colorxlatSize};
                 VkWriteDescriptorSet colWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                colWrite.dstSet = m_m2DescSet[e][p];
+                colWrite.dstSet = m_m2DescSetF[m_fs][e][p];
                 colWrite.dstBinding = 3;
                 colWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 colWrite.descriptorCount = 1;
@@ -1404,9 +1422,9 @@ private:
                 writes.push_back(colWrite);
 
                 // Binding 4: Lumaram
-                VkDescriptorBufferInfo lumInfo{m_lumaramBuffer.buf, 0, m_lumaramSize};
+                VkDescriptorBufferInfo lumInfo{m_lumaramBufferF[m_fs].buf, 0, m_lumaramSize};
                 VkWriteDescriptorSet lumWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                lumWrite.dstSet = m_m2DescSet[e][p];
+                lumWrite.dstSet = m_m2DescSetF[m_fs][e][p];
                 lumWrite.dstBinding = 4;
                 lumWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 lumWrite.descriptorCount = 1;
@@ -1414,9 +1432,9 @@ private:
                 writes.push_back(lumWrite);
 
                 // Binding 5: Gamma
-                VkDescriptorBufferInfo gamInfo{m_gammaBuffer.buf, 0, m_gammaSize};
+                VkDescriptorBufferInfo gamInfo{m_gammaBufferF[m_fs].buf, 0, m_gammaSize};
                 VkWriteDescriptorSet gamWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                gamWrite.dstSet = m_m2DescSet[e][p];
+                gamWrite.dstSet = m_m2DescSetF[m_fs][e][p];
                 gamWrite.dstBinding = 5;
                 gamWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 gamWrite.descriptorCount = 1;
@@ -1426,7 +1444,7 @@ private:
                 // Binding 6, 7: Dummy SSBOs
                 VkDescriptorBufferInfo dummyInfo{m_dummyBuffer.buf, 0, 256};
                 VkWriteDescriptorSet dum6Write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                dum6Write.dstSet = m_m2DescSet[e][p];
+                dum6Write.dstSet = m_m2DescSetF[m_fs][e][p];
                 dum6Write.dstBinding = 6;
                 dum6Write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 dum6Write.descriptorCount = 1;
@@ -1434,7 +1452,7 @@ private:
                 writes.push_back(dum6Write);
 
                 VkWriteDescriptorSet dum7Write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                dum7Write.dstSet = m_m2DescSet[e][p];
+                dum7Write.dstSet = m_m2DescSetF[m_fs][e][p];
                 dum7Write.dstBinding = 7;
                 // binding 7 = the colour table as a storage buffer (uint RGBA per (component, luma))
                 VkDescriptorBufferInfo lutInfo{m_lutBuffer.buf, 0, 64 * 32 * 4};
@@ -1446,7 +1464,7 @@ private:
                 // Binding 8, 9: Sheet texture samplers
                 VkDescriptorImageInfo sheet0Info{m_sheetSampler, m_sheetView[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                 VkWriteDescriptorSet s0Write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                s0Write.dstSet = m_m2DescSet[e][p];
+                s0Write.dstSet = m_m2DescSetF[m_fs][e][p];
                 s0Write.dstBinding = 8;
                 s0Write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 s0Write.descriptorCount = 1;
@@ -1455,7 +1473,7 @@ private:
 
                 VkDescriptorImageInfo sheet1Info{m_sheetSampler, m_sheetView[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                 VkWriteDescriptorSet s1Write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                s1Write.dstSet = m_m2DescSet[e][p];
+                s1Write.dstSet = m_m2DescSetF[m_fs][e][p];
                 s1Write.dstBinding = 9;
                 s1Write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 s1Write.descriptorCount = 1;
@@ -1472,6 +1490,7 @@ private:
                 vkUpdateDescriptorSets(m_vkDevice, (uint32_t)writes.size(), writes.data(), 0, nullptr);
             }
         }
+        m_fs = 0;
     }
 
     // gamma(colorxlat) for every (channel, 5-bit component, luma): 3 texel reads per pixel
@@ -1502,22 +1521,21 @@ private:
     }
 
     void UploadColourChain(const tcvr_m2_frame& frame) {
-        BuildColourLut(frame);
         if (frame.palram && frame.palram_entries) {
             size_t bytes = std::min(size_t(frame.palram_entries) * sizeof(uint16_t), m_palramSize);
-            memcpy(m_palramMapped, frame.palram, bytes);
+            memcpy(m_palramMappedF[m_fs], frame.palram, bytes);
         }
         if (frame.colorxlat && frame.colorxlat_entries) {
             size_t bytes = std::min(size_t(frame.colorxlat_entries) * sizeof(uint16_t), m_colorxlatSize);
-            memcpy(m_colorxlatMapped, frame.colorxlat, bytes);
+            memcpy(m_colorxlatMappedF[m_fs], frame.colorxlat, bytes);
         }
         if (frame.lumaram && frame.lumaram_entries) {
             size_t bytes = std::min(size_t(frame.lumaram_entries) * sizeof(uint8_t), m_lumaramSize);
-            memcpy(m_lumaramMapped, frame.lumaram, bytes);
+            memcpy(m_lumaramMappedF[m_fs], frame.lumaram, bytes);
         }
         if (frame.gamma && frame.gamma_entries) {
             size_t bytes = std::min(size_t(frame.gamma_entries) * sizeof(uint8_t), m_gammaSize);
-            memcpy(m_gammaMapped, frame.gamma, bytes);
+            memcpy(m_gammaMappedF[m_fs], frame.gamma, bytes);
         }
     }
 
@@ -1545,6 +1563,8 @@ private:
         const bool needsUpload = !m_texturesUploaded || hashChanged;
         if (!needsUpload) return false;
 
+        // The sheet staging buffers are shared by both frame slots: let any in-flight copy finish (rare: loads).
+        if (m_texturesUploaded) vkDeviceWaitIdle(m_vkDevice);
         Log::Write(Log::Level::Info, Fmt("TCVR_M2VK: Uploading texture sheets (hashChanged=%d, words=%u)",
                                          hashChanged ? 1 : 0, frame.textureram_words));
 
@@ -1617,7 +1637,7 @@ private:
             const uint32_t copyW = std::min(uint32_t(w), 512u);
             const uint32_t copyH = std::min(uint32_t(h), 384u);
             for (uint32_t y = 0; y < copyH; ++y) {
-                memcpy(&m_layerStagingMapped[idx][y * 512], &pixels[y * stride], copyW * sizeof(uint32_t));
+                memcpy(&m_layerStagingMappedF[m_fs][idx][y * 512], &pixels[y * stride], copyW * sizeof(uint32_t));
             }
 
             VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1638,7 +1658,7 @@ private:
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageOffset = {0, 0, 0};
             region.imageExtent = {copyW, copyH, 1};
-            vkCmdCopyBufferToImage(cmd, m_layerStagingBuffer[idx].buf, m_layerImage[idx],
+            vkCmdCopyBufferToImage(cmd, m_layerStagingBufferF[m_fs][idx].buf, m_layerImage[idx],
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1696,27 +1716,33 @@ private:
     VkSampler m_layerSampler[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 
     // Host-visible mapped buffers
-    BufferAndMemory m_uboBuffer[2][2]; // [eye][pass]
-    M2UniformBufferObject* m_uboMapped[2][2] = {};
+    // Two frames in flight: everything the CPU rewrites every frame exists twice, indexed by
+    // m_fs (the frame slot the plugin is recording). The GPU reads slot s while the CPU fills 1-s.
+    static constexpr int kFrames = 2;
+    int m_fs = 0;
+    std::vector<uint32_t> m_pendSlots[kFrames];
+    bool m_fullPend[kFrames] = {true, true};
+    BufferAndMemory m_uboBufferF[kFrames][2][2]; // [eye][pass]
+    M2UniformBufferObject* m_uboMappedF[kFrames][2][2] = {};
 
-    BufferAndMemory m_primsBuffer;
-    tcvr_m2_prim* m_primsMapped = nullptr;
+    BufferAndMemory m_primsBufferF[kFrames];
+    tcvr_m2_prim* m_primsMappedF[kFrames] = {};
     size_t m_primsSize = 0;
 
-    BufferAndMemory m_palramBuffer;
-    uint32_t* m_palramMapped = nullptr;
+    BufferAndMemory m_palramBufferF[kFrames];
+    uint32_t* m_palramMappedF[kFrames] = {};
     size_t m_palramSize = 0;
 
-    BufferAndMemory m_colorxlatBuffer;
-    uint32_t* m_colorxlatMapped = nullptr;
+    BufferAndMemory m_colorxlatBufferF[kFrames];
+    uint32_t* m_colorxlatMappedF[kFrames] = {};
     size_t m_colorxlatSize = 0;
 
-    BufferAndMemory m_lumaramBuffer;
-    uint32_t* m_lumaramMapped = nullptr;
+    BufferAndMemory m_lumaramBufferF[kFrames];
+    uint32_t* m_lumaramMappedF[kFrames] = {};
     size_t m_lumaramSize = 0;
 
-    BufferAndMemory m_gammaBuffer;
-    uint32_t* m_gammaMapped = nullptr;
+    BufferAndMemory m_gammaBufferF[kFrames];
+    uint32_t* m_gammaMappedF[kFrames] = {};
     size_t m_gammaSize = 0;
 
     BufferAndMemory m_dummyBuffer;
@@ -1726,20 +1752,20 @@ private:
     uint32_t m_lastEyePixels = 0;
     bool m_built = false;
 
-    BufferAndMemory m_vboBuffer;
-    float* m_vboMapped = nullptr;
+    BufferAndMemory m_vboBufferF[kFrames];
+    float* m_vboMappedF[kFrames] = {};
     size_t m_vboSize = 0;
 
-    BufferAndMemory m_primIndexBuffer;
-    uint32_t* m_primIndexMapped = nullptr;
+    BufferAndMemory m_primIndexBufferF[kFrames];
+    uint32_t* m_primIndexMappedF[kFrames] = {};
     size_t m_primIndexSize = 0;
 
-    BufferAndMemory m_iboBuffer;
-    uint32_t* m_iboMapped = nullptr;
+    BufferAndMemory m_iboBufferF[kFrames];
+    uint32_t* m_iboMappedF[kFrames] = {};
     size_t m_iboSize = 0;
 
     // Descriptor Sets
-    VkDescriptorSet m_m2DescSet[2][2] = {};
+    VkDescriptorSet m_m2DescSetF[kFrames][2][2] = {};
     VkDescriptorSet m_layerDescSet[2] = {};
 
     // Textures
@@ -1767,8 +1793,8 @@ private:
     VkDeviceMemory m_layerMem[2] = {};
     VkImageView m_layerView[2] = {};
     VkImageLayout m_layerLayout[2] = {};
-    BufferAndMemory m_layerStagingBuffer[2];
-    uint32_t* m_layerStagingMapped[2] = {};
+    BufferAndMemory m_layerStagingBufferF[kFrames][2];
+    uint32_t* m_layerStagingMappedF[kFrames][2] = {};
     bool m_haveLayer[2] = {false, false};
 
     // Geometry unpack state

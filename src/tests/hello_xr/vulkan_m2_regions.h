@@ -172,12 +172,12 @@ public:
         if (!m_pending.empty()) m_created += uint32_t(m_pending.size());
         m_pending.clear();
         m_stagingUsed = 0;
-        m_half ^= 1u;
     }
 
     // Descriptor writes for binding `imgBinding` (texture2D[kMaxSlots]) and `smpBinding`
     // (sampler[4]) of `set`: everything the first time / after Clear, then only new slots.
-    void WriteDescriptors(VkDescriptorSet set, uint32_t imgBinding, uint32_t smpBinding, bool full) {
+    void WriteDescriptors(VkDescriptorSet set, uint32_t imgBinding, uint32_t smpBinding, bool full,
+                          const std::vector<uint32_t>& slots) {
         std::vector<VkDescriptorImageInfo> infos;
         std::vector<VkWriteDescriptorSet> writes;
         if (full) {
@@ -203,18 +203,22 @@ public:
             vkUpdateDescriptorSets(m_dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
             return;
         }
-        if (m_dirtySlots.empty()) return;
-        infos.resize(m_dirtySlots.size());
-        for (size_t i = 0; i < m_dirtySlots.size(); ++i) {
-            infos[i] = {VK_NULL_HANDLE, m_slots[m_dirtySlots[i]].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        if (slots.empty()) return;
+        infos.resize(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i] >= m_slots.size()) continue;
+            infos[i] = {VK_NULL_HANDLE, m_slots[slots[i]].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = set; w.dstBinding = imgBinding; w.dstArrayElement = m_dirtySlots[i];
+            w.dstSet = set; w.dstBinding = imgBinding; w.dstArrayElement = slots[i];
             w.descriptorCount = 1; w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             w.pImageInfo = &infos[i];
             writes.push_back(w);
         }
         vkUpdateDescriptorSets(m_dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
     }
+    std::vector<uint32_t> TakeDirty() { std::vector<uint32_t> d; d.swap(m_dirtySlots); return d; }
+    // Staging half follows the frame slot being recorded (its previous use is fenced).
+    void SetHalf(uint32_t h) { if (h != m_half) { m_half = h & 1u; m_stagingUsed = 0; } }
     // After all sets were written for this frame.
     void DescriptorsDone() { m_dirtySlots.clear(); m_resetDescriptors = false; }
     bool NeedsFullDescriptorWrite() const { return m_resetDescriptors; }

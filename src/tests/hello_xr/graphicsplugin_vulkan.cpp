@@ -784,7 +784,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XRC_CHECK_THROW_VKCMD(vkCreateSemaphore(m_vkDevice, &semInfo, nullptr, &m_vkDrawDone));
         XRC_CHECK_THROW_VKCMD(m_namer.SetName(VK_OBJECT_TYPE_SEMAPHORE, (uint64_t)m_vkDrawDone, "hello_xr draw done semaphore"));
 
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 4; ++i) {
             if (!m_cmdBuffer[i].Init(m_namer, m_vkDevice, m_queueFamilyIndex)) THROW("Failed to create command buffer");
         }
 
@@ -1125,7 +1125,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         std::tie(swapchainData, imageIndex) = m_swapchainImageDataMap.GetDataAndIndexFromBasePointer(swapchainImage);
 
-        const size_t v = viewIndex % 2;
+        if (viewIndex == 0) m_frameSlot ^= 1u;
+        const size_t v = m_frameSlot * 2 + (viewIndex % 2);   // command buffer of (frame slot, eye)
 
         // Double-buffered command execution:
         // Wait for previous frame's GPU completion at the start of view 0,
@@ -1136,6 +1137,27 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // is still drawing the previous frame; only then wait for that frame's fence.
         const tcvr_m2_frame* m2Frame = nullptr;
         if (viewIndex == 0) {
+            // Wait only for the frame that used THIS slot (two frames ago); the previous frame keeps
+            // running on the GPU while we prepare this one. Outside the immersive pass (screen
+            // fallback, whose staging buffer is single) keep the old full serialization.
+            const auto tw = clk::now();
+            const uint32_t s0 = m_frameSlot * 2;
+            // Wait() throws unless the buffer is Executing or Initialized: a buffer already waited
+            // (Executable) must not be waited again -- that exception killed the render thread.
+            auto waitIfRunning = [](CmdBuffer& cb) {
+                if (cb.state == CmdBuffer::CmdBufferState::Executing) cb.Wait();
+            };
+            waitIfRunning(m_cmdBuffer[s0]);
+            waitIfRunning(m_cmdBuffer[s0 + 1]);
+            if (!m_lastM2Drawn) {
+                waitIfRunning(m_cmdBuffer[(s0 + 2) & 3]);
+                waitIfRunning(m_cmdBuffer[(s0 + 3) & 3]);
+            }
+            m_cpuWaitMs += std::chrono::duration<float, std::milli>(clk::now() - tw).count();
+            m_cmdBuffer[s0].Clear();
+            m_cmdBuffer[s0 + 1].Clear();
+            ReadGpuTimestamps();
+            m_m2Renderer.SetFrameSlot(int(m_frameSlot));
             if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m_m2SceneRequested = true;
                 SetM2SceneMode(1);
@@ -1148,20 +1170,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     m_cpuPrepMs += std::chrono::duration<float, std::milli>(clk::now() - tp).count();
                 }
             }
-            const auto tw = clk::now();
-            m_cmdBuffer[0].Wait();
-            m_cmdBuffer[1].Wait();
-            m_cpuWaitMs += std::chrono::duration<float, std::milli>(clk::now() - tw).count();
-            m_cmdBuffer[0].Clear();
-            m_cmdBuffer[1].Clear();
-            ReadGpuTimestamps();
         }
 
         VkCommandBuffer cmd = m_cmdBuffer[v].buf;
         m_cmdBuffer[v].Begin();
         if (m_gpuQueryPool == VK_NULL_HANDLE) CreateGpuQueryPool();
         if (m_gpuQueryPool != VK_NULL_HANDLE) {
-            vkCmdResetQueryPool(cmd, m_gpuQueryPool, uint32_t(v * 2), 2);
+            vkCmdResetQueryPool(cmd, m_gpuQueryPool, uint32_t(v * 2), 2);   // v = slot*2 + eye
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_gpuQueryPool, uint32_t(v * 2));
         }
 
@@ -1449,14 +1464,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qi.queryCount = 4;
+        qi.queryCount = 8;
         if (vkCreateQueryPool(m_vkDevice, &qi, nullptr, &m_gpuQueryPool) != VK_SUCCESS) m_gpuQueryPool = VK_NULL_HANDLE;
     }
 
     void ReadGpuTimestamps() {
-        if (m_gpuQueryPool == VK_NULL_HANDLE || !m_gpuQueryWritten[0] || !m_gpuQueryWritten[1]) return;
+        const uint32_t s0 = m_frameSlot * 2;   // the slot just fenced: its two eyes' queries
+        if (m_gpuQueryPool == VK_NULL_HANDLE || !m_gpuQueryWritten[s0] || !m_gpuQueryWritten[s0 + 1]) return;
         uint64_t ts[4] = {};
-        if (vkGetQueryPoolResults(m_vkDevice, m_gpuQueryPool, 0, 4, sizeof(ts), ts, sizeof(uint64_t),
+        if (vkGetQueryPoolResults(m_vkDevice, m_gpuQueryPool, s0 * 2, 4, sizeof(ts), ts, sizeof(uint64_t),
                                   VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
             return;
         const double ms = (double(ts[1] - ts[0]) + double(ts[3] - ts[2])) * m_timestampPeriodNs * 1e-6;
@@ -1543,7 +1559,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     MemoryAllocator m_memAllocator{};
     ShaderProgram m_shaderProgram{SHADER_PROGRAM_TYPE_GRAPHICS};
     ShaderProgram m_computeShaderProgram{SHADER_PROGRAM_TYPE_COMPUTE};
-    CmdBuffer m_cmdBuffer[2]{};
+    // [frame slot * 2 + eye]: two frames in flight, so the CPU records frame N+1 while the GPU
+    // still draws frame N (measured 22/09: waiting on the fence of the frame just submitted left
+    // the GPU idle during the CPU preparation -> 12-14 ms periods at 90 Hz).
+    CmdBuffer m_cmdBuffer[4]{};
+    uint32_t m_frameSlot{0};
     PipelineLayout m_pipelineLayout{};
     VertexBuffer<Geometry::Vertex> m_drawBuffer{};
     std::array<float, 4> m_clearColor;
@@ -1582,7 +1602,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkPhysicalDeviceFragmentDensityMapFeaturesEXT m_fdmFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
     std::map<const ISwapchainImageData*, std::vector<XrSwapchainImageFoveationVulkanFB>> m_fdmImages;
     VkQueryPool m_gpuQueryPool{VK_NULL_HANDLE};
-    bool m_gpuQueryWritten[2]{false, false};
+    bool m_gpuQueryWritten[4]{false, false, false, false};
     float m_timestampPeriodNs{0.0f};
     std::vector<float> m_gpuSamples;
     std::chrono::steady_clock::time_point m_gpuLogAt{};
