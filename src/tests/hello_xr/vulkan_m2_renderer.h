@@ -604,8 +604,13 @@ public:
         m_lumaramBuffer.Reset(m_vkDevice);
         m_gammaBuffer.Reset(m_vkDevice);
         m_dummyBuffer.Reset(m_vkDevice);
-        m_sheetStagingBuffer.Reset(m_vkDevice);
+        for (int i = 0; i < 2; ++i) {
+            m_sheetStagingBuffer[i].Reset(m_vkDevice);
+            m_sheetStagingMapped[i] = nullptr;
+        }
         for (int i = 0; i < 2; ++i) m_layerStagingBuffer[i].Reset(m_vkDevice);
+        m_texturesUploaded = false;
+        m_texHash = 0;
 
         for (int e = 0; e < 2; ++e) {
             for (int p = 0; p < 2; ++p) {
@@ -885,8 +890,10 @@ private:
                            reinterpret_cast<void**>(&m_iboMapped));
 
         // 4. Staging Buffers
-        createMappedBuffer(m_sheetStagingBuffer, 1024 * 512 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                           reinterpret_cast<void**>(&m_sheetStagingMapped));
+        for (int i = 0; i < 2; ++i) {
+            createMappedBuffer(m_sheetStagingBuffer[i], 1024 * 512 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               reinterpret_cast<void**>(&m_sheetStagingMapped[i]));
+        }
 
         for (int i = 0; i < 2; ++i) {
             createMappedBuffer(m_layerStagingBuffer[i], 512 * 384 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -1119,14 +1126,38 @@ private:
 
     void UploadTextures(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
         if (!frame.textureram[0] || !frame.textureram[1] || frame.textureram_words == 0) return;
-        if (frame.dirty_generation == m_sheetGeneration && m_sheetGeneration != 0) return;
+
+        // Model 2B (Sega Rally) does not update dirty_generation.
+        // Fingerprint both sheets using FNV-1a hash (sampling every 4 words)
+        // exactly matching gpu_renderer.cpp lines 716-724.
+        bool hashChanged = false;
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (int sheet = 0; sheet < 2; sheet++) {
+                const uint32_t* w = frame.textureram[sheet];
+                const uint32_t n = frame.textureram_words;
+                if (!w) continue;
+                for (uint32_t i = 0; i < n; i += 4) { h ^= w[i]; h *= 1099511628211ull; }
+            }
+            if (h != m_texHash) {
+                hashChanged = m_texturesUploaded;
+                m_texHash = h;
+            }
+        }
+
+        const bool needsUpload = !m_texturesUploaded || hashChanged;
+        if (!needsUpload) return;
+
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK: Uploading texture sheets (hashChanged=%d, words=%u)",
+                                         hashChanged ? 1 : 0, frame.textureram_words));
+
         for (int sheet = 0; sheet < 2; sheet++) {
             const uint32_t* words = frame.textureram[sheet];
             const uint32_t wordCount = frame.textureram_words;
             if (!words || wordCount == 0) continue;
 
             const size_t copySize = std::min(size_t(wordCount) * sizeof(uint32_t), size_t(1024 * 512 * 4));
-            memcpy(m_sheetStagingMapped, words, copySize);
+            memcpy(m_sheetStagingMapped[sheet], words, copySize);
 
             // Barrier: UNDEFINED or SHADER_READ_ONLY -> TRANSFER_DST
             VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1147,7 +1178,7 @@ private:
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageOffset = {0, 0, 0};
             region.imageExtent = {1024, 512, 1};
-            vkCmdCopyBufferToImage(cmd, m_sheetStagingBuffer.buf, m_sheetImage[sheet],
+            vkCmdCopyBufferToImage(cmd, m_sheetStagingBuffer[sheet].buf, m_sheetImage[sheet],
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1159,6 +1190,7 @@ private:
 
             m_sheetLayout[sheet] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
+        m_texturesUploaded = true;
         m_sheetGeneration = frame.dirty_generation;
     }
 
@@ -1285,9 +1317,11 @@ private:
     VkDeviceMemory m_sheetMem[2] = {};
     VkImageView m_sheetView[2] = {};
     VkImageLayout m_sheetLayout[2] = {};
-    BufferAndMemory m_sheetStagingBuffer;
-    uint32_t* m_sheetStagingMapped = nullptr;
+    BufferAndMemory m_sheetStagingBuffer[2];
+    uint32_t* m_sheetStagingMapped[2] = {nullptr, nullptr};
     uint64_t m_sheetGeneration = 0;
+    uint64_t m_texHash = 0;
+    bool m_texturesUploaded = false;
 
     VkImage m_layerImage[2] = {};
     VkDeviceMemory m_layerMem[2] = {};

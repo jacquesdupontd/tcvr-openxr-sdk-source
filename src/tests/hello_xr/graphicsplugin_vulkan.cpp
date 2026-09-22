@@ -730,7 +730,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XRC_CHECK_THROW_VKCMD(vkCreateSemaphore(m_vkDevice, &semInfo, nullptr, &m_vkDrawDone));
         XRC_CHECK_THROW_VKCMD(m_namer.SetName(VK_OBJECT_TYPE_SEMAPHORE, (uint64_t)m_vkDrawDone, "hello_xr draw done semaphore"));
 
-        if (!m_cmdBuffer.Init(m_namer, m_vkDevice, m_queueFamilyIndex)) THROW("Failed to create command buffer");
+        for (int i = 0; i < 2; ++i) {
+            if (!m_cmdBuffer[i].Init(m_namer, m_vkDevice, m_queueFamilyIndex)) THROW("Failed to create command buffer");
+        }
 
         m_pipelineLayout.Create(m_vkDevice);
 
@@ -833,14 +835,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 #if defined(USE_MIRROR_WINDOW)
         m_swapchain.Create(m_vkInstance, m_vkPhysicalDevice, m_vkDevice, m_graphicsBinding.queueFamilyIndex);
 
-        m_cmdBuffer.Reset();
-        if (!m_cmdBuffer.Init(m_namer, m_vkDevice, m_queueFamilyIndex)) THROW("Failed to create command buffer");
+        m_cmdBuffer[0].Reset();
+        if (!m_cmdBuffer[0].Init(m_namer, m_vkDevice, m_queueFamilyIndex)) THROW("Failed to create command buffer");
 
-        m_cmdBuffer.Begin();
-        m_swapchain.Prepare(m_cmdBuffer.buf);
-        m_cmdBuffer.End();
-        m_cmdBuffer.Exec(m_vkQueue);
-        m_cmdBuffer.Wait();
+        m_cmdBuffer[0].Begin();
+        m_swapchain.Prepare(m_cmdBuffer[0].buf);
+        m_cmdBuffer[0].End();
+        m_cmdBuffer[0].Exec(m_vkQueue);
+        m_cmdBuffer[0].Wait();
 #endif
     }
 
@@ -903,11 +905,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         return ret;
     }
 
-    void SetViewportAndScissor(const VkRect2D& rect) {
+    void SetViewportAndScissor(VkCommandBuffer cmd, const VkRect2D& rect) {
         VkViewport viewport{
             float(rect.offset.x), float(rect.offset.y), float(rect.extent.width), float(rect.extent.height), 0.0f, 1.0f};
-        vkCmdSetViewport(m_cmdBuffer.buf, 0, 1, &viewport);
-        vkCmdSetScissor(m_cmdBuffer.buf, 0, 1, &rect);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &rect);
     }
 
     void CreateScreenPipeline(VkRenderPass renderPass) {
@@ -1069,8 +1071,20 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         std::tie(swapchainData, imageIndex) = m_swapchainImageDataMap.GetDataAndIndexFromBasePointer(swapchainImage);
 
-        m_cmdBuffer.Clear();
-        m_cmdBuffer.Begin();
+        const size_t v = viewIndex % 2;
+
+        // Double-buffered command execution:
+        // Wait for previous frame's GPU completion at the start of view 0,
+        // allowing the CPU to record without blocking at the end of each eye.
+        if (viewIndex == 0) {
+            m_cmdBuffer[0].Wait();
+            m_cmdBuffer[1].Wait();
+            m_cmdBuffer[0].Clear();
+            m_cmdBuffer[1].Clear();
+        }
+
+        VkCommandBuffer cmd = m_cmdBuffer[v].buf;
+        m_cmdBuffer[v].Begin();
 
         // 1. If viewIndex == 0, check for new MAME frame and upload to m_screenImage via staging buffer
         if (viewIndex == 0) {
@@ -1082,7 +1096,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 const tcvr_m2_frame* m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
                 if (m2Frame) {
-                    m_m2Renderer.PrepareFrame(*m2Frame, m_cmdBuffer.buf);
+                    m_m2Renderer.PrepareFrame(*m2Frame, cmd);
                 }
             }
             arcadexr::video::FrameInfo info;
@@ -1106,7 +1120,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                             barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                             barrier.image = m_screenImage;
                             barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                            vkCmdPipelineBarrier(m_cmdBuffer.buf,
+                            vkCmdPipelineBarrier(cmd,
                                                  (m_screenImageLayout == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                  0, 0, nullptr, 0, nullptr, 1, &barrier);
@@ -1118,14 +1132,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                             region.imageOffset = {0, 0, 0};
                             region.imageExtent = {(uint32_t)got.width, (uint32_t)got.height, 1};
-                            vkCmdCopyBufferToImage(m_cmdBuffer.buf, m_stagingBuffer, m_screenImage,
+                            vkCmdCopyBufferToImage(cmd, m_stagingBuffer, m_screenImage,
                                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
                             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
                             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                             barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                            vkCmdPipelineBarrier(m_cmdBuffer.buf,
+                            vkCmdPipelineBarrier(cmd,
                                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                                  0, 0, nullptr, 0, nullptr, 1, &barrier);
@@ -1145,7 +1159,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         const XrRect2Di& r = layerView.subImage.imageRect;
         VkRect2D renderArea = {{r.offset.x, r.offset.y}, {uint32_t(r.extent.width), uint32_t(r.extent.height)}};
-        SetViewportAndScissor(renderArea);
+        SetViewportAndScissor(cmd, renderArea);
 
         // may be depth, stencil, or both
         // XXX support VK_IMAGE_ASPECT_STENCIL_BIT
@@ -1160,10 +1174,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         if (!swapchainData->DepthSwapchainEnabled()) {
             // Ensure self-made fallback depth is in the right layout
-            swapchainData->TransitionLayout(imageIndex, &m_cmdBuffer, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            swapchainData->TransitionLayout(imageIndex, &m_cmdBuffer[v], VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
 
-        vkCmdBeginRenderPass(m_cmdBuffer.buf, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBeginRenderPass(cmd, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
         // Bind and clear eye render target
         static std::array<VkClearValue, 2> clearValues;
@@ -1183,7 +1197,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         // imageArrayIndex already included in the VkImageView
         VkClearRect clearRect{renderArea, 0, 1};
-        vkCmdClearAttachments(m_cmdBuffer.buf, 2, &clearAttachments[0], 1, &clearRect);
+        vkCmdClearAttachments(cmd, 2, &clearAttachments[0], 1, &clearRect);
 
         // Compute the view-projection transform.
         const auto& pose = layerView.pose;
@@ -1205,7 +1219,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, renderPassBeginInfo.renderPass);
                 m_m2RendererInitialized = true;
             }
-            m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, m_cmdBuffer.buf, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
+            m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, cmd, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
         }
 
         // Render Virtual Arcade Screen fallback
@@ -1238,41 +1252,42 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 XrMatrix4x4f mvp;
                 XrMatrix4x4f_Multiply(&mvp, &vp, &model);
 
-                vkCmdBindPipeline(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
-                vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
                                         0, 1, &m_screenDescriptorSet, 0, nullptr);
-                vkCmdPushConstants(m_cmdBuffer.buf, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+                vkCmdPushConstants(cmd, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
 
-                vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_screenDrawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
                 VkDeviceSize vtxOffset = 0;
-                vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_screenDrawBuffer.vtx.buf, &vtxOffset);
-                vkCmdDrawIndexed(m_cmdBuffer.buf, 6, 1, 0, 0, 0);
+                vkCmdBindIndexBuffer(cmd, m_screenDrawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &m_screenDrawBuffer.vtx.buf, &vtxOffset);
+                vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
             }
         }
 
         // Render cubes
         if (!cubes.empty()) {
-            swapchainData->BindPipeline(m_cmdBuffer.buf, imageArrayIndex);
-            vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+            swapchainData->BindPipeline(cmd, imageArrayIndex);
+            vkCmdBindIndexBuffer(cmd, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
             VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_drawBuffer.vtx.buf, &offset);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m_drawBuffer.vtx.buf, &offset);
 
             for (const Cube& cube : cubes) {
                 XrMatrix4x4f model;
                 XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
                 XrMatrix4x4f mvp;
                 XrMatrix4x4f_Multiply(&mvp, &vp, &model);
-                vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
-                vkCmdDrawIndexed(m_cmdBuffer.buf, m_drawBuffer.count.idx, 1, 0, 0, 0);
+                vkCmdPushConstants(cmd, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+                vkCmdDrawIndexed(cmd, m_drawBuffer.count.idx, 1, 0, 0, 0);
             }
         }
 
-        vkCmdEndRenderPass(m_cmdBuffer.buf);
+        vkCmdEndRenderPass(cmd);
 
-        m_cmdBuffer.End();
-        m_cmdBuffer.Exec(m_vkQueue);
-        // XXX Should double-buffer the command buffers, for now just flush
-        m_cmdBuffer.Wait();
+        m_cmdBuffer[v].End();
+        m_cmdBuffer[v].Exec(m_vkQueue);
+        // Fully asynchronous GPU execution:
+        // Do NOT call m_cmdBuffer[v].Wait() here! Fences are waited at the start
+        // of the next frame (viewIndex == 0).
 
 #if defined(USE_MIRROR_WINDOW)
         // Cycle the window's swapchain on the last view rendered
@@ -1291,6 +1306,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     ~VulkanGraphicsPlugin() override {
         if (m_vkDevice != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(m_vkDevice);
             m_m2Renderer.Cleanup();
             if (m_screenPipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_vkDevice, m_screenPipeline, nullptr);
@@ -1350,7 +1366,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     MemoryAllocator m_memAllocator{};
     ShaderProgram m_shaderProgram{SHADER_PROGRAM_TYPE_GRAPHICS};
     ShaderProgram m_computeShaderProgram{SHADER_PROGRAM_TYPE_COMPUTE};
-    CmdBuffer m_cmdBuffer{};
+    CmdBuffer m_cmdBuffer[2]{};
     PipelineLayout m_pipelineLayout{};
     VertexBuffer<Geometry::Vertex> m_drawBuffer{};
     std::array<float, 4> m_clearColor;
