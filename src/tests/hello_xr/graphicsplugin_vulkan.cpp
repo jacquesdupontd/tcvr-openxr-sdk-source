@@ -41,6 +41,7 @@
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_renderer.h"
 #include "vulkan_overlay.h"
+#include "vulkan_s22_renderer.h"
 #include "menu.h"
 #include "aim_state.h"
 #include <chrono>
@@ -1211,6 +1212,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // 1. If viewIndex == 0, commit the built scene (GPU-visible copies, uploads) and upload the MAME frame
         if (viewIndex == 0) {
             if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);   // frozen: same built arrays re-committed
+            PrepareSystem22(cmd, swapchainData);
             // SCREEN presentation of a Model 2 game: the GPU draws it in the board's projection (MAME can
             // stop rasterising, like in immersive). Falls back to MAME's framebuffer when it cannot.
             m_flatDrawn = false;
@@ -1314,7 +1316,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const std::string presentation = arcadexr::profiles::GetString("presentation", "immersive");
         const bool immersiveAllowed = (presentation == "immersive" && arcadexr::profiles::GetInt("m2.immersive", 1) != 0);
         bool m2ImmersiveDrawn = false;
-        if (immersiveAllowed) {
+        bool s22Drawn = false;
+        if (m_s22Active) {
+            s22Drawn = RenderSystem22Eye(cmd, viewIndex, layerView, swapchainData, imageIndex, renderArea);
+            m2ImmersiveDrawn = s22Drawn;   // the eye image is written: skip the other paths
+        }
+        if (immersiveAllowed && !s22Drawn) {
             EnsureM2Renderer(swapchainData);
             if (m_m2Renderer.HasGeometry()) {
                 const float clear[4] = {m_clearColor[0], m_clearColor[1], m_clearColor[2], 1.0f};
@@ -1600,6 +1607,113 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_overlay.End(cmd);
     }
 
+    // ---- Namco System 22 (Time Crisis, Dirt Dash) immersive, Vulkan module vulkan_s22_renderer.h ----
+    // Port of RenderImmersiveArcadeScene of the GLES plugin: same anchor on the virtual screen, same
+    // camera recovery, same settings (profiles immersive.*), same lightgun ray cast.
+    void PrepareSystem22(VkCommandBuffer cmd, VulkanSwapchainImageData* swapchainData) {
+        namespace s22 = arcadexr::hardware::namco_system22;
+        m_s22Active = false;
+        const bool isS22 = arcadexr::profiles::IsSystem22() && s22::HaveSceneSource();
+        const bool want = isS22 && arcadexr::profiles::GetString("render", "cpu") == "gpu" &&
+                          arcadexr::profiles::GetString("presentation", "screen") == "immersive" &&
+                          arcadexr::config::GetInt("s22.vk", 1) != 0;
+        const int mode = want ? (arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
+        if (isS22 && mode != m_s22SceneMode) {
+            m_s22SceneMode = mode;
+            s22::EnableScene(mode);
+            Log::Write(Log::Level::Info, Fmt("TCVR_S22VK scene recording mode %d", mode));
+        }
+        if (!want) return;
+        if (!m_s22.Ready()) {
+            const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("immersive.msaa", 4)));
+            m_s22.Init(m_vkDevice, &m_memAllocator, VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt), msaa);
+            arcadexr::gun::SetSceneAim(&S22AimTrampoline);
+            s_s22Self = this;
+        }
+        const std::string game = arcadexr::profiles::CurrentGame();
+        if (game != m_s22Game) { m_s22.ResetAssets(); m_s22Game = game; }
+        const tcvr_scene_frame* f = s22::AcquireScene();
+        if (f) m_s22Frame = f;
+        if (!m_s22Frame || m_s22Frame->width <= 0 || m_s22Frame->height <= 0) return;
+        if (!m_s22.AssetsReady()) {
+            tcvr_scene_assets assets{};
+            if (!s22::SceneAssets(assets) || !m_s22.UploadAssets(cmd, assets)) return;
+        }
+        if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
+        m_s22.RenderDepthMap(cmd);
+        m_s22Active = true;
+    }
+
+    bool RenderSystem22Eye(VkCommandBuffer cmd, uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
+                           VulkanSwapchainImageData* swapchainData, uint32_t imageIndex, const VkRect2D& renderArea) {
+        arcadexr::gun::ScreenPlane screen;
+        if (!arcadexr::video::GetVirtualScreen(screen)) return false;
+        const float distance = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
+        const float depthUnits = std::max(100.0f, arcadexr::config::GetFloat("immersive.depth", 5000.0f));
+        const float worldScale = distance / depthUnits;
+        const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance, screen.center.y + screen.normal.y * distance,
+                                         screen.center.z + screen.normal.z * distance};
+        XrMatrix4x4f arcadeToWorld{};
+        arcadeToWorld.m[0] = screen.right.x * worldScale; arcadeToWorld.m[1] = screen.right.y * worldScale; arcadeToWorld.m[2] = screen.right.z * worldScale;
+        arcadeToWorld.m[4] = screen.up.x * worldScale; arcadeToWorld.m[5] = screen.up.y * worldScale; arcadeToWorld.m[6] = screen.up.z * worldScale;
+        arcadeToWorld.m[8] = -screen.normal.x * worldScale; arcadeToWorld.m[9] = -screen.normal.y * worldScale; arcadeToWorld.m[10] = -screen.normal.z * worldScale;
+        arcadeToWorld.m[12] = camera.x; arcadeToWorld.m[13] = camera.y; arcadeToWorld.m[14] = camera.z; arcadeToWorld.m[15] = 1.0f;
+        m_s22AnchorCamera = camera; m_s22AnchorRight = screen.right; m_s22AnchorUp = screen.up; m_s22AnchorNormal = screen.normal;
+        m_s22AnchorScale = worldScale; m_s22AnchorValid = true;
+        const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
+        const float nearMetres = std::max(0.001f, std::min(0.05f, arcadexr::config::GetFloat("immersive.near", 0.005f)));
+        XrMatrix4x4f projection, eyeToWorld, worldToEye, viewProjection, mvp;
+        XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_VULKAN, layerView.fov, nearMetres, farMetres);
+        XrMatrix4x4f_CreateFromRigidTransform(&eyeToWorld, &layerView.pose);
+        XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
+        XrMatrix4x4f_Multiply(&viewProjection, &projection, &worldToEye);
+        XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
+        XrMatrix4x4f hudToWorld{};
+        hudToWorld.m[0] = screen.right.x * screen.width; hudToWorld.m[1] = screen.right.y * screen.width; hudToWorld.m[2] = screen.right.z * screen.width;
+        hudToWorld.m[4] = screen.up.x * screen.height; hudToWorld.m[5] = screen.up.y * screen.height; hudToWorld.m[6] = screen.up.z * screen.height;
+        hudToWorld.m[8] = screen.normal.x; hudToWorld.m[9] = screen.normal.y; hudToWorld.m[10] = screen.normal.z;
+        hudToWorld.m[12] = screen.center.x; hudToWorld.m[13] = screen.center.y; hudToWorld.m[14] = screen.center.z; hudToWorld.m[15] = 1.0f;
+        XrMatrix4x4f hudMvp;
+        XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
+        arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
+        st.depthTest = arcadexr::profiles::GetInt("immersive.depthTest", 1) != 0;
+        st.depthBias = arcadexr::profiles::GetFloat("immersive.depthBias", 4e-8f);
+        {
+            const std::string v = arcadexr::config::GetString("immersive.void", "game");
+            unsigned r = 0, g = 0, b = 0;
+            if (v == "game") st.voidMode = 0;
+            else if (std::sscanf(v.c_str(), "%u,%u,%u", &r, &g, &b) == 3) { st.voidMode = 2; st.voidRGB[0] = r & 255; st.voidRGB[1] = g & 255; st.voidRGB[2] = b & 255; }
+            else st.voidMode = 1;
+        }
+        const int texAa = arcadexr::profiles::GetInt("immersive.texAA", 1);
+        st.texSamples = texAa <= 0 ? 1 : (texAa == 1 ? 4 : 16);
+        st.spriteMinDepth = arcadexr::config::GetFloat("immersive.spriteMinDepth", 50.0f);
+        const float scale = std::max(0.3f, std::min(2.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f)));
+        const VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
+        return m_s22.RenderEye(cmd, viewIndex, mvp.m, hudMvp.m, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, scale, st);
+    }
+
+    bool S22Aim(const XrVector3f& origin, const XrVector3f& direction, float& nx, float& ny, XrVector3f& hitWorld) {
+        if (!m_s22Active || !m_s22AnchorValid || !m_s22Frame) return false;
+        const auto dot = [](const XrVector3f& a, const arcadexr::gun::Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+        const XrVector3f rel{origin.x - m_s22AnchorCamera.x, origin.y - m_s22AnchorCamera.y, origin.z - m_s22AnchorCamera.z};
+        const float o[3] = {dot(rel, m_s22AnchorRight) / m_s22AnchorScale, dot(rel, m_s22AnchorUp) / m_s22AnchorScale, -dot(rel, m_s22AnchorNormal) / m_s22AnchorScale};
+        const float d[3] = {dot(direction, m_s22AnchorRight), dot(direction, m_s22AnchorUp), -dot(direction, m_s22AnchorNormal)};
+        float sx = 0, sy = 0, hit[3] = {0, 0, 0};
+        if (!m_s22.RayCast(o, d, m_s22Frame->width, m_s22Frame->height, sx, sy, hit)) return false;
+        nx = sx / float(m_s22Frame->width);
+        ny = sy / float(m_s22Frame->height);
+        const float sc = m_s22AnchorScale;
+        hitWorld = {m_s22AnchorCamera.x + (m_s22AnchorRight.x * hit[0] + m_s22AnchorUp.x * hit[1] - m_s22AnchorNormal.x * hit[2]) * sc,
+                    m_s22AnchorCamera.y + (m_s22AnchorRight.y * hit[0] + m_s22AnchorUp.y * hit[1] - m_s22AnchorNormal.y * hit[2]) * sc,
+                    m_s22AnchorCamera.z + (m_s22AnchorRight.z * hit[0] + m_s22AnchorUp.z * hit[1] - m_s22AnchorNormal.z * hit[2]) * sc};
+        return true;
+    }
+    static inline VulkanGraphicsPlugin* s_s22Self = nullptr;
+    static bool S22AimTrampoline(const XrVector3f& o, const XrVector3f& d, float& nx, float& ny, XrVector3f& hit) {
+        return s_s22Self && s_s22Self->S22Aim(o, d, nx, ny, hit);
+    }
+
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
         if (m_m2RendererInitialized) return;
         const VkFormat fmt = VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt);
@@ -1693,6 +1807,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             vkDeviceWaitIdle(m_vkDevice);
             m_m2Renderer.Cleanup();
             m_overlay.Destroy();
+            m_s22.Destroy();
             if (m_gpuQueryPool != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(m_vkDevice, m_gpuQueryPool, nullptr);
                 m_gpuQueryPool = VK_NULL_HANDLE;
@@ -1793,6 +1908,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_m2SceneMode{-1};
     bool m_fdmEnabled{false};
     bool m_lastM2Drawn{false};
+    arcadexr::vulkan::VulkanSystem22Renderer m_s22;
+    bool m_s22Active{false};
+    int m_s22SceneMode{-1};
+    std::string m_s22Game;
+    const tcvr_scene_frame* m_s22Frame{nullptr};
+    arcadexr::gun::Vec3 m_s22AnchorCamera{}, m_s22AnchorRight{}, m_s22AnchorUp{}, m_s22AnchorNormal{};
+    float m_s22AnchorScale{1.0f};
+    bool m_s22AnchorValid{false};
     bool m_flatDrawn{false};
     VkDescriptorSet m_flatDescriptorSet{VK_NULL_HANDLE};
     VkSampler m_flatSampler{VK_NULL_HANDLE};
