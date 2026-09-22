@@ -64,11 +64,8 @@ layout(std430, set = 0, binding = 5) readonly buffer Gamma     { uint gammaTab[]
 layout(std430, set = 0, binding = 6) readonly buffer Tex0      { uint tex0[]; };
 layout(std430, set = 0, binding = 7) readonly buffer Tex1      { uint tex1[]; };
 
-// Texture sheets, one texel per byte, R8_UNORM holding t*17 (t = the 4-bit Model 2 texel):
-// texelFetch gives the exact texel back, and the SAME image can be sampled with the
-// hardware bilinear filter, which is what the new path (uFilterMode 5) does.
-layout(set = 0, binding = 8) uniform sampler2D uSheetTex0;
-layout(set = 0, binding = 9) uniform sampler2D uSheetTex1;
+layout(set = 0, binding = 8) uniform usampler2D uSheetTex0;
+layout(set = 0, binding = 9) uniform usampler2D uSheetTex1;
 
 uint u16at(uint arr_index_hi_lo, uint packed) {
     return (arr_index_hi_lo == 0u) ? (packed & 0xffffu) : (packed >> 16);
@@ -86,8 +83,7 @@ uint get_texel(uint base_x, uint base_y, int x, int y, uint sheet) {
         y2 ^= 1024;
     }
     ivec2 at = ivec2(x2, y2);
-    float f = (sheet == 0u) ? texelFetch(uSheetTex0, at, 0).r : texelFetch(uSheetTex1, at, 0).r;
-    return uint(f * 15.0 + 0.5);
+    return (sheet == 0u) ? texelFetch(uSheetTex0, at, 0).r : texelFetch(uSheetTex1, at, 0).r;
 }
 
 uint lerp_packed(uint x, uint y, uint a) {
@@ -299,202 +295,82 @@ vec4 shaded_sample(Prim p, int level, int max_level, int mml, int u, int v, bool
     return vec4(shade(p, luma, 0x7fffu), keep);
 }
 
-
-// ---------------------------------------------------------------------------------------
-// uFilterMode 5 -- "the board's own filter, done by the texture unit" (opus55, 22/09).
-//
-// On the real Model 2 the filtered quantity is t, the 4-bit texel (an intensity that indexes
-// the tone curve lumaram); colour comes AFTER, once, from the polygon's palette entry.
-// So: filter t with the hardware sampler (bilinear inside a mip level, trilinear between
-// the board's own mip levels, anisotropic taps along the pixel footprint), then run the
-// colour chain ONCE per pixel. Same arithmetic order as MAME, a fraction of the fetches.
-//
-// The mip level comes from the SCREEN derivatives of the texel coordinates -- the real
-// density of the headset's pixels -- not from the board's depth LOD, which was calibrated
-// for a 496x384 screen and picked mips that shimmered (too sharp) or smeared under a
-// 2000-pixel-wide eye. That is the anti-shimmer.
-// ---------------------------------------------------------------------------------------
-
-// Storage position of texel (x, y) of the logical 2048x1024 sheet (MAME get_texel fold).
-ivec2 sheet_at(int x2, int y2) {
-    if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
-    return ivec2(x2, y2);
-}
-
-// Filtered t (0..15) of one mip level at continuous LEVEL-0 texel coordinate tc.
-float level_t(Prim p, int L, vec2 tc) {
-    uint w = p.texwidth >> uint(L), h = p.texheight >> uint(L);
-    int ox = int(((p.texx - 2048u) >> uint(L)) & 2047u);
-    int oy = int(((p.texy - 1024u) >> uint(L)) & 1023u);
-    uint sheet = ((L & 1) == 0) ? p.texsheet : (1u - p.texsheet);
-    vec2 c = tc / float(1 << L);
-    vec2 wh = vec2(float(w), float(h));
-    if (p.texmirrorx != 0u) { float m = mod(c.x, 2.0 * wh.x); c.x = (m >= wh.x) ? (2.0 * wh.x - m) : m; }
-    if (p.texmirrory != 0u) { float m = mod(c.y, 2.0 * wh.y); c.y = (m >= wh.y) ? (2.0 * wh.y - m) : m; }
-    c -= 0.5;
-    vec2 i0f = floor(c);
-    vec2 f = c - i0f;
-    int u0 = int(mod(i0f.x, wh.x)), v0 = int(mod(i0f.y, wh.y));
-    // Interior of the region, both taps inside and no sheet fold crossed: one hardware tap.
-    ivec2 b0 = sheet_at(ox + u0, oy + v0);
-    ivec2 b1 = sheet_at(ox + u0 + 1, oy + v0 + 1);
-    if (u0 + 1 < int(w) && v0 + 1 < int(h) && b1 == b0 + ivec2(1)) {
-        vec2 uv = (vec2(b0) + 0.5 + f) / vec2(1024.0, 4096.0);
-        float r = (sheet == 0u) ? textureLod(uSheetTex0, uv, 0.0).r : textureLod(uSheetTex1, uv, 0.0).r;
-        return r * 15.0;
-    }
-    // Seam of a tiled / clamped region: the board's own 4 taps (wrap, or clamp when off).
-    int u1 = (u0 + 1) % int(w), v1 = (v0 + 1) % int(h);
-    if (p.texwrapx == 0u && u1 == 0) { if (f.x >= 0.5) { u0 = 0; u1 = 1; f.x = 0.0; } else { u1 = u0; u0 = u0 - 1; f.x = 1.0; } }
-    if (p.texwrapy == 0u && v1 == 0) { if (f.y >= 0.5) { v0 = 0; v1 = 1; f.y = 0.0; } else { v1 = v0; v0 = v0 - 1; f.y = 1.0; } }
-    float t00 = float(get_texel(uint(ox), uint(oy), u0, v0, sheet));
-    float t01 = float(get_texel(uint(ox), uint(oy), u1, v0, sheet));
-    float t10 = float(get_texel(uint(ox), uint(oy), u0, v1, sheet));
-    float t11 = float(get_texel(uint(ox), uint(oy), u1, v1, sheet));
-    return mix(mix(t00, t01, f.x), mix(t10, t11, f.x), f.y);
-}
-
-// Microtexture (detail texture, 128x128 on the other sheet) at level-0 coordinate tc.
-float micro_t(Prim p, vec2 tc) {
-    vec2 c = tc * float(1 << (1 << int(p.utexminlod))) - 0.5;
-    vec2 i0f = floor(c); vec2 f = c - i0f;
-    int u0 = int(mod(i0f.x, 128.0)), v0 = int(mod(i0f.y, 128.0));
-    int u1 = (u0 + 1) & 127, v1 = (v0 + 1) & 127;
-    uint sheet = 1u - p.texsheet;
-    float t00 = float(get_texel(p.utexx, p.utexy, u0, v0, sheet));
-    float t01 = float(get_texel(p.utexx, p.utexy, u1, v0, sheet));
-    float t10 = float(get_texel(p.utexx, p.utexy, u0, v1, sheet));
-    float t11 = float(get_texel(p.utexx, p.utexy, u1, v1, sheet));
-    return mix(mix(t00, t01, f.x), mix(t10, t11, f.x), f.y);
-}
-
-// Trilinear t at coordinate tc for a fractional level lod (already clamped >= 0).
-float tri_t(Prim p, vec2 tc, float lod, int max_level) {
-    int L = min(int(lod), max_level);
-    float t = level_t(p, L, tc);
-    float fr = lod - float(L);
-    if (L < max_level && fr > 0.004) t = mix(t, level_t(p, L + 1, tc), fr);
-    return t;
-}
-
-// Colour chain, once: filtered t -> lumaram tone curve -> palette -> colorxlat -> gamma.
-vec3 tone(Prim p, float t) {
-    uint t8 = min(uint(t * 16.0 + 0.5), 0xf0u);
-    uint luma = (lumaram8(p.lumabase + (t8 >> 1)) * p.luma) / 256u;
-    return shade(p, min(luma, 0x3fu), 0x7fffu);
-}
-
 void main() {
     Prim p = prims[vPrim];
-#ifndef NO_DISCARD
     ivec2 pix = (uImmersive != 0) ? ivec2(floor(vBoard)) : ivec2(gl_FragCoord.xy) / uScale;
     if ((uImmersive == 0 || vSecondary != 0u) && (pix.x < p.clip_l || pix.x > p.clip_r || pix.y < p.clip_t || pix.y > p.clip_b)) discard;
     if (p.checker != 0u) {
         ivec2 fine = ivec2(gl_FragCoord.xy);
         if (uStipple == 0 && ((fine.x ^ fine.y) & 1) == 0) discard;
     }
-#endif
     bool glass = (p.checker != 0u) && (uStipple != 0);
+    if (uPass == 1 && glass) discard;
+    if (uPass == 0) {
+        if (glass || p.translucent != 0u) discard;
+        bool sel = (uPrepassClass >= 3) || (p.textured == 0u) || (uPrepassClass >= 2 && p.utex != 0u);
+        if (!sel) discard;
+    }
     float outAlpha = glass ? 0.5 : 1.0;
-
-    // Texel coordinates and their screen derivatives, in uniform control flow.
-    bool mainView = (uImmersive != 0 && vSecondary == 0u);
-    float ooz = vParam.x, uoz = vParam.y, voz = vParam.z;
-    if (mainView) { float zb = max(vParam.z, 1e-6); ooz = 1.0 / zb; uoz = vParam.x * ooz; voz = vParam.y * ooz; }
-    ooz = max(ooz, 1e-9);
-    float z = 1.0 / ooz;
-    vec2 tc = vec2(uoz, voz) * z;          // level-0 texel units (u, v / 256)
-    vec2 dx = dFdx(tc), dy = dFdy(tc);
-
     if (p.textured == 0u) {
-#ifndef NO_DISCARD
         if (p.translucent != 0u) discard;
-#endif
+        if (uPass == 0) return;
         oColor = vec4(shade(p, p.luma >> 2, 0xffffu), outAlpha);
-    } else {
-        bool translucent = (p.translucent != 0u);
-        uint texmin = min(p.texwidth, p.texheight);
-        int max_level = (texmin == 0u) ? 0 : max(findMSB(texmin) - 1, 0);
-        int u = int(tc.x * 256.0), v = int(tc.y * 256.0);
-        if (uFilterMode == 5 && mainView && !translucent) {
-            float lx = dot(dx, dx), ly = dot(dy, dy);
-            vec2 maj = (lx >= ly) ? dx : dy;
-            float majL = sqrt(max(lx, ly)), minL = sqrt(max(min(lx, ly), 1e-12));
-            float n = clamp(ceil(majL / minL), 1.0, float(max(uAniso, 1)));
-            float lod = log2(max(majL / n, minL)) + float(uMipBias) / 128.0;
-            float t;
-            if (lod < 0.0 && p.utex != 0u) {
-                // Close up: the board fades its microtexture in, weighted by how far below level 0.
-                float tb = level_t(p, 0, tc);
-                float w = min(-lod * 128.0 / float(1 << int(p.utexminlod)), 127.0) / 256.0;
-                t = mix(tb, micro_t(p, tc), w);
-            } else {
-                float l = max(lod, 0.0);
-                if (n <= 1.0) {
-                    t = tri_t(p, tc, l, max_level);
-                } else {
-                    t = 0.0;
-                    for (int i = 0; i < 8; i++) {
-                        if (float(i) >= n) break;
-                        t += tri_t(p, tc + maj * ((float(i) + 0.5) / n - 0.5), l, max_level);
-                    }
-                    t /= n;
-                }
-            }
-            oColor = vec4(tone(p, t), outAlpha);
-        } else {
-            // Board path (cut-outs, secondary views, legacy modes): MAME's taps and alpha reject.
-            int mml;
-            if (mainView && uFilterMode == 5) {
-                float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-12)) + float(uMipBias) / 128.0;
-                mml = int(lod * 128.0);
-            } else {
-                mml = -p.texlod + fast_log2(z);
-                if (mainView) mml += uMipBias;
-            }
-            int level = clamp(mml >> 7, 0, max_level);
-            int fm = (uFilterMode == 5) ? 2 : uFilterMode;
-            vec4 base;
-            if (fm == 3) base = fetch_bilinear_rgb(p, level, u, v, translucent);
-            else if (fm == 4) {
-                base = fetch_bilinear_rgb(p, level, u, v, translucent);
-                if (mml > 0 && level < max_level) base = mix(base, fetch_bilinear_rgb(p, level + 1, u, v, translucent), float(mml & 127) / 128.0);
-            } else {
-                uint t;
-                if (fm == 0) t = fetch_nearest_texel(p, level, u, v, translucent);
-                else {
-                    t = fetch_bilinear_texel(p, level, u, v, translucent);
-                    if (fm == 2 && mml > 0 && level < max_level)
-                        t = lerp_packed(t, fetch_bilinear_texel(p, level + 1, u, v, translucent), uint((mml & 127) << 1));
-                    else if (fm == 2 && p.utex != 0u && mml < 0)
-                        t = lerp_packed(t, fetch_bilinear_texel(p, -1, u, v, translucent), uint(min(-mml >> int(p.utexminlod), 127)));
-                }
-                float keep = 1.0;
-                if (translucent) { if (t < 0x00400000u) keep = 0.0; t &= 0xffu; }
-                uint luma = (lumaram8(p.lumabase + (t >> 1)) * p.luma) / 256u;
-                base = vec4(shade(p, min(luma, 0x3fu), 0x7fffu), keep);
-            }
-            float acov = 1.0;
-#ifndef NO_DISCARD
-            if (translucent) {
-                if (uAlphaCoverage != 0 && mainView) {
-                    acov = clamp((base.a - 0.5) / max(fwidth(base.a), 1.0 / 255.0) + 0.5, 0.0, 1.0);
-                    if (acov <= 0.0) discard;
-                } else if (base.a < 0.5) {
-                    discard;
-                }
-            }
-#endif
-            oColor = vec4(base.rgb, (uAlphaCoverage != 0 && mainView && translucent) ? acov : outAlpha);
+        return;
+    }
+    bool translucent = (p.translucent != 0u);
+    float ooz = vParam.x;
+    float uoz = vParam.y;
+    float voz = vParam.z;
+    if (uImmersive != 0 && vSecondary == 0u) { float zb = max(vParam.z, 1e-6); ooz = 1.0 / zb; uoz = vParam.x * ooz; voz = vParam.y * ooz; }
+    if (ooz <= 0.0) discard;
+    if (uPass == 0) return;
+
+    float z = 1.0 / ooz;
+    uint texmin = min(p.texwidth, p.texheight);
+    int max_level = (texmin == 0u) ? 0 : max(findMSB(texmin) - 1, 0);
+    int mml = -p.texlod + fast_log2(z);
+    if (uImmersive != 0 && vSecondary == 0u) mml += uMipBias;
+    int level = clamp(mml >> 7, 0, max_level);
+    int u = int(uoz * z * 256.0);
+    int v = int(voz * z * 256.0);
+
+    vec4 base = shaded_sample(p, level, max_level, mml, u, v, translucent);
+    bool useCov = (uAlphaCoverage != 0) && (uImmersive != 0) && (vSecondary == 0u);
+    float acov = 1.0;
+    if (translucent) {
+        if (useCov) {
+            acov = clamp((base.a - 0.5) / max(fwidth(base.a), 1.0/255.0) + 0.5, 0.0, 1.0);
+            if (acov <= 0.0) discard;
+        } else if (base.a < 0.5) {
+            discard;
         }
     }
-    if (mainView && uEdgeFade > 0.5) {
+    vec3 rgb = base.rgb;
+    if (uImmersive != 0 && vSecondary == 0u && uAniso > 1) {
+        vec2 ax = vec2(dFdx(float(u)), dFdx(float(v)));
+        vec2 ay = vec2(dFdy(float(u)), dFdy(float(v)));
+        vec2 maj = (dot(ax, ax) >= dot(ay, ay)) ? ax : ay;
+        float wsum = 1.0;
+        for (int i = 0; i < 8; i++) {
+            if (i >= uAniso - 1) break;
+            float off = (float(i) + 1.0) / float(uAniso) - 0.5;
+            int su = u + int(maj.x * off);
+            int sv = v + int(maj.y * off);
+            vec4 sm = shaded_sample(p, level, max_level, mml, su, sv, translucent);
+            rgb += sm.rgb * sm.a;
+            wsum += sm.a;
+        }
+        rgb /= wsum;
+    }
+    oColor = vec4(rgb, useCov ? acov : outAlpha);
+    if (uImmersive != 0 && vSecondary == 0u && uEdgeFade > 0.5) {
         vec4 cl = vec4(uMainClip);
         float d = min(min(vBoard.x - cl.x, cl.z - vBoard.x), min(vBoard.y - cl.y, cl.w - vBoard.y));
-        float fe = clamp(d / uEdgeFade, 0.0, 1.0);
-        float hr = (uHorizonRow >= 0.0) ? uHorizonRow : 192.0;
-        oColor.rgb = mix((vBoard.y > hr) ? uGround : uSky, oColor.rgb, fe);
+        float f = clamp(d / uEdgeFade, 0.0, 1.0);
+        float h = (uHorizonRow >= 0.0) ? uHorizonRow : 192.0;
+        vec3 voidc = (vBoard.y > h) ? uGround : uSky;
+        oColor.rgb = mix(voidc, oColor.rgb, f);
     }
     if (uImmersive != 0) oColor.rgb = clamp((oColor.rgb - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0);
-    if (!glass && !(uAlphaCoverage != 0 && mainView && p.translucent != 0u)) oColor.a = 1.0;
+    oColor.a = 1.0;
 }

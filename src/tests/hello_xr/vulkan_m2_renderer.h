@@ -17,7 +17,9 @@
 
 #include "m2_vert_spv.h"
 #include "m2_frag_spv.h"
+#include "m2_frag_nd_spv.h"
 #include "quad_vert_spv.h"
+#include "quad_far_vert_spv.h"
 #include "void_frag_spv.h"
 #include "plane_frag_spv.h"
 
@@ -153,19 +155,21 @@ public:
 
         // 4. Create Shader Modules
         m_quadVertModule = CreateShaderModule(c_quad_vertSpv, sizeof(c_quad_vertSpv));
+        m_quadFarVertModule = CreateShaderModule(c_quad_far_vertSpv, sizeof(c_quad_far_vertSpv));
         m_voidFragModule = CreateShaderModule(c_void_fragSpv, sizeof(c_void_fragSpv));
         m_planeFragModule = CreateShaderModule(c_plane_fragSpv, sizeof(c_plane_fragSpv));
         m_m2VertModule = CreateShaderModule(m2_vert_spv, sizeof(m2_vert_spv));
         m_m2FragModule = CreateShaderModule(c_m2_fragSpv, sizeof(c_m2_fragSpv));
+        m_m2FragNdModule = CreateShaderModule(c_m2_fragNoDiscardSpv, sizeof(c_m2_fragNoDiscardSpv));
 
         // 5. Create Pipelines
         CreatePipelines(renderPass);
 
         // 6. Allocate Samplers
-        // Sheet sampler: Nearest, Clamp
+        // Sheet sampler: LINEAR (the hardware bilinear of filter mode 5; texelFetch ignores it), Clamp
         VkSamplerCreateInfo sheetSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sheetSamplerInfo.magFilter = VK_FILTER_NEAREST;
-        sheetSamplerInfo.minFilter = VK_FILTER_NEAREST;
+        sheetSamplerInfo.magFilter = VK_FILTER_LINEAR;
+        sheetSamplerInfo.minFilter = VK_FILTER_LINEAR;
         sheetSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         sheetSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sheetSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -289,8 +293,9 @@ public:
             m_rawVerts.resize(vcount * 5);
             m_rawPrimOfVertex.resize(vcount);
             m_rawIdx.resize(icount);
-            std::vector<std::uint32_t> rawGlassIdx;
+            std::vector<std::uint32_t> rawGlassIdx, rawCutIdx;
             rawGlassIdx.reserve(icount / 8);
+            rawCutIdx.reserve(icount / 4);
 
             std::size_t vo = 0, io = 0;
             std::uint32_t last_zsort = 0xffffffffu;
@@ -320,7 +325,21 @@ public:
                 }
 
                 const bool isGlass = (q.checker != 0u);
-                if (isGlass) {
+                const bool isMain = q.center_x == mainCx && q.center_y == mainCy &&
+                                    std::abs(q.clip_l - mainL) <= 2 && std::abs(q.clip_t - mainT) <= 2 &&
+                                    std::abs(q.clip_r - mainR) <= 2 && std::abs(q.clip_b - mainB) <= 2;
+                // Untextured + translucent draws NOTHING on the board (draw_scanline_solid returns).
+                const bool invisible = q.textured == 0u && q.translucent != 0u;
+                // Discard-free: opaque, no stipple, main camera (secondary views need the clip test).
+                const bool fast = !isGlass && q.translucent == 0u && isMain;
+                if (invisible) {
+                } else if (!isGlass && !fast) {
+                    for (std::uint32_t t = 1; t + 1 < vc; t++) {
+                        rawCutIdx.push_back(q.first_vertex);
+                        rawCutIdx.push_back(q.first_vertex + t);
+                        rawCutIdx.push_back(q.first_vertex + t + 1);
+                    }
+                } else if (isGlass) {
                     for (std::uint32_t t = 1; t + 1 < vc; t++) {
                         rawGlassIdx.push_back(q.first_vertex);
                         rawGlassIdx.push_back(q.first_vertex + t);
@@ -336,6 +355,8 @@ public:
                 vo += vc;
             }
 
+            m_fastIndexCount = unsigned(io);
+            for (std::uint32_t idx : rawCutIdx) m_rawIdx[io++] = idx;
             m_opaqueIndexCount = unsigned(io);
             m_glassIndexCount = unsigned(rawGlassIdx.size());
             for (std::uint32_t idx : rawGlassIdx) {
@@ -468,8 +489,8 @@ public:
             ubo.uHorizonRow = m_horizonGeo;
             ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
             ubo.uGround[0] = m_groundColor[0]; ubo.uGround[1] = m_groundColor[1]; ubo.uGround[2] = m_groundColor[2];
-            ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1)));
-            ubo.uFilterMode = std::max(0, std::min(4, arcadexr::config::GetInt("m2.filter", 1)));
+            ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 4)));
+            ubo.uFilterMode = std::max(0, std::min(5, arcadexr::config::GetInt("m2.filter", 5)));
             ubo.uMipBias = std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0)));
             ubo.uAlphaCoverage = arcadexr::config::GetInt("m2.alphaCoverage", 0);
             ubo.uContrast = arcadexr::config::GetFloat("contrast", 1.2f);
@@ -481,33 +502,10 @@ public:
         const float outW = float(renderAreaExtent.width);
         const float outH = float(renderAreaExtent.height);
 
-        // 1. DrawVoid
-        float invMvp[16];
-        if (InvertMatrix4x4(mvp.m, invMvp)) {
-            VoidPushConstants voidPc{};
-            memcpy(voidPc.uInvMvp, invMvp, sizeof(invMvp));
-            voidPc.uSky[0] = m_voidColor[0]; voidPc.uSky[1] = m_voidColor[1]; voidPc.uSky[2] = m_voidColor[2]; voidPc.uSky[3] = 1.0f;
-            voidPc.uGround[0] = m_groundColor[0]; voidPc.uGround[1] = m_groundColor[1]; voidPc.uGround[2] = m_groundColor[2]; voidPc.uGround[3] = 1.0f;
-            voidPc.uOutSize[0] = outW; voidPc.uOutSize[1] = outH;
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_voidPipeline);
-            vkCmdPushConstants(cmd, m_voidPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(voidPc), &voidPc);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-        }
-
-        // 2. DrawPlaneLayer (Back 2D)
-        if (m_haveLayer[1]) {
-            PlanePushConstants backPc{};
-            memcpy(backPc.uHudMvp, hudMvpBack.m, sizeof(hudMvpBack.m));
-            backPc.uOutSize[0] = outW; backPc.uOutSize[1] = outH;
-            backPc.uKeyZero = 0;
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[1], 0, nullptr);
-            vkCmdPushConstants(cmd, m_planePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(backPc), &backPc);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-        }
-
+        // Debug, live: debug.tcvr.m2.vkskip bitmask to time each pass on the headset.
+        // 1 void, 2 back plane, 4 discard-free opaque, 8 cut-outs/secondary, 16 glass, 32 front HUD.
+        const int skip = arcadexr::config::GetInt("m2.vkskip", 0);
+        const bool bgFar = true;  // background is drawn after the geometry: far-plane, depth-tested
         // 3. Draw Model 2 Geometry
         if (m_opaqueIndexCount > 0) {
             VkBuffer vtxBufs[2] = { m_vboBuffer.buf, m_primIndexBuffer.buf };
@@ -516,12 +514,48 @@ public:
             vkCmdBindIndexBuffer(cmd, m_iboBuffer.buf, 0, VK_INDEX_TYPE_UINT32);
 
             // Pass 1: Opaque
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineOpaque);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSet[eye][0], 0, nullptr);
-            vkCmdDrawIndexed(cmd, m_opaqueIndexCount, 1, 0, 0, 0);
+            if (m_fastIndexCount > 0 && !(skip & 4)) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineFast);
+                vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
+            }
+            if (m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineOpaque);
+                vkCmdDrawIndexed(cmd, m_opaqueIndexCount - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
+            }
 
-            // Pass 2: Glass
-            if (m_glassIndexCount > 0) {
+            // Background AFTER the opaque geometry, depth-tested on the far plane (m2.bgAfter=1):
+            // void + back 2D layer now shade only the pixels no polygon covered.
+        // 1. DrawVoid
+            float invMvp[16];
+            if (!(skip & 1) && InvertMatrix4x4(mvp.m, invMvp)) {
+                VoidPushConstants voidPc{};
+                memcpy(voidPc.uInvMvp, invMvp, sizeof(invMvp));
+                voidPc.uSky[0] = m_voidColor[0]; voidPc.uSky[1] = m_voidColor[1]; voidPc.uSky[2] = m_voidColor[2]; voidPc.uSky[3] = 1.0f;
+                voidPc.uGround[0] = m_groundColor[0]; voidPc.uGround[1] = m_groundColor[1]; voidPc.uGround[2] = m_groundColor[2]; voidPc.uGround[3] = 1.0f;
+                voidPc.uOutSize[0] = outW; voidPc.uOutSize[1] = outH;
+    
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_voidPipelineFar : m_voidPipeline));
+                vkCmdPushConstants(cmd, m_voidPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(voidPc), &voidPc);
+                vkCmdDraw(cmd, 3, 1, 0, 0);
+            }
+    
+            // 2. DrawPlaneLayer (Back 2D)
+            if (m_haveLayer[1] && !(skip & 2)) {
+                PlanePushConstants backPc{};
+                memcpy(backPc.uHudMvp, hudMvpBack.m, sizeof(hudMvpBack.m));
+                backPc.uOutSize[0] = outW; backPc.uOutSize[1] = outH;
+                backPc.uKeyZero = 0;
+    
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_planePipelineFar : m_planePipeline));
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[1], 0, nullptr);
+                vkCmdPushConstants(cmd, m_planePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(backPc), &backPc);
+                vkCmdDraw(cmd, 3, 1, 0, 0);
+            }
+    
+    
+            // Pass 2: Glass (after the background: it blends over what is really behind it)
+            if (m_glassIndexCount > 0 && !(skip & 16)) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineGlass);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSet[eye][1], 0, nullptr);
                 vkCmdDrawIndexed(cmd, m_glassIndexCount, 1, m_opaqueIndexCount, 0, 0);
@@ -529,7 +563,7 @@ public:
         }
 
         // 4. DrawPlaneLayer (Front 2D HUD)
-        if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0) {
+        if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0 && !(skip & 32)) {
             PlanePushConstants frontPc{};
             memcpy(frontPc.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
             frontPc.uOutSize[0] = outW; frontPc.uOutSize[1] = outH;
@@ -543,8 +577,8 @@ public:
 
         static unsigned s_immFrames = 0;
         if ((s_immFrames++ % 120u) == 0u) {
-            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u prims=%zu opq=%u gls=%u res=%ux%u",
-                                             eye, m_rawPrims.size(), m_opaqueIndexCount, m_glassIndexCount,
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u prims=%zu fast=%u opq=%u gls=%u res=%ux%u",
+                                             eye, m_rawPrims.size(), m_fastIndexCount, m_opaqueIndexCount, m_glassIndexCount,
                                              renderAreaExtent.width, renderAreaExtent.height));
         }
 
@@ -566,6 +600,9 @@ public:
 
         auto destroyPipe = [&](VkPipeline& p) { if (p != VK_NULL_HANDLE) { vkDestroyPipeline(m_vkDevice, p, nullptr); p = VK_NULL_HANDLE; } };
         destroyPipe(m_m2PipelineOpaque);
+        destroyPipe(m_m2PipelineFast);
+        destroyPipe(m_voidPipelineFar);
+        destroyPipe(m_planePipelineFar);
         destroyPipe(m_m2PipelineGlass);
         destroyPipe(m_voidPipeline);
         destroyPipe(m_planePipeline);
@@ -582,6 +619,8 @@ public:
         auto destroyMod = [&](VkShaderModule& m) { if (m != VK_NULL_HANDLE) { vkDestroyShaderModule(m_vkDevice, m, nullptr); m = VK_NULL_HANDLE; } };
         destroyMod(m_m2VertModule);
         destroyMod(m_m2FragModule);
+        destroyMod(m_m2FragNdModule);
+        destroyMod(m_quadFarVertModule);
         destroyMod(m_quadVertModule);
         destroyMod(m_voidFragModule);
         destroyMod(m_planeFragModule);
@@ -693,6 +732,11 @@ private:
             pipeInfo.renderPass = renderPass;
 
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_voidPipeline));
+            // Far-plane variant, depth-tested: drawn after the geometry, shades only the sky.
+            stages[0].module = m_quadFarVertModule;
+            dsState.depthTestEnable = VK_TRUE;
+            dsState.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+            XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_voidPipelineFar));
         }
 
         // --- 2. Plane Pipeline ---
@@ -744,6 +788,10 @@ private:
             pipeInfo.renderPass = renderPass;
 
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_planePipeline));
+            stages[0].module = m_quadFarVertModule;
+            dsState.depthTestEnable = VK_TRUE;
+            dsState.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+            XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_planePipelineFar));
         }
 
         // --- 3. Model 2 Pipelines (Opaque & Glass) ---
@@ -808,6 +856,11 @@ private:
             pipeInfo.renderPass = renderPass;
 
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineOpaque));
+            // Same state, fragment shader compiled WITHOUT any discard: the Adreno keeps its
+            // early depth rejection (LRZ) on for these, so hidden fragments are never shaded.
+            stages[1].module = m_m2FragNdModule;
+            XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineFast));
+            stages[1].module = m_m2FragModule;
 
             // Glass depth state: test=TRUE, write=FALSE, LESS_OR_EQUAL
             VkPipelineDepthStencilStateCreateInfo dsGlass{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -913,7 +966,7 @@ private:
             imgInfo.extent.depth = 1;
             imgInfo.mipLevels = 1;
             imgInfo.arrayLayers = 1;
-            imgInfo.format = VK_FORMAT_R8_UINT;
+            imgInfo.format = VK_FORMAT_R8_UNORM;
             imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -929,7 +982,7 @@ private:
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = m_sheetImage[s];
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = VK_FORMAT_R8_UINT;
+            viewInfo.format = VK_FORMAT_R8_UNORM;
             viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             viewInfo.subresourceRange.baseMipLevel = 0;
             viewInfo.subresourceRange.levelCount = 1;
@@ -1168,10 +1221,10 @@ private:
                 const uint32_t x0 = xh0 * 2;
                 const uint32_t y0 = yh0 * 2;
                 const uint32_t w0 = w & 0xffff;
-                dst[y0 * 1024 + x0] = (w0 >> 12) & 0xf;
-                dst[y0 * 1024 + (x0 + 1)] = (w0 >> 8) & 0xf;
-                dst[(y0 + 1) * 1024 + x0] = (w0 >> 4) & 0xf;
-                dst[(y0 + 1) * 1024 + (x0 + 1)] = w0 & 0xf;
+                dst[y0 * 1024 + x0] = ((w0 >> 12) & 0xf) * 17;
+                dst[y0 * 1024 + (x0 + 1)] = ((w0 >> 8) & 0xf) * 17;
+                dst[(y0 + 1) * 1024 + x0] = ((w0 >> 4) & 0xf) * 17;
+                dst[(y0 + 1) * 1024 + (x0 + 1)] = (w0 & 0xf) * 17;
 
                 const uint32_t off1 = off0 + 1;
                 const uint32_t yh1 = off1 / 512;
@@ -1179,10 +1232,10 @@ private:
                 const uint32_t x1 = xh1 * 2;
                 const uint32_t y1 = yh1 * 2;
                 const uint32_t w1 = (w >> 16) & 0xffff;
-                dst[y1 * 1024 + x1] = (w1 >> 12) & 0xf;
-                dst[y1 * 1024 + (x1 + 1)] = (w1 >> 8) & 0xf;
-                dst[(y1 + 1) * 1024 + x1] = (w1 >> 4) & 0xf;
-                dst[(y1 + 1) * 1024 + (x1 + 1)] = w1 & 0xf;
+                dst[y1 * 1024 + x1] = ((w1 >> 12) & 0xf) * 17;
+                dst[y1 * 1024 + (x1 + 1)] = ((w1 >> 8) & 0xf) * 17;
+                dst[(y1 + 1) * 1024 + x1] = ((w1 >> 4) & 0xf) * 17;
+                dst[(y1 + 1) * 1024 + (x1 + 1)] = (w1 & 0xf) * 17;
             }
 
             // Barrier: UNDEFINED or SHADER_READ_ONLY -> TRANSFER_DST
@@ -1287,6 +1340,12 @@ private:
     VkShaderModule m_planeFragModule = VK_NULL_HANDLE;
     VkShaderModule m_m2VertModule = VK_NULL_HANDLE;
     VkShaderModule m_m2FragModule = VK_NULL_HANDLE;
+    VkShaderModule m_m2FragNdModule = VK_NULL_HANDLE;
+    VkPipeline m_m2PipelineFast = VK_NULL_HANDLE;
+    VkShaderModule m_quadFarVertModule = VK_NULL_HANDLE;
+    VkPipeline m_voidPipelineFar = VK_NULL_HANDLE;
+    VkPipeline m_planePipelineFar = VK_NULL_HANDLE;
+    uint32_t m_fastIndexCount = 0;
 
     VkPipeline m_voidPipeline = VK_NULL_HANDLE;
     VkPipeline m_planePipeline = VK_NULL_HANDLE;
