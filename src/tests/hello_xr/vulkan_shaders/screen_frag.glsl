@@ -14,5 +14,5 @@ layout (location = 0) out vec4 FragColor;
 
 void main()
 {
-    FragColor = texture(ScreenTexture, PSTexCoord);
+    FragColor = vec4(texture(ScreenTexture, PSTexCoord).rgb, 1.0);
 }

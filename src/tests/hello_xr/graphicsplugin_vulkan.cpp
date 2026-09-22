@@ -1182,7 +1182,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         clearValues[0].color.float32[0] = m_clearColor[0];
         clearValues[0].color.float32[1] = m_clearColor[1];
         clearValues[0].color.float32[2] = m_clearColor[2];
-        clearValues[0].color.float32[3] = m_clearColor[3];
+        clearValues[0].color.float32[3] = 1.0f;
         clearValues[1].depthStencil.depth = 1.0f;
         clearValues[1].depthStencil.stencil = 0;
         renderPassBeginInfo.clearValueCount = (uint32_t)clearValues.size();

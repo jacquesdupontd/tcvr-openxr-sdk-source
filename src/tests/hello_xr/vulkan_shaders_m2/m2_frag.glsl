@@ -372,4 +372,5 @@ void main() {
         oColor.rgb = mix(voidc, oColor.rgb, f);
     }
     if (uImmersive != 0) oColor.rgb = clamp((oColor.rgb - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0);
+    oColor.a = 1.0;
 }

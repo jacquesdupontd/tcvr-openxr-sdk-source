@@ -401,9 +401,8 @@ struct OpenXrProgram : IOpenXrProgram {
             case XR_ENVIRONMENT_BLEND_MODE_OPAQUE:
                 return SlateGrey;
             case XR_ENVIRONMENT_BLEND_MODE_ADDITIVE:
-                return Black;
             case XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND:
-                return TransparentBlack;
+                return Black;
             default:
                 return SlateGrey;
         }
@@ -465,10 +464,19 @@ struct OpenXrProgram : IOpenXrProgram {
                 }
                 m_blendMode = ebm;
             } else {
-                // Runtimes return blend modes in preference order
-                m_blendMode = blendModes[0];
+                // Runtimes return blend modes in preference order, but MR headsets
+                // like Meta Quest 3 put ALPHA_BLEND first. For pure VR arcade immersion,
+                // we MUST explicitly select OPAQUE when available.
+                auto opaqueIt = std::find(blendModes.begin(), blendModes.end(), XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
+                if (opaqueIt != blendModes.end()) {
+                    m_blendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                } else {
+                    m_blendMode = blendModes[0];
+                }
             }
         }
+        Log::Write(Log::Level::Info, Fmt("TCVR_M0 EnvironmentBlendMode selected: %s (available: %s)",
+                                         to_string(m_blendMode), m_blendModesAvailable.c_str()));
     }
 
     void InitializeDevice() override {
@@ -712,12 +720,25 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.menuNavAction, thumbstickLeft},
                                                             {m_input.driveShiftAction, thumbstickRight}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-            suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             bindings.push_back({m_input.aimAction, aimLeft});
             bindings.push_back({m_input.aimAction, aimRight});
             suggestedBindings.suggestedBindings = bindings.data();
             suggestedBindings.countSuggestedBindings = (uint32_t)bindings.size();
-            CHECK_XRCMD(xrSuggestInteractionProfileBindings(m_instance, &suggestedBindings));
+
+            for (const char* profile : {
+                     "/interaction_profiles/oculus/touch_controller",
+                     "/interaction_profiles/meta/touch_controller_plus",
+                     "/interaction_profiles/meta/touch_plus_controller",
+                     "/interaction_profiles/meta/touch_controller_pro",
+                     "/interaction_profiles/meta/touch_pro_controller",
+                 }) {
+                XrPath profilePath = XR_NULL_PATH;
+                if (XR_SUCCEEDED(xrStringToPath(m_instance, profile, &profilePath))) {
+                    suggestedBindings.interactionProfile = profilePath;
+                    XrResult res = xrSuggestInteractionProfileBindings(m_instance, &suggestedBindings);
+                    Log::Write(Log::Level::Info, Fmt("Suggested bindings for %s: %s", profile, to_string(res)));
+                }
+            }
         }
         // Suggest bindings for the Vive Controller.
         {
