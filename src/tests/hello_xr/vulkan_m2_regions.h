@@ -23,6 +23,8 @@
 #include <vulkan/vulkan.h>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 
@@ -197,6 +199,71 @@ public:
         return layer;
     }
     uint32_t LayerCount() const { return m_layerCount; }
+
+    // Debug readback: level 0 of one region present BOTH as a layer and as its own image, copied to a
+    // host buffer (layer 256x256 then image w x h). Call RecordReadback(cmd) then, after the fence,
+    // WriteReadback(dir). Returns false if no region is in both maps.
+    bool RecordReadback(VkCommandBuffer cmd, int pick = 1) {
+        int seen = 0;
+        for (auto& kv : m_layerMap) {
+            auto it = m_map.find(kv.first);
+            if (it == m_map.end()) continue;
+            const Entry& e = m_slots[it->second];
+            if (pick >= 100) { if (kv.second != uint32_t(pick - 100)) continue; }                // exact layer
+            else if (pick >= 2 && (e.w == kLayerSize && e.h == kLayerSize)) continue;   // want a tiled (smaller) region
+            if (pick < 100 && ++seen < pick - 1) continue;
+            m_rbLayer = kv.second; m_rbW = e.w; m_rbH = e.h; m_rbKey = kv.first;
+            const VkDeviceSize bytes = VkDeviceSize(kLayerSize) * kLayerSize * 4 + VkDeviceSize(e.w) * e.h * 4;
+            if (m_rbBuf == VK_NULL_HANDLE) {
+                VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                bi.size = VkDeviceSize(kLayerSize) * kLayerSize * 4 * 2; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                vkCreateBuffer(m_dev, &bi, nullptr, &m_rbBuf);
+                VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(m_dev, m_rbBuf, &req);
+                m_alloc->Allocate(req, &m_rbMem);
+                vkBindBufferMemory(m_dev, m_rbBuf, m_rbMem, 0);
+            }
+            (void)bytes;
+            auto toSrc = [&](VkImage img, uint32_t layer, VkImageLayout from, VkImageLayout to) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+                b.oldLayout = from; b.newLayout = to;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            };
+            toSrc(m_array.image, m_rbLayer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            toSrc(e.image, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy r{};
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, m_rbLayer, 1};
+            r.imageExtent = {kLayerSize, kLayerSize, 1};
+            vkCmdCopyImageToBuffer(cmd, m_array.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_rbBuf, 1, &r);
+            VkBufferImageCopy r2{};
+            r2.bufferOffset = VkDeviceSize(kLayerSize) * kLayerSize * 4;
+            r2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r2.imageExtent = {e.w, e.h, 1};
+            vkCmdCopyImageToBuffer(cmd, e.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_rbBuf, 1, &r2);
+            toSrc(m_array.image, m_rbLayer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            toSrc(e.image, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            return true;
+        }
+        return false;
+    }
+    void WriteReadback(const std::string& dir) {
+        uint8_t* p = nullptr;
+        if (vkMapMemory(m_dev, m_rbMem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&p)) != VK_SUCCESS) return;
+        auto ppm = [&](const std::string& path, const uint8_t* px, uint32_t w, uint32_t h) {
+            FILE* f = std::fopen(path.c_str(), "wb");
+            if (!f) return;
+            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+            for (uint32_t i = 0; i < w * h; ++i) std::fwrite(px + i * 4, 1, 3, f);
+            std::fclose(f);
+        };
+        ppm(dir + "/rb-layer.ppm", p, kLayerSize, kLayerSize);
+        ppm(dir + "/rb-image.ppm", p + size_t(kLayerSize) * kLayerSize * 4, m_rbW, m_rbH);
+        vkUnmapMemory(m_dev, m_rbMem);
+        Log::Write(Log::Level::Info, Fmt("TCVR_RB region key=%llx layer=%u image %ux%u written to %s",
+                                         (unsigned long long)m_rbKey, m_rbLayer, m_rbW, m_rbH, dir.c_str()));
+    }
 
     // Colour table, 64 (luma) x 32 (5-bit component) RGBA8: texel.r/g/b = gamma(colorxlat) of the
     // red / green / blue channel for that component and luma. Rebuilt by the caller when the
@@ -458,6 +525,10 @@ private:
     uint32_t m_half = 0;
     size_t Base() const { return size_t(m_half) * kHalfBytes; }
     Entry m_dummy;
+    VkBuffer m_rbBuf = VK_NULL_HANDLE;
+    VkDeviceMemory m_rbMem = VK_NULL_HANDLE;
+    uint32_t m_rbLayer = 0, m_rbW = 0, m_rbH = 0;
+    uint64_t m_rbKey = 0;
     Entry m_array;
     VkSampler m_arraySampler = VK_NULL_HANDLE;
     bool m_arrayInit = false;

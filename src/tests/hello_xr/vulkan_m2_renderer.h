@@ -469,6 +469,8 @@ public:
     // descriptor updates, copies into the host-visible buffers, 2D layers.
     void CommitFrame(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
         if (!m_initialized) return;
+        if (m_rbPendingNext) { m_rbPendingNext = false; m_rbWaitFrames = 3; }
+        if (m_rbWaitFrames > 0 && --m_rbWaitFrames == 0) m_rbPending = true;
         if (m_dbgMapped && (m_dbgMapped[0] | m_dbgMapped[1]) != 0u) {
             static unsigned s_ov = 0;
             if ((s_ov++ % 30u) == 0u)
@@ -482,6 +484,17 @@ public:
             return;
         }
         if (!m_built) return;
+        {   // debug.tcvr.m2_regionsReset=<n>: rebuild every region/layer now (each new value triggers once)
+            const int rr = arcadexr::config::GetInt("m2.regionsReset", 0);
+            if (rr != m_lastRegionsReset) {
+                m_lastRegionsReset = rr;
+                vkDeviceWaitIdle(m_vkDevice);
+                m_regions.Clear();
+                BuildFrame(frame);
+                Log::Write(Log::Level::Info, "TCVR_M2VK regions reset (debug)");
+                if (!m_built) return;
+            }
+        }
         UploadColourChain(frame);
         const bool texChanged = UploadTextures(frame, cmd);
         if (texChanged) {
@@ -533,6 +546,10 @@ public:
         }
         UploadLayers(frame, cmd);
         m_preparedSeq = frame.sequence;
+        // debug.tcvr.m2_rb=<n>: read back one region as layer AND as image (new value = once)
+        if (m_rbPending) { m_regions.WriteReadback(arcadexr::config::ExternalDirectory()); m_rbPending = false; }
+        const int rb = arcadexr::config::GetInt("m2.rb", 0);
+        if (rb != m_lastRb) { m_lastRb = rb; if (rb != 0 && m_regions.RecordReadback(cmd, rb)) m_rbPendingNext = true; }
     }
 
     bool RenderImmersive(uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
@@ -669,11 +686,11 @@ public:
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
             if (m_fastIndexCount > 0 && !(skip & 4)) {
                 // LEAN: the same opaque polygons through a shader holding only their path (occupancy).
-                const bool lean = (arcadexr::config::GetInt("m2.lean", 1) & 1) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
+                const bool lean = (arcadexr::config::GetInt("m2.lean", 3) & 1) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lean ? m_m2PipelineFastLean : m_m2PipelineFast);
                 vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
             }
-            const bool leanOn = (arcadexr::config::GetInt("m2.lean", 1) & 2) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
+            const bool leanOn = (arcadexr::config::GetInt("m2.lean", 3) & 2) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
             if (leanOn && m_secIndexStart > m_fastIndexCount && !(skip & 8)) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutLean);
                 vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
@@ -762,7 +779,7 @@ public:
         static unsigned s_immFrames = 0;
         if ((s_immFrames++ % 120u) == 0u) {
             Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u lean=%d layers=%u lut=%d prims=%zu fast=%u cutEnd=%u opq=%u gls=%u res=%ux%u",
-                                             eye, int(arcadexr::config::GetInt("m2.lean", 1)), m_regions.LayerCount(), int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_secIndexStart, m_opaqueIndexCount, m_glassIndexCount,
+                                             eye, int(arcadexr::config::GetInt("m2.lean", 3)), m_regions.LayerCount(), int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_secIndexStart, m_opaqueIndexCount, m_glassIndexCount,
                                              renderAreaExtent.width, renderAreaExtent.height));
         }
 
@@ -1897,6 +1914,9 @@ private:
     uint8_t* m_lutMapped = nullptr;
     uint32_t m_lastEyePixels = 0;
     bool m_built = false;
+    int m_lastRegionsReset = 0;
+    int m_lastRb = 0, m_rbWaitFrames = 0;
+    bool m_rbPending = false, m_rbPendingNext = false;
     bool m_edgeFadeOff = true;
     bool m_gammaFolded = false;
 

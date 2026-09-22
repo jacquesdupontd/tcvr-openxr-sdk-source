@@ -600,6 +600,11 @@ void main() {
             vec4 c;
             uint layer = vLayer & 0xffffu;
             bool mirror = ((vPA.w >> 3) & 3u) != 0u;
+            if (uTestStage == 11 && layer != 0xffffu) {   // diag: layer at mip 0 vs region image, side by side in stripes
+                float a0 = textureLod(uRegionArr, vec3(tc / 256.0, float(layer)), 0.0).r;
+                float b0 = ((vSlot & 0xffffu) != 0xffffu) ? textureLod(sampler2D(uRegion[nonuniformEXT(vSlot & 0xffffu)], uRegionSmp[0]), tc / size, 0.0).r : 0.0;
+                oColor = vec4(a0, b0, float(layer) / 192.0, 1.0); return;
+            }
             if ((uTexImplicit & 2) != 0 && layer != 0xffffu && !mirror) {
                 // Tiled layer: layer repeat == region repeat, so tc/256 samples it directly.
                 c = texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias);
