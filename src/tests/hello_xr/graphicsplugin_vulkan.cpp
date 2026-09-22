@@ -870,10 +870,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         VkDescriptorPoolSize poolSize{};
         poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 1;
+        poolSize.descriptorCount = 2;   // [0] MAME framebuffer, [1] the GPU-drawn flat Model 2 image
 
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        poolInfo.maxSets = 1;
+        poolInfo.maxSets = 2;
         poolInfo.poolSizeCount = 1;
         poolInfo.pPoolSizes = &poolSize;
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_vkDevice, &poolInfo, nullptr, &m_screenDescriptorPool));
@@ -883,6 +883,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &m_screenDescriptorSetLayout;
         XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_screenDescriptorSet));
+        XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_flatDescriptorSet));
+        {   // trilinear: the 4x flat image is minified on the virtual screen
+            VkSamplerCreateInfo fs{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            fs.magFilter = fs.minFilter = VK_FILTER_LINEAR; fs.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            fs.addressModeU = fs.addressModeV = fs.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            fs.maxLod = 16.0f;
+            XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_vkDevice, &fs, nullptr, &m_flatSampler));
+        }
 
         VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -1203,6 +1211,29 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // 1. If viewIndex == 0, commit the built scene (GPU-visible copies, uploads) and upload the MAME frame
         if (viewIndex == 0) {
             if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);   // frozen: same built arrays re-committed
+            // SCREEN presentation of a Model 2 game: the GPU draws it in the board's projection (MAME can
+            // stop rasterising, like in immersive). Falls back to MAME's framebuffer when it cannot.
+            m_flatDrawn = false;
+            {
+                const std::string pres = arcadexr::profiles::GetString("presentation", "immersive");
+                const bool wantFlat = pres != "immersive" && arcadexr::hardware::sega_model2::HaveSceneSource() &&
+                                      arcadexr::config::GetInt("m2.vkFlat", 1) != 0;
+                if (wantFlat) {
+                    EnsureM2Renderer(swapchainData);
+                    if (m_m2Renderer.HasGeometry() && m_m2Renderer.RenderFlat(cmd)) {
+                        m_flatDrawn = true;
+                        if (m_m2Renderer.FlatView() != m_flatBoundView) {
+                            VkDescriptorImageInfo di{m_flatSampler, m_m2Renderer.FlatView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                            VkWriteDescriptorSet wd{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                            wd.dstSet = m_flatDescriptorSet; wd.dstBinding = 0; wd.descriptorCount = 1;
+                            wd.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wd.pImageInfo = &di;
+                            vkDeviceWaitIdle(m_vkDevice);   // rare: only when the flat target is (re)created
+                            vkUpdateDescriptorSets(m_vkDevice, 1, &wd, 0, nullptr);
+                            m_flatBoundView = m_m2Renderer.FlatView();
+                        }
+                    }
+                }
+            }
             // Game selector menu: CPU-drawn picture, uploaded when it changed.
             if (arcadexr::ui::Menu::Get().IsOpen()) {
                 if (!m_overlayInit) {
@@ -1218,7 +1249,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             arcadexr::video::FrameInfo info;
             // The flat framebuffer only feeds the screen fallback: skip its 760 KB copy while the
             // immersive pass is the one drawing (it resumes the first frame the fallback runs).
-            if (!m_lastM2Drawn && arcadexr::video::PeekLatestFrameInfo(info)) {
+            if (!m_lastM2Drawn && !m_flatDrawn && arcadexr::video::PeekLatestFrameInfo(info)) {
                 if (info.sequence != m_lastScreenSequence || (uint32_t)info.width != m_screenWidth || (uint32_t)info.height != m_screenHeight) {
                     arcadexr::video::FrameInfo got;
                     const std::uint32_t* pixels = arcadexr::video::AcquireLatestFrame(got);
@@ -1284,15 +1315,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const bool immersiveAllowed = (presentation == "immersive" && arcadexr::profiles::GetInt("m2.immersive", 1) != 0);
         bool m2ImmersiveDrawn = false;
         if (immersiveAllowed) {
-            if (!m_m2RendererInitialized) {
-                const VkFormat fmt = VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt);
-                const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("m2.msaa", 4)));
-                // Foveation on this swapchain? (it was created with a density map iff foveation > 0)
-                const bool useFdm = m_fdmEnabled && arcadexr::config::GetInt("foveation", 0) > 0 &&
-                                    !m_fdmImages.empty();
-                m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, fmt, uint32_t(msaa), useFdm);
-                m_m2RendererInitialized = true;
-            }
+            EnsureM2Renderer(swapchainData);
             if (m_m2Renderer.HasGeometry()) {
                 const float clear[4] = {m_clearColor[0], m_clearColor[1], m_clearColor[2], 1.0f};
                 const VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
@@ -1356,7 +1379,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // Render Virtual Arcade Screen fallback
         if (!m2ImmersiveDrawn) {
             arcadexr::gun::ScreenPlane screen;
-            if (m_screenImage != VK_NULL_HANDLE && arcadexr::video::GetVirtualScreen(screen)) {
+            if ((m_screenImage != VK_NULL_HANDLE || m_flatDrawn) && arcadexr::video::GetVirtualScreen(screen)) {
                 if (m_screenPipeline == VK_NULL_HANDLE) {
                     CreateScreenPipeline(renderPassBeginInfo.renderPass);
                 }
@@ -1385,17 +1408,18 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
-                                        0, 1, &m_screenDescriptorSet, 0, nullptr);
+                                        0, 1, m_flatDrawn ? &m_flatDescriptorSet : &m_screenDescriptorSet, 0, nullptr);
                 ScreenPC spc{};
                 std::memcpy(spc.mvp, mvp.m, sizeof(spc.mvp));
                 const auto aim = arcadexr::gun::GetAimState();
                 spc.aim[0] = aim.normalized_x; spc.aim[1] = aim.normalized_y;
                 spc.srcSize[0] = float(m_screenWidth); spc.srcSize[1] = float(m_screenHeight);
+                if (m_flatDrawn) { spc.srcSize[0] = float(m_m2Renderer.FlatWidth()); spc.srcSize[1] = float(m_m2Renderer.FlatHeight()); }
                 spc.aimVisible = aim.show_crosshair ? 1 : 0;
                 spc.calibrating = aim.calibrating ? 1 : 0;
                 // "edge" / "catmull" -> Catmull-Rom (the GLES edge pass adds FXAA on top: not ported yet)
                 const std::string filt = arcadexr::profiles::GetString("filter", "edge");
-                spc.filter = (filt == "nearest" || filt == "bilinear") ? 1 : 3;
+                spc.filter = (m_flatDrawn || filt == "nearest" || filt == "bilinear") ? 1 : 3;   // flat GPU image: trilinear
                 spc.sharpen = float(std::atof(arcadexr::profiles::GetString("sharpen", "0").c_str()));
                 vkCmdPushConstants(cmd, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(spc), &spc);
 
@@ -1473,7 +1497,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (viewIndex == 0) m_lastM2Drawn = m2ImmersiveDrawn;
         if (viewIndex == 0 && m_m2SceneRequested) {
             const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 1) != 0;
-            SetM2SceneMode((m2ImmersiveDrawn && m_m2Renderer.HaveMainView() && allowSkip) ? 2 : 1);
+            SetM2SceneMode((((m2ImmersiveDrawn && m_m2Renderer.HaveMainView()) || m_flatDrawn) && allowSkip) ? 2 : 1);
         }
 
         m_cmdBuffer[v].End();
@@ -1574,6 +1598,16 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_overlay.DrawMenu(cmd, mvp.m);
         }
         m_overlay.End(cmd);
+    }
+
+    void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
+        if (m_m2RendererInitialized) return;
+        const VkFormat fmt = VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt);
+        const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("m2.msaa", 4)));
+        // Foveation on this swapchain? (it was created with a density map iff foveation > 0)
+        const bool useFdm = m_fdmEnabled && arcadexr::config::GetInt("foveation", 0) > 0 && !m_fdmImages.empty();
+        m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, fmt, uint32_t(msaa), useFdm);
+        m_m2RendererInitialized = true;
     }
 
     void WriteDump() {
@@ -1679,6 +1713,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 vkDestroyDescriptorSetLayout(m_vkDevice, m_screenDescriptorSetLayout, nullptr);
                 m_screenDescriptorSetLayout = VK_NULL_HANDLE;
             }
+            if (m_flatSampler != VK_NULL_HANDLE) { vkDestroySampler(m_vkDevice, m_flatSampler, nullptr); m_flatSampler = VK_NULL_HANDLE; }
             if (m_screenSampler != VK_NULL_HANDLE) {
                 vkDestroySampler(m_vkDevice, m_screenSampler, nullptr);
                 m_screenSampler = VK_NULL_HANDLE;
@@ -1758,6 +1793,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_m2SceneMode{-1};
     bool m_fdmEnabled{false};
     bool m_lastM2Drawn{false};
+    bool m_flatDrawn{false};
+    VkDescriptorSet m_flatDescriptorSet{VK_NULL_HANDLE};
+    VkSampler m_flatSampler{VK_NULL_HANDLE};
+    VkImageView m_flatBoundView{VK_NULL_HANDLE};
     arcadexr::vulkan::VulkanOverlay m_overlay;
     bool m_overlayInit{false};
     XrPosef m_menuFramePose{};

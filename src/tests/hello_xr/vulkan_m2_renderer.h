@@ -300,6 +300,13 @@ public:
         if (!m_haveMainView) { mainL = mainT = mainR = mainB = -1; mainCx = mainCy = -100000; }
 
         m_horizonGeo = -1.0f;
+        m_crtc[0] = float(frame.crtc_xoffset); m_crtc[1] = float(frame.crtc_yoffset);
+        // The geometry engine's real focal length (the GLES renderer reads it; the first Vulkan port kept 512).
+        if (frame.focus_x > 1.0f && frame.focus_y > 1.0f) {
+            if (std::fabs(frame.focus_x - m_m2FocusX) > 0.5f || std::fabs(frame.focus_y - m_m2FocusY) > 0.5f)
+                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK focus %.1f x %.1f (was %.1f x %.1f)", frame.focus_x, frame.focus_y, m_m2FocusX, m_m2FocusY));
+            m_m2FocusX = frame.focus_x; m_m2FocusY = frame.focus_y;
+        }
         if (m_haveMainView) {
             std::vector<float> farRows;
             for (std::uint32_t i = 0; i < kn; i++) {
@@ -626,6 +633,15 @@ public:
         hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
         XrMatrix4x4f hudMvpBack;
         XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
+        if (m_flatMode) {
+            // FLAT: the board's own projection into the flat target (see RenderFlat), every view on the
+            // screen plane mapped 1:1 onto it (plane (u,v) in -0.5..0.5 -> NDC (2u, -2v), Vulkan y down).
+            mvp = m_flatMvp;
+            XrMatrix4x4f plane{};
+            plane.m[0] = 2.0f; plane.m[5] = -2.0f; plane.m[15] = 1.0f;
+            hudMvp = plane;
+            hudMvpBack = plane;
+        }
 
         // Update UBO slices for this eye
         const uint32_t eye = (viewIndex < 2) ? viewIndex : 0;
@@ -658,8 +674,8 @@ public:
             ubo.uFilterMode = std::max(0, std::min(5, arcadexr::config::GetInt("m2.filter", 5)));
             ubo.uMipBias = std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0)));
             ubo.uAlphaCoverage = IsMsaa() ? arcadexr::config::GetInt("m2.alphaCoverage", 1) : 0;
-            ubo.uContrast = arcadexr::config::GetFloat("contrast", 1.2f);
-            ubo.uBright = arcadexr::config::GetFloat("bright", -0.02f);
+            ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.2f);
+            ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", -0.02f);
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
             ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
@@ -716,7 +732,7 @@ public:
             // void + back 2D layer now shade only the pixels no polygon covered.
         // 1. DrawVoid
             float invMvp[16];
-            if (!(skip & 1) && InvertMatrix4x4(mvp.m, invMvp)) {
+            if (!(skip & 1) && !m_flatMode && InvertMatrix4x4(mvp.m, invMvp)) {
                 VoidPushConstants voidPc{};
                 memcpy(voidPc.uInvMvp, invMvp, sizeof(invMvp));
                 voidPc.uSky[0] = m_voidColor[0]; voidPc.uSky[1] = m_voidColor[1]; voidPc.uSky[2] = m_voidColor[2]; voidPc.uSky[3] = 1.0f;
@@ -787,6 +803,98 @@ public:
     }
 
     bool HaveMainView() const { return m_haveMainView; }
+    VkImageView FlatView() const { return m_flat.view; }
+    uint32_t FlatWidth() const { return m_flat.w; }
+    uint32_t FlatHeight() const { return m_flat.h; }
+
+    // SCREEN presentation of a Model 2 game, drawn by the GPU: the recorded scene through the BOARD's own
+    // projection into a k x (496x384) image (k = m2.gpuRaster, default 4), MSAA 4x, the same texture
+    // regions and lean shaders as the immersive view, then mipmapped (it is minified on the virtual screen).
+    // Lets MAME stop rasterising (scene mode 2) in screen mode too. Record outside any render pass.
+    bool RenderFlat(VkCommandBuffer cmd) {
+        if (!m_initialized || m_opaqueIndexCount == 0) return false;
+        const int k = std::max(1, std::min(8, arcadexr::config::GetInt("m2.gpuRaster", 4)));
+        const uint32_t W = 496u * uint32_t(k), H = 384u * uint32_t(k);
+        if (m_flat.w != W || m_flat.h != H) {
+            vkDeviceWaitIdle(m_vkDevice);
+            if (m_flat.view) vkDestroyImageView(m_vkDevice, m_flat.view, nullptr);
+            if (m_flat.image) vkDestroyImage(m_vkDevice, m_flat.image, nullptr);
+            if (m_flat.mem) vkFreeMemory(m_vkDevice, m_flat.mem, nullptr);
+            for (auto& f : m_fbs) if (f.eye == 2) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); f.fb = VK_NULL_HANDLE; }
+            m_fbs.erase(std::remove_if(m_fbs.begin(), m_fbs.end(), [](const FbEntry& f) { return f.fb == VK_NULL_HANDLE; }), m_fbs.end());
+            m_flat = FlatTarget{};
+            m_flat.w = W; m_flat.h = H;
+            uint32_t levels = 1; while ((std::max(W, H) >> levels) > 0) ++levels;
+            m_flat.levels = levels;
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = m_colorFormat; ii.extent = {W, H, 1};
+            ii.mipLevels = levels; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &ii, nullptr, &m_flat.image));
+            VkMemoryRequirements req{}; vkGetImageMemoryRequirements(m_vkDevice, m_flat.image, &req);
+            m_memAllocator->Allocate(req, &m_flat.mem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_vkDevice, m_flat.image, m_flat.mem, 0));
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = m_flat.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = m_colorFormat;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
+            XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &vi, nullptr, &m_flat.view));
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK flat target %ux%u (x%d), %u mips", W, H, k, levels));
+        }
+        // Board projection, clip w = camera z (so the GPU clips behind the eye and interpolates in perspective):
+        //   x_ndc = (crtc_x + cx + focus_x * X / z) / 248 - 1 ;  y_ndc = ((384 - cy) + crtc_y - focus_y * Y / z) / 192 - 1
+        const float fx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, fy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const float cx = float(m_mainCenter[0]), cy = float(m_mainCenter[1]);
+        m_flatMvp = XrMatrix4x4f{};
+        m_flatMvp.m[0] = fx / 248.0f;                                     // row 0 . X
+        m_flatMvp.m[8] = (m_crtc[0] + cx - 248.0f) / 248.0f;              // row 0 . z
+        m_flatMvp.m[5] = -fy / 192.0f;                                    // row 1 . Y
+        m_flatMvp.m[9] = ((384.0f - cy) + m_crtc[1] - 192.0f) / 192.0f;   // row 1 . z
+        m_flatMvp.m[11] = 1.0f;                                           // row 3 . z  (w = z)
+        const VkRect2D area{{0, 0}, {W, H}};
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        BeginPass(cmd, 2, m_flat.image, {W, H}, area, black);
+        VkViewport vp{0.0f, 0.0f, float(W), float(H), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &area);
+        XrCompositionLayerProjectionView lv{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        lv.pose.orientation.w = 1.0f;
+        lv.fov = {-0.8f, 0.8f, 0.8f, -0.8f};
+        m_flatMode = true;
+        const bool drawn = RenderImmersive(0, lv, cmd, {W, H});
+        m_flatMode = false;
+        vkCmdEndRenderPass(cmd);
+        // Mip chain (the 4x image is minified on the virtual screen: without mips it shimmers).
+        auto bar = [&](uint32_t lvl, uint32_t cnt, VkImageLayout from, VkImageLayout to, VkAccessFlags sa, VkAccessFlags da,
+                       VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = sa; b.dstAccessMask = da; b.oldLayout = from; b.newLayout = to;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = m_flat.image; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, lvl, cnt, 0, 1};
+            vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+        };
+        bar(0, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        if (m_flat.levels > 1)
+            bar(1, m_flat.levels - 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        int32_t w = int32_t(W), h = int32_t(H);
+        for (uint32_t l = 1; l < m_flat.levels; ++l) {
+            VkImageBlit bl{};
+            bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0, 1};
+            bl.srcOffsets[1] = {w, h, 1};
+            const int32_t nw = std::max(1, w / 2), nh = std::max(1, h / 2);
+            bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+            bl.dstOffsets[1] = {nw, nh, 1};
+            vkCmdBlitImage(cmd, m_flat.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_flat.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+            bar(l, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            w = nw; h = nh;
+        }
+        bar(0, m_flat.levels, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        return drawn;
+    }
     // The LEAN shader assumes filter mode 5 + texture array + no edge fade + stage 0.
     bool ubo_texArray(uint32_t eye) const {
         const M2UniformBufferObject& u = *m_uboMappedF[m_fs][eye < 2 ? eye : 0][0];
@@ -823,7 +931,7 @@ public:
     // Begin the immersive render pass on swapchain image `target` (eye `eye`).
     void BeginPass(VkCommandBuffer cmd, uint32_t eye, VkImage target, VkExtent2D ext, const VkRect2D& area, const float clear[4],
                    VkImage fdmImage = VK_NULL_HANDLE, VkExtent2D fdmExt = {0, 0}) {
-        eye = eye < 2 ? eye : 0;
+        eye = eye < 3 ? eye : 0;
         EyeTargets& et = m_eyeTargets[eye];
         if (et.ext.width != ext.width || et.ext.height != ext.height) DestroyEyeTargets(et), CreateEyeTargets(et, ext);
         VkFramebuffer fb = VK_NULL_HANDLE;
@@ -989,6 +1097,11 @@ public:
         m_regions.Destroy();
         DestroyEyeTargets(m_eyeTargets[0]);
         DestroyEyeTargets(m_eyeTargets[1]);
+        DestroyEyeTargets(m_eyeTargets[2]);
+        if (m_flat.view) vkDestroyImageView(m_vkDevice, m_flat.view, nullptr);
+        if (m_flat.image) vkDestroyImage(m_vkDevice, m_flat.image, nullptr);
+        if (m_flat.mem) vkFreeMemory(m_vkDevice, m_flat.mem, nullptr);
+        m_flat = FlatTarget{};
         for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); }
         m_fbs.clear();
         if (m_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(m_vkDevice, m_pass, nullptr); m_pass = VK_NULL_HANDLE; }
@@ -1863,7 +1976,7 @@ private:
     VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;
     VkRenderPass m_pass = VK_NULL_HANDLE;
     bool m_useFdm = false;
-    EyeTargets m_eyeTargets[2];
+    EyeTargets m_eyeTargets[3];   // [2] = the flat (screen presentation) target
     std::vector<FbEntry> m_fbs;
     VkShaderModule m_quadFarVertModule = VK_NULL_HANDLE;
     VkPipeline m_voidPipelineFar = VK_NULL_HANDLE;
@@ -1980,6 +2093,11 @@ private:
     int32_t m_mainCenter[2] = {-100000, -100000};
     bool m_haveMainView = false;
     float m_horizonGeo = -1.0f;
+    float m_crtc[2] = {0.0f, 0.0f};
+    bool m_flatMode = false;
+    XrMatrix4x4f m_flatMvp{};
+    struct FlatTarget { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE;
+                        uint32_t w = 0, h = 0, levels = 0; } m_flat;
     float m_groundColor[3] = {0.18f, 0.16f, 0.14f};
     float m_voidColor[3] = {0.16f, 0.36f, 0.78f};
     float m_m2Pitch = 0.0f;
