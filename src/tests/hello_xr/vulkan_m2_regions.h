@@ -42,7 +42,8 @@ public:
     void Init(VkDevice device, const MemoryAllocator* alloc, float maxAniso) {
         m_dev = device;
         m_alloc = alloc;
-        for (int m = 0; m < 4; ++m) {
+        m_maxAniso = maxAniso;
+        for (int m = 0; m < 8; ++m) {
             VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
             si.magFilter = VK_FILTER_LINEAR;
             si.minFilter = VK_FILTER_LINEAR;
@@ -50,7 +51,7 @@ public:
             si.addressModeU = (m & 1) ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : VK_SAMPLER_ADDRESS_MODE_REPEAT;
             si.addressModeV = (m & 2) ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : VK_SAMPLER_ADDRESS_MODE_REPEAT;
             si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-            si.anisotropyEnable = maxAniso > 1.0f ? VK_TRUE : VK_FALSE;
+            si.anisotropyEnable = (maxAniso > 1.0f && m < 4) ? VK_TRUE : VK_FALSE;   // [4..7]: same, no anisotropy
             si.maxAnisotropy = std::max(1.0f, maxAniso);
             si.minLod = 0.0f;
             si.maxLod = 16.0f;
@@ -77,6 +78,7 @@ public:
         m_dummy = CreateImage(1, 1, 1);
         m_dummyPending = true;
         m_lut = CreateImage(64, 32, 1);
+        CreateArray();
         {   // zeros until the first real table, so the image is always valid to bind
             std::vector<uint8_t> z(64 * 32 * 4, 0);
             SetLut(z.data());
@@ -88,6 +90,11 @@ public:
         Clear();
         DestroyEntry(m_dummy);
         DestroyEntry(m_lut);
+        if (m_array.view) vkDestroyImageView(m_dev, m_array.view, nullptr);
+        if (m_array.image) vkDestroyImage(m_dev, m_array.image, nullptr);
+        if (m_array.mem) vkFreeMemory(m_dev, m_array.mem, nullptr);
+        m_array = Entry{};
+        if (m_arraySampler) { vkDestroySampler(m_dev, m_arraySampler, nullptr); m_arraySampler = VK_NULL_HANDLE; }
         for (auto& s : m_samplers) if (s) { vkDestroySampler(m_dev, s, nullptr); s = VK_NULL_HANDLE; }
         if (m_lutSampler) { vkDestroySampler(m_dev, m_lutSampler, nullptr); m_lutSampler = VK_NULL_HANDLE; }
         if (m_stagingPtr) { vkUnmapMemory(m_dev, m_stagingMem); m_stagingPtr = nullptr; }
@@ -102,6 +109,9 @@ public:
         for (auto& e : m_slots) DestroyEntry(e);
         m_slots.clear();
         m_map.clear();
+        m_layerMap.clear();
+        m_layerCount = 0;
+        m_pendingLayers.clear();
         m_pending.clear();
         m_dirtySlots.clear();
         m_resetDescriptors = true;
@@ -147,6 +157,47 @@ public:
         return slot;
     }
 
+    // ---- Texture ARRAY path (opus55, second step). The descriptor-indexed images above cost ~3 ms
+    // per frame for the texture INSTRUCTION itself (measured on a frozen scene: a constant-coordinate
+    // sample through the bindless path costs as much as the real one). One ordinary sampler2DArray
+    // bound normally is the cheap path: the layer is just a coordinate. Every region up to 256x256
+    // gets one 256x256 layer, filled by TILING the region, so the hardware REPEAT of the layer is
+    // exactly the region's own repeat, and GPU mips of the tiled layer are the region's mips.
+    static constexpr uint32_t kLayerSize = 256;
+    static constexpr uint32_t kMaxLayers = 192;
+
+    uint32_t Layer(const std::vector<uint8_t>* sheets, uint32_t sheet, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h) {
+        if (w < 1 || h < 1 || w > kLayerSize || h > kLayerSize || (kLayerSize % w) || (kLayerSize % h) || sheets[sheet & 1].empty())
+            return kNone;
+        const uint64_t key = (uint64_t(sheet & 1) << 60) | (uint64_t(ox) << 44) | (uint64_t(oy) << 28) | (uint64_t(w) << 14) | uint64_t(h);
+        auto it = m_layerMap.find(key);
+        if (it != m_layerMap.end()) return it->second;
+        if (m_layerCount >= kMaxLayers || m_array.image == VK_NULL_HANDLE) return kNone;
+        const size_t bytes = size_t(kLayerSize) * kLayerSize * 4;
+        if (m_stagingUsed + bytes > kHalfBytes) return kNone;
+        uint8_t* dst = m_stagingPtr + Base() + m_stagingUsed;
+        const std::vector<uint8_t>& cpu = sheets[sheet & 1];
+        for (uint32_t y = 0; y < kLayerSize; ++y)
+            for (uint32_t x = 0; x < kLayerSize; ++x) {
+                int x2 = int(ox + (x % w)), y2 = int(oy + (y % h));
+                if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
+                const size_t at = size_t(y2) * 1024 + size_t(x2);
+                const uint8_t t = at < cpu.size() ? cpu[at] : 0;
+                const bool opaque = t != 15;
+                uint8_t* px = dst + (size_t(y) * kLayerSize + x) * 4;
+                px[0] = uint8_t(t * 17);
+                px[1] = opaque ? uint8_t(t * 17) : 0;
+                px[2] = opaque ? 255 : 0;
+                px[3] = 255;
+            }
+        const uint32_t layer = m_layerCount++;
+        m_layerMap.emplace(key, layer);
+        m_pendingLayers.push_back({layer, Base() + m_stagingUsed});
+        m_stagingUsed += bytes;
+        return layer;
+    }
+    uint32_t LayerCount() const { return m_layerCount; }
+
     // Colour table, 64 (luma) x 32 (5-bit component) RGBA8: texel.r/g/b = gamma(colorxlat) of the
     // red / green / blue channel for that component and luma. Rebuilt by the caller when the
     // board's tables change; uploaded at the next Flush.
@@ -161,6 +212,15 @@ public:
 
     // Record uploads + mip chains of the regions created this frame. Call before the render pass.
     void Flush(VkCommandBuffer cmd) {
+        if (m_arrayInit) {   // every layer valid to bind from the first frame (unused ones hold garbage, never sampled)
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = m_array.image; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, m_array.levels, 0, kMaxLayers};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            m_arrayInit = false;
+        }
         if (m_lutPending) { Upload(cmd, m_lut, m_lutOffset); m_lutPending = false; }
         if (m_dummyPending) {
             std::memset(m_stagingPtr + Base() + m_stagingUsed, 0, 4);
@@ -169,6 +229,8 @@ public:
             m_dummyPending = false;
         }
         for (auto& p : m_pending) Upload(cmd, m_slots[p.slot], p.offset);
+        for (auto& p : m_pendingLayers) UploadLayer(cmd, p.slot, p.offset);
+        m_pendingLayers.clear();
         if (!m_pending.empty()) m_created += uint32_t(m_pending.size());
         m_pending.clear();
         m_stagingUsed = 0;
@@ -189,10 +251,10 @@ public:
             w.descriptorCount = kMaxSlots; w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             w.pImageInfo = infos.data();
             writes.push_back(w);
-            VkDescriptorImageInfo smp[4];
-            for (int m = 0; m < 4; ++m) smp[m] = {m_samplers[m], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            VkDescriptorImageInfo smp[8];
+            for (int m = 0; m < 8; ++m) smp[m] = {m_samplers[m], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
             VkWriteDescriptorSet ws{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            ws.dstSet = set; ws.dstBinding = smpBinding; ws.descriptorCount = 4;
+            ws.dstSet = set; ws.dstBinding = smpBinding; ws.descriptorCount = 8;
             ws.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; ws.pImageInfo = smp;
             writes.push_back(ws);
             VkDescriptorImageInfo lut{m_lutSampler, m_lut.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -200,6 +262,11 @@ public:
             wl.dstSet = set; wl.dstBinding = 14; wl.descriptorCount = 1;
             wl.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wl.pImageInfo = &lut;
             writes.push_back(wl);
+            VkDescriptorImageInfo arr{m_arraySampler, m_array.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wa.dstSet = set; wa.dstBinding = 15; wa.descriptorCount = 1;
+            wa.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wa.pImageInfo = &arr;
+            writes.push_back(wa);
             vkUpdateDescriptorSets(m_dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
             return;
         }
@@ -262,6 +329,74 @@ private:
         return e;
     }
 
+    void CreateArray() {
+        uint32_t levels = 1;
+        while ((kLayerSize >> levels) > 0) ++levels;
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.extent = {kLayerSize, kLayerSize, 1}; ii.mipLevels = levels; ii.arrayLayers = kMaxLayers;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        XRC_CHECK_THROW_VKCMD(vkCreateImage(m_dev, &ii, nullptr, &m_array.image));
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(m_dev, m_array.image, &req);
+        m_alloc->Allocate(req, &m_array.mem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_dev, m_array.image, m_array.mem, 0));
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = m_array.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, kMaxLayers};
+        XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &vi, nullptr, &m_array.view));
+        m_array.w = kLayerSize; m_array.h = kLayerSize; m_array.levels = levels;
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = VK_FILTER_LINEAR; si.minFilter = VK_FILTER_LINEAR; si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.anisotropyEnable = m_maxAniso > 1.0f ? VK_TRUE : VK_FALSE;
+        si.maxAnisotropy = std::max(1.0f, m_maxAniso);
+        si.maxLod = 16.0f;
+        XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_arraySampler));
+        m_arrayInit = true;   // all layers still UNDEFINED: transitioned at the first Flush
+    }
+
+    void UploadLayer(VkCommandBuffer cmd, uint32_t layer, size_t offset) {
+        auto bar = [&](uint32_t lvl, VkImageLayout from, VkImageLayout to, VkAccessFlags sa, VkAccessFlags da,
+                       VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = sa; b.dstAccessMask = da; b.oldLayout = from; b.newLayout = to;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = m_array.image; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, lvl, 1, layer, 1};
+            vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+        };
+        for (uint32_t l = 0; l < m_array.levels; ++l)
+            bar(l, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy r{};
+        r.bufferOffset = offset;
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+        r.imageExtent = {kLayerSize, kLayerSize, 1};
+        vkCmdCopyBufferToImage(cmd, m_staging, m_array.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        int32_t w = int32_t(kLayerSize);
+        for (uint32_t l = 1; l < m_array.levels; ++l) {
+            bar(l - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkImageBlit bl{};
+            bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, layer, 1};
+            bl.srcOffsets[1] = {w, w, 1};
+            const int32_t nw = std::max(1, w / 2);
+            bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, layer, 1};
+            bl.dstOffsets[1] = {nw, nw, 1};
+            vkCmdBlitImage(cmd, m_array.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_array.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+            bar(l - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            w = nw;
+        }
+        bar(m_array.levels - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+
     void DestroyEntry(Entry& e) {
         if (e.view) vkDestroyImageView(m_dev, e.view, nullptr);
         if (e.image) vkDestroyImage(m_dev, e.image, nullptr);
@@ -314,7 +449,7 @@ private:
 
     VkDevice m_dev = VK_NULL_HANDLE;
     const MemoryAllocator* m_alloc = nullptr;
-    VkSampler m_samplers[4] = {};
+    VkSampler m_samplers[8] = {};
     VkSampler m_lutSampler = VK_NULL_HANDLE;
     VkBuffer m_staging = VK_NULL_HANDLE;
     VkDeviceMemory m_stagingMem = VK_NULL_HANDLE;
@@ -323,6 +458,13 @@ private:
     uint32_t m_half = 0;
     size_t Base() const { return size_t(m_half) * kHalfBytes; }
     Entry m_dummy;
+    Entry m_array;
+    VkSampler m_arraySampler = VK_NULL_HANDLE;
+    bool m_arrayInit = false;
+    float m_maxAniso = 1.0f;
+    uint32_t m_layerCount = 0;
+    std::unordered_map<uint64_t, uint32_t> m_layerMap;
+    std::vector<Pending> m_pendingLayers;
     Entry m_lut;
     size_t m_lutOffset = 0;
     bool m_lutPending = false;

@@ -1,4 +1,6 @@
 #version 450
+// The cut-out colour pass tests depth EQUAL against its own pre-pass: positions must be bit-identical.
+invariant gl_Position;
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec3 aParam;
 layout(location = 2) in uint aPrim;
@@ -34,6 +36,9 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uBright;
     int uTestStage;
     int uCountOverdraw;
+    int uSmpBase;       // 0 = samplers with hardware anisotropy, 4 = without (debug.tcvr.m2_hwAnisoOn)
+    int uGammaFolded;   // 1 = colorxlat already holds gamma(colorxlat): skip gamma8()
+    int uTexImplicit;   // bit 0: texture() with implicit derivatives; bit 1: use the texture array
 };
 
 struct Prim {
@@ -64,7 +69,8 @@ layout(location = 4) flat out uvec4 vPA;   // texx, texy, texwidth | texheight <
 layout(location = 5) flat out uvec4 vPB;   // utexx | utexy << 16, lumabase | luma << 16, colorbase, texlod
 layout(location = 6) flat out ivec4 vPC;   // clip l, t, r, b
 layout(location = 7) flat out uint vSlot;
-layout(location = 8) flat out uint vColor; // the polygon's palette entry (palram[colorbase + 0x1000]), 16 bits  // region texture slots: main | microtexture << 16 (0xffff = none)
+layout(location = 8) flat out uint vColor;
+layout(location = 9) flat out uint vLayer; // texture-array layers: main | microtexture << 16 (0xffff = none) // the polygon's palette entry (palram[colorbase + 0x1000]), 16 bits  // region texture slots: main | microtexture << 16 (0xffff = none)
 
 void main() {
     vPrim = aPrim;

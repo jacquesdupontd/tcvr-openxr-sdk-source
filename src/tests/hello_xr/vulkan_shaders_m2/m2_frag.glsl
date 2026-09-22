@@ -12,6 +12,7 @@ layout(location = 5) flat in uvec4 vPB;
 layout(location = 6) flat in ivec4 vPC;
 layout(location = 7) flat in uint vSlot;
 layout(location = 8) flat in uint vColor;
+layout(location = 9) flat in uint vLayer;
 layout(location = 0) out vec4 oColor;
 
 layout(set = 0, binding = 0, std140) uniform M2Uniforms {
@@ -45,6 +46,9 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uBright;
     int uTestStage;
     int uCountOverdraw;
+    int uSmpBase;       // 0 = samplers with hardware anisotropy, 4 = without (debug.tcvr.m2_hwAnisoOn)
+    int uGammaFolded;   // 1 = colorxlat already holds gamma(colorxlat): skip gamma8()
+    int uTexImplicit;   // bit 0: texture() with implicit derivatives; bit 1: use the texture array
 };
 
 struct Prim {
@@ -83,7 +87,9 @@ layout(set = 0, binding = 11) uniform sampler2D uCutTex1;
 // Every texture region as its own mipmapped image (see vulkan_m2_regions.h): R = t*17,
 // G = t*17*opaque, B = opaque. Samplers: [mirrorx | mirrory << 1], repeat otherwise, hw aniso.
 layout(set = 0, binding = 12) uniform texture2D uRegion[512];
-layout(set = 0, binding = 13) uniform sampler uRegionSmp[4];
+layout(set = 0, binding = 13) uniform sampler uRegionSmp[8];
+// Every region <= 256x256 as one TILED 256x256 layer of a single array bound the ordinary way.
+layout(set = 0, binding = 15) uniform sampler2DArray uRegionArr;
 // binding 14 (colour table image) is still declared by the renderer but unused: a precomputed
 // gamma(colorxlat) table, as a texture (~2x) or as a storage buffer (~3x), made the WHOLE shader
 // slower on the Adreno 740 (measured 22/09, interleaved A/B). Kept out of the shader on purpose.
@@ -191,6 +197,7 @@ vec3 shade(Prim p, uint luma, uint palmask) {
     uint r = colorxlat16((0x0000u / 2u) + (((color >>  0) & 0x1fu) << 8) + luma) & 0xffu;
     uint g = colorxlat16((0x4000u / 2u) + (((color >>  5) & 0x1fu) << 8) + luma) & 0xffu;
     uint b = colorxlat16((0x8000u / 2u) + (((color >> 10) & 0x1fu) << 8) + luma) & 0xffu;
+    if (uGammaFolded != 0) return vec3(float(r), float(g), float(b)) / 255.0;
     return vec3(float(gamma8(r)), float(gamma8(g)), float(gamma8(b))) / 255.0;
 }
 
@@ -199,6 +206,7 @@ vec3 shade_c(uint color, uint luma) {
     uint r = colorxlat16((0x0000u / 2u) + (((color >>  0) & 0x1fu) << 8) + luma) & 0xffu;
     uint g = colorxlat16((0x4000u / 2u) + (((color >>  5) & 0x1fu) << 8) + luma) & 0xffu;
     uint b = colorxlat16((0x8000u / 2u) + (((color >> 10) & 0x1fu) << 8) + luma) & 0xffu;
+    if (uGammaFolded != 0) return vec3(float(r), float(g), float(b)) / 255.0;
     return vec3(float(gamma8(r)), float(gamma8(g)), float(gamma8(b))) / 255.0;
 }
 
@@ -415,6 +423,10 @@ vec2 tri_s(Prim p, vec2 tc, float lod, int max_level, bool cut) {
 // Region path: one hardware trilinear(+anisotropic) sample of the region's own image.
 // grads are the level-0 texel-space derivatives; bias in mip levels.
 vec4 region_sample(uint slot, uint smp, vec2 tc, vec2 size, vec2 gx, vec2 gy, float bias) {
+    // A 2x2 quad never spans two polygons, so implicit derivatives are valid in this per-polygon
+    // branch; explicit gradients take a slower path on many mobile GPUs.
+    if (uTestStage == 4) return texture(sampler2D(uRegion[0], uRegionSmp[0]), tc / size, bias);   // bench: uniform index
+    if ((uTexImplicit & 1) != 0) return texture(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, bias);
     float k = exp2(bias);
     return textureGrad(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, gx * k / size, gy * k / size);
 }
@@ -444,14 +456,79 @@ Prim flatPrim() {
     return p;
 }
 
-#ifdef NO_DISCARD
+#if defined(NO_DISCARD) || defined(CUT_COLOR)
 // No discard, no depth write from the shader: the depth test ALWAYS runs before shading, even
-// with the debug counter's side effect.
+// with the debug counter's side effect. CUT_COLOR = colour pass of the cut-outs after their depth
+// pre-pass (depth EQUAL): only the visible sample of each pixel is shaded, once.
 layout(early_fragment_tests) in;
 #endif
+#ifdef CUT_COLOR
+#define NO_DISCARD_KEEP_TRANSLUCENT 1
+#endif
 
+#ifdef LEAN
+// LEAN opaque pass: only what the discard-free polygons of the main view need, nothing else, so the
+// compiler allocates few registers and many pixel groups run in parallel (texture latency hidden).
+void main() {
+    uint fl = vPA.w;
+    float zb = max(vParam.z, 1e-6);
+    vec2 tc = vec2(vParam.x, vParam.y);                 // main view: (u, v) in level-0 texels
+    vec3 rgb;
+    if (((fl >> 6) & 1u) == 0u) {
+        rgb = shade_c(vColor, (vPB.y >> 16) >> 2);        // untextured: luma >> 2
+    } else {
+        uint layer = vLayer & 0xffffu;
+        float bias = float(uMipBias) / 128.0;
+        float t;
+        if (layer != 0xffffu && ((fl >> 3) & 3u) == 0u) {
+            t = texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias).r * 15.0;
+        } else {
+            uint slot = vSlot & 0xffffu;
+            uint smp = ((fl >> 3) & 1u) | (((fl >> 4) & 1u) << 1);
+            vec2 size = vec2(float(vPA.z & 0xffffu), float(vPA.z >> 16));
+            t = (slot != 0xffffu) ? texture(sampler2D(uRegion[nonuniformEXT(slot)], uRegionSmp[smp]), tc / size, bias).r * 15.0 : 7.0;
+        }
+        if (((fl >> 8) & 1u) != 0u && (vLayer >> 16) != 0xffffu) {
+            vec2 dx = dFdx(tc), dy = dFdy(tc);
+            float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-12)) + bias;
+            if (lod < 0.0) {
+                uint ulod = (fl >> 9) & 15u;
+                float sc = float(1 << (1 << int(ulod)));
+                float mt = texture(uRegionArr, vec3(tc * sc / 256.0, float(vLayer >> 16))).r * 15.0;
+                t = mix(t, mt, min(-lod * 128.0 / float(1 << int(ulod)), 127.0) / 256.0);
+            }
+        }
+        uint t8 = min(uint(t * 16.0 + 0.5), 0xf0u);
+        uint luma = min((lumaram8((vPB.y & 0xffffu) + (t8 >> 1)) * (vPB.y >> 16)) / 256u, 0x3fu);
+        rgb = shade_c(vColor & 0x7fffu, luma);
+    }
+    oColor = vec4(clamp((rgb - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0), 1.0);
+}
+#else
 void main() {
     Prim p = flatPrim();
+#ifdef CUT_DEPTH
+    // Depth pre-pass of the cut-outs: the cheapest possible shader -- the clip window of the
+    // secondary views and the region's opacity (B channel, hardware filtered), nothing else. Colour
+    // writes are masked; alpha-to-coverage turns the opacity into per-sample depth coverage.
+    {
+        bool mv = (uImmersive != 0 && vSecondary == 0u);
+        ivec2 px = ivec2(floor(vBoard));
+        if (!mv && (px.x < p.clip_l || px.x > p.clip_r || px.y < p.clip_t || px.y > p.clip_b)) discard;
+        float zb = max(vParam.z, 1e-6);
+        vec2 tcd = mv ? vec2(vParam.x, vParam.y) : vec2(0.0);
+        vec2 ddx = dFdx(tcd), ddy = dFdy(tcd);
+        oColor = vec4(0.0, 0.0, 0.0, 1.0);
+        if (p.textured == 0u || p.translucent == 0u || !mv || (vSlot & 0xffffu) == 0xffffu) return;
+        uint smp = ((vPA.w >> 3) & 1u) | (((vPA.w >> 4) & 1u) << 1);
+        vec2 size = vec2(float(p.texwidth), float(p.texheight));
+        float a = region_sample(vSlot & 0xffffu, smp + uint(uSmpBase), tcd, size, ddx, ddy, float(uMipBias) / 128.0).b;
+        a = clamp((a - 0.5) / max(fwidth(a), 1.0 / 255.0) + 0.5, 0.0, 1.0);
+        if (a <= 0.0) discard;
+        oColor.a = a;
+        return;
+    }
+#endif
     if (uTestStage == 3) {
 #ifdef NO_DISCARD
         atomicAdd(dbg[0], 1u);
@@ -485,7 +562,7 @@ void main() {
 #endif
         oColor = vec4(shade_c(vColor, p.luma >> 2), outAlpha);
     } else {
-#ifdef NO_DISCARD
+#if defined(NO_DISCARD) && !defined(CUT_COLOR)
         bool translucent = false;   // routed here only when its texture has no transparent texel
 #else
         bool translucent = (p.translucent != 0u);
@@ -500,7 +577,18 @@ void main() {
             uint smp = ((vPA.w >> 3) & 1u) | (((vPA.w >> 4) & 1u) << 1);
             vec2 size = vec2(float(p.texwidth), float(p.texheight));
             float bias = float(uMipBias) / 128.0;
-            vec4 c = region_sample(vSlot & 0xffffu, smp, tc, size, dx, dy, bias);
+            if (uTestStage == 5) { oColor = vec4(region_sample(vSlot & 0xffffu, smp, tc, size, dx, dy, bias).rrr, 1.0); return; }
+            if (uTestStage == 6) { oColor = vec4(region_sample(vSlot & 0xffffu, smp, vec2(0.5), size, dx, dy, bias).rrr, 1.0); return; }
+            if (uTestStage == 7) { oColor = vec4(vec3(fract(tc.x + tc.y)), 1.0); return; }
+            vec4 c;
+            uint layer = vLayer & 0xffffu;
+            bool mirror = ((vPA.w >> 3) & 3u) != 0u;
+            if ((uTexImplicit & 2) != 0 && layer != 0xffffu && !mirror) {
+                // Tiled layer: layer repeat == region repeat, so tc/256 samples it directly.
+                c = texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias);
+            } else {
+                c = region_sample(vSlot & 0xffffu, smp + uint(uSmpBase), tc, size, dx, dy, bias);
+            }
             vec2 ts = translucent ? vec2(c.g * 15.0, c.b) : vec2(c.r * 15.0, 1.0);
             uint ms = vSlot >> 16;
             if (!translucent && p.utex != 0u && ms != 0xffffu) {
@@ -508,7 +596,10 @@ void main() {
                 float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-12)) + bias;
                 if (lod < 0.0) {
                     float sc = float(1 << (1 << int(p.utexminlod)));
-                    float mt = region_sample(ms, 0u, tc * sc, vec2(128.0), dx * sc, dy * sc, 0.0).r * 15.0;
+                    uint ml = vLayer >> 16;
+                    float mt = ((uTexImplicit & 2) != 0 && ml != 0xffffu)
+                                   ? texture(uRegionArr, vec3(tc * sc / 256.0, float(ml))).r * 15.0
+                                   : region_sample(ms, 0u, tc * sc, vec2(128.0), dx * sc, dy * sc, 0.0).r * 15.0;
                     float w = min(-lod * 128.0 / float(1 << int(p.utexminlod)), 127.0) / 256.0;
                     ts.x = mix(ts.x, mt, w);
                 }
@@ -625,3 +716,4 @@ void main() {
     if (!glass && !(uAlphaCoverage != 0 && mainView && p.translucent != 0u)) oColor.a = 1.0;
 #endif
 }
+#endif  // LEAN

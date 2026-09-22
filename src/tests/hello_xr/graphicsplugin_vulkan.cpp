@@ -1162,8 +1162,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 m_m2SceneRequested = true;
                 SetM2SceneMode(1);
             }
-            if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
+            // Bench: debug.tcvr.m2_freeze=1 keeps re-drawing the last scene (no new acquire): the same
+            // workload every frame, so an A/B of a render setting is not drowned in scene variance.
+            const bool freeze = arcadexr::config::GetInt("m2.freeze", 0) != 0 && m_lastM2Frame != nullptr;
+            if (freeze) {
+                m2Frame = m_lastM2Frame;
+            } else if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
+                if (m2Frame) m_lastM2Frame = m2Frame;
                 if (m2Frame) {
                     const auto tp = clk::now();
                     m_m2Renderer.BuildFrame(*m2Frame);
@@ -1182,7 +1188,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         // 1. If viewIndex == 0, commit the built scene (GPU-visible copies, uploads) and upload the MAME frame
         if (viewIndex == 0) {
-            if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);
+            if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);   // frozen: same built arrays re-committed
             arcadexr::video::FrameInfo info;
             // The flat framebuffer only feeds the screen fallback: skip its 760 KB copy while the
             // immersive pass is the one drawing (it resumes the first frame the fallback runs).
@@ -1596,6 +1602,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_m2SceneMode{-1};
     bool m_fdmEnabled{false};
     bool m_lastM2Drawn{false};
+    const tcvr_m2_frame* m_lastM2Frame{nullptr};
     float m_cpuWaitMs{0}, m_cpuPrepMs{0}, m_cpuSubmitMs{0}, m_cpuViewMs{0}, m_cpuPeriodMs{0};
     uint32_t m_cpuFrames{0};
     std::chrono::steady_clock::time_point m_cpuLastFrame{}, m_cpuLogAt{};

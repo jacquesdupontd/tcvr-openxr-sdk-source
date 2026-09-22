@@ -20,6 +20,9 @@
 #include "m2_vert_spv.h"
 #include "m2_frag_spv.h"
 #include "m2_frag_nd_spv.h"
+#include "m2_frag_cutd_spv.h"
+#include "m2_frag_lean_spv.h"
+#include "m2_frag_cutc_spv.h"
 #include "quad_vert_spv.h"
 #include "quad_far_vert_spv.h"
 #include "void_frag_spv.h"
@@ -78,9 +81,9 @@ public:
         std::array<VkDescriptorPoolSize, 5> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 80},
             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * M2RegionTextures::kMaxSlots + 16},
-            {VK_DESCRIPTOR_TYPE_SAMPLER, 40}
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 80}
         }};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.maxSets = 24;
@@ -128,8 +131,12 @@ public:
             m2Bindings.push_back(rb);
             VkDescriptorSetLayoutBinding sb{};
             sb.binding = 13; sb.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            sb.descriptorCount = 4; sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            sb.descriptorCount = 8; sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
             m2Bindings.push_back(sb);
+            VkDescriptorSetLayoutBinding ab{};
+            ab.binding = 15; ab.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            ab.descriptorCount = 1; ab.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            m2Bindings.push_back(ab);
             VkDescriptorSetLayoutBinding lb{};
             lb.binding = 14; lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             lb.descriptorCount = 1; lb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -189,6 +196,9 @@ public:
         m_m2VertModule = CreateShaderModule(m2_vert_spv, sizeof(m2_vert_spv));
         m_m2FragModule = CreateShaderModule(c_m2_fragSpv, sizeof(c_m2_fragSpv));
         m_m2FragNdModule = CreateShaderModule(c_m2_fragNoDiscardSpv, sizeof(c_m2_fragNoDiscardSpv));
+        m_m2FragCutDModule = CreateShaderModule(c_m2_fragCutDepthSpv, sizeof(c_m2_fragCutDepthSpv));
+        m_m2FragLeanModule = CreateShaderModule(c_m2_fragLeanSpv, sizeof(c_m2_fragLeanSpv));
+        m_m2FragCutCModule = CreateShaderModule(c_m2_fragCutColorSpv, sizeof(c_m2_fragCutColorSpv));
 
         // 5. Create Pipelines
         CreatePipelines(renderPass);
@@ -322,6 +332,7 @@ public:
 
             m_rawPrims.resize(n);
             m_primSlot.assign(n, 0xffffffffu);
+            m_primLayer.assign(n, 0xffffffffu);
             std::size_t vcount = 0, icount = 0;
             for (std::uint32_t k = 0; k < n; k++) {
                 const tcvr_m2_prim& p = frame.raw_prims[0xffffu - (m_rawKeys[k] & 0xffffu)];
@@ -335,6 +346,8 @@ public:
             std::vector<std::uint32_t> rawGlassIdx, rawCutIdx;
             rawGlassIdx.reserve(icount / 8);
             rawCutIdx.reserve(icount / 4);
+            std::vector<std::uint32_t> cutSegStart;   // per cut polygon, to emit them FAR to NEAR
+            std::vector<std::uint32_t> rawSecIdx;     // secondary views (other cameras, on the screen plane)
 
             std::size_t vo = 0, io = 0;
             std::uint32_t last_zsort = 0xffffffffu;
@@ -363,6 +376,13 @@ public:
                         if (q.utex != 0u) micro = m_regions.Slot(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
                     }
                     m_primSlot[k] = slot | (micro << 16);
+                    uint32_t layer = M2RegionTextures::kNone, mlayer = M2RegionTextures::kNone;
+                    if (q.textured != 0u) {
+                        layer = m_regions.Layer(m_sheetCpu, q.texsheet & 1u, (q.texx - 2048u) & 2047u, (q.texy - 1024u) & 1023u,
+                                                q.texwidth, q.texheight);
+                        if (q.utex != 0u) mlayer = m_regions.Layer(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
+                    }
+                    m_primLayer[k] = layer | (mlayer << 16);
                 }
 
                 for (std::uint32_t v = 0; v < vc; v++) {
@@ -381,8 +401,15 @@ public:
                 // Discard-free: opaque, no stipple, main camera (secondary views need the clip test).
                 const bool fast = !isGlass && isMain && (q.translucent == 0u || !RegionHasHoles(q));
                 if (invisible) {
+                } else if (!isGlass && !isMain) {
+                    for (std::uint32_t t = 1; t + 1 < vc; t++) {
+                        rawSecIdx.push_back(q.first_vertex);
+                        rawSecIdx.push_back(q.first_vertex + t);
+                        rawSecIdx.push_back(q.first_vertex + t + 1);
+                    }
                 } else if (!isGlass && !fast) {
                     for (std::uint32_t t = 1; t + 1 < vc; t++) {
+                        if (t == 1) cutSegStart.push_back(std::uint32_t(rawCutIdx.size()));
                         rawCutIdx.push_back(q.first_vertex);
                         rawCutIdx.push_back(q.first_vertex + t);
                         rawCutIdx.push_back(q.first_vertex + t + 1);
@@ -404,7 +431,21 @@ public:
             }
 
             m_fastIndexCount = unsigned(io);
-            for (std::uint32_t idx : rawCutIdx) m_rawIdx[io++] = idx;
+            // Cut-outs are drawn WITHOUT depth writes (so the Adreno keeps its early depth test and
+            // skips every tree fragment hidden by the opaque scene): among themselves they must then
+            // be painted far to near. Polygons are in near-to-far rank order: emit them reversed.
+            // Mode 1 (no depth write) paints them far to near; modes 0/2 keep near to far (depth decides).
+            m_cutMode = std::max(0, std::min(2, arcadexr::config::GetInt("m2.cutMode", 2)));
+            if (m_cutMode == 1) {
+                for (size_t sgi = cutSegStart.size(); sgi-- > 0;) {
+                    const size_t b = cutSegStart[sgi], e = (sgi + 1 < cutSegStart.size()) ? cutSegStart[sgi + 1] : rawCutIdx.size();
+                    for (size_t x = b; x < e; ++x) m_rawIdx[io++] = rawCutIdx[x];
+                }
+            } else {
+                for (std::uint32_t idx : rawCutIdx) m_rawIdx[io++] = idx;
+            }
+            m_secIndexStart = unsigned(io);
+            for (std::uint32_t idx : rawSecIdx) m_rawIdx[io++] = idx;
             m_opaqueIndexCount = unsigned(io);
             m_glassIndexCount = unsigned(rawGlassIdx.size());
             for (std::uint32_t idx : rawGlassIdx) {
@@ -414,7 +455,11 @@ public:
 
             // first_vertex is not read by any shader: it now carries the region slots
             // (main | microtexture << 16) to the vertex stage, which hands them on flat.
-            for (std::uint32_t k = 0; k < n; k++) m_rawPrims[k].first_vertex = m_primSlot[k];
+            // vertex_count, also unread by the shaders, carries the texture-array layers the same way.
+            for (std::uint32_t k = 0; k < n; k++) {
+                m_rawPrims[k].first_vertex = m_primSlot[k];
+                m_rawPrims[k].vertex_count = m_primLayer[k];
+            }
         }
     }
 
@@ -597,6 +642,9 @@ public:
             ubo.uContrast = arcadexr::config::GetFloat("contrast", 1.2f);
             ubo.uBright = arcadexr::config::GetFloat("bright", -0.02f);
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
+            ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
+            ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
+            ubo.padEnd[0] = arcadexr::config::GetInt("m2.hwAnisoOn", 1) != 0 ? 0 : 4;   // = uSmpBase (live A/B)
             ubo.uCountOverdraw = (m_useRegions && arcadexr::config::GetInt("m2.regions", 1) != 0) ? 1 : 0;  // = uUseRegions
         }
 
@@ -618,14 +666,27 @@ public:
             // Pass 1: Opaque
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
             if (m_fastIndexCount > 0 && !(skip & 4)) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineFast);
+                // LEAN: the same opaque polygons through a shader holding only their path (occupancy).
+                const bool lean = arcadexr::config::GetInt("m2.lean", 1) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lean ? m_m2PipelineFastLean : m_m2PipelineFast);
                 vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
             }
-            if (m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineOpaque);
-                vkCmdDrawIndexed(cmd, m_opaqueIndexCount - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
+            const bool cutNoWrite = (m_cutMode == 1);
+            if (m_cutMode == 2 && m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
+                // Cut-outs, depth pre-pass then colour of the visible sample only (before the background,
+                // which then only fills what nothing covered).
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutDepth);
+                vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutColor);
+                vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
             }
-
+            if (m_cutMode == 0) {
+            if (m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineOpaque);
+                    vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
+                }
+    
+    }
             // Background AFTER the opaque geometry, depth-tested on the far plane (m2.bgAfter=1):
             // void + back 2D layer now shade only the pixels no polygon covered.
         // 1. DrawVoid
@@ -656,6 +717,19 @@ public:
             }
     
     
+            // Secondary views (rear-view mirror, previews) on the arcade screen plane: own range, skip bit 64.
+            if (m_opaqueIndexCount > m_secIndexStart && !(skip & 64)) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineOpaque);
+                vkCmdDrawIndexed(cmd, m_opaqueIndexCount - m_secIndexStart, 1, m_secIndexStart, 0, 0);
+            }
+            // Cut-outs after the background, no depth write, far to near (see index building).
+            if (cutNoWrite && m_opaqueIndexCount > m_fastIndexCount && !(skip & 8)) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineCutNoWrite);
+                vkCmdDrawIndexed(cmd, m_secIndexStart - m_fastIndexCount, 1, m_fastIndexCount, 0, 0);
+            }
+
             // Pass 2: Glass (after the background: it blends over what is really behind it)
             if (m_glassIndexCount > 0 && !(skip & 16)) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineGlass);
@@ -679,8 +753,8 @@ public:
 
         static unsigned s_immFrames = 0;
         if ((s_immFrames++ % 120u) == 0u) {
-            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u lut=%d prims=%zu fast=%u opq=%u gls=%u res=%ux%u",
-                                             eye, int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_opaqueIndexCount, m_glassIndexCount,
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK rendered eye=%u lean=%d layers=%u lut=%d prims=%zu fast=%u cutEnd=%u opq=%u gls=%u res=%ux%u",
+                                             eye, int(arcadexr::config::GetInt("m2.lean", 1) != 0 && ubo_texArray(eye)), m_regions.LayerCount(), int(m_lutValid), m_rawPrims.size(), m_fastIndexCount, m_secIndexStart, m_opaqueIndexCount, m_glassIndexCount,
                                              renderAreaExtent.width, renderAreaExtent.height));
         }
 
@@ -688,6 +762,11 @@ public:
     }
 
     bool HaveMainView() const { return m_haveMainView; }
+    // The LEAN shader assumes filter mode 5 + texture array + no edge fade + stage 0.
+    bool ubo_texArray(uint32_t eye) const {
+        const M2UniformBufferObject& u = *m_uboMappedF[m_fs][eye < 2 ? eye : 0][0];
+        return u.uFilterMode == 5 && (u.padEnd[2] & 2) != 0 && u.uTestStage == 0;
+    }
     void SetFrameSlot(int s) { m_fs = s & 1; m_regions.SetHalf(uint32_t(m_fs)); }
 
     // Does this polygon's texture (level 0 region) contain the transparent index 15 at all?
@@ -897,6 +976,10 @@ public:
         auto destroyPipe = [&](VkPipeline& p) { if (p != VK_NULL_HANDLE) { vkDestroyPipeline(m_vkDevice, p, nullptr); p = VK_NULL_HANDLE; } };
         destroyPipe(m_m2PipelineOpaque);
         destroyPipe(m_m2PipelineFast);
+        destroyPipe(m_m2PipelineCutNoWrite);
+        destroyPipe(m_m2PipelineCutDepth);
+        destroyPipe(m_m2PipelineFastLean);
+        destroyPipe(m_m2PipelineCutColor);
         destroyPipe(m_voidPipelineFar);
         destroyPipe(m_planePipelineFar);
         destroyPipe(m_m2PipelineGlass);
@@ -916,6 +999,9 @@ public:
         destroyMod(m_m2VertModule);
         destroyMod(m_m2FragModule);
         destroyMod(m_m2FragNdModule);
+        destroyMod(m_m2FragCutDModule);
+        destroyMod(m_m2FragLeanModule);
+        destroyMod(m_m2FragCutCModule);
         destroyMod(m_quadFarVertModule);
         destroyMod(m_quadVertModule);
         destroyMod(m_voidFragModule);
@@ -1164,11 +1250,40 @@ private:
             msCut.alphaToCoverageEnable = (m_samples != VK_SAMPLE_COUNT_1_BIT) ? VK_TRUE : VK_FALSE;
             pipeInfo.pMultisampleState = &msCut;
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineOpaque));
+            {   // same, depth test but NO depth write: early depth rejection stays on despite discard
+                VkPipelineDepthStencilStateCreateInfo dsCut = dsOpaque;
+                dsCut.depthWriteEnable = VK_FALSE;
+                pipeInfo.pDepthStencilState = &dsCut;
+                XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineCutNoWrite));
+                pipeInfo.pDepthStencilState = &dsOpaque;
+            }
+            {   // cut-out DEPTH pre-pass: opacity-only shader, colour masked, A2C coverage -> per-sample depth
+                VkPipelineColorBlendAttachmentState noColor = cbOpaqueAtt;
+                noColor.colorWriteMask = 0;
+                VkPipelineColorBlendStateCreateInfo cbNo = cbOpaqueState;
+                cbNo.pAttachments = &noColor;
+                pipeInfo.pColorBlendState = &cbNo;
+                stages[1].module = m_m2FragCutDModule;
+                XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineCutDepth));
+                pipeInfo.pColorBlendState = &cbOpaqueState;
+                // cut-out COLOUR pass: depth EQUAL, no write, no discard, early tests, no A2C
+                VkPipelineDepthStencilStateCreateInfo dsEq = dsOpaque;
+                dsEq.depthWriteEnable = VK_FALSE;
+                dsEq.depthCompareOp = VK_COMPARE_OP_EQUAL;
+                pipeInfo.pDepthStencilState = &dsEq;
+                pipeInfo.pMultisampleState = &msState;
+                stages[1].module = m_m2FragCutCModule;
+                XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineCutColor));
+                pipeInfo.pDepthStencilState = &dsOpaque;
+                stages[1].module = m_m2FragModule;
+            }
             pipeInfo.pMultisampleState = &msState;
             // Same state, fragment shader compiled WITHOUT any discard: the Adreno keeps its
             // early depth rejection (LRZ) on for these, so hidden fragments are never shaded.
             stages[1].module = m_m2FragNdModule;
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineFast));
+            stages[1].module = m_m2FragLeanModule;
+            XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_m2PipelineFastLean));
             stages[1].module = m_m2FragModule;
 
             // Glass depth state: test=TRUE, write=FALSE, LESS_OR_EQUAL
@@ -1525,9 +1640,18 @@ private:
             size_t bytes = std::min(size_t(frame.palram_entries) * sizeof(uint16_t), m_palramSize);
             memcpy(m_palramMappedF[m_fs], frame.palram, bytes);
         }
+        m_gammaFolded = arcadexr::config::GetInt("m2.foldGamma", 1) != 0 && frame.gamma && frame.gamma_entries >= 256;
         if (frame.colorxlat && frame.colorxlat_entries) {
             size_t bytes = std::min(size_t(frame.colorxlat_entries) * sizeof(uint16_t), m_colorxlatSize);
-            memcpy(m_colorxlatMappedF[m_fs], frame.colorxlat, bytes);
+            if (m_gammaFolded) {
+                // gamma folded INTO colorxlat (same buffer, same shader code shape): one dependent
+                // read level less per pixel -- the shader then skips gamma8().
+                uint16_t* dst = reinterpret_cast<uint16_t*>(m_colorxlatMappedF[m_fs]);
+                const size_t n = bytes / sizeof(uint16_t);
+                for (size_t i = 0; i < n; ++i) dst[i] = frame.gamma[frame.colorxlat[i] & 0xffu];
+            } else {
+                memcpy(m_colorxlatMappedF[m_fs], frame.colorxlat, bytes);
+            }
         }
         if (frame.lumaram && frame.lumaram_entries) {
             size_t bytes = std::min(size_t(frame.lumaram_entries) * sizeof(uint8_t), m_lumaramSize);
@@ -1696,6 +1820,13 @@ private:
     VkShaderModule m_m2FragModule = VK_NULL_HANDLE;
     VkShaderModule m_m2FragNdModule = VK_NULL_HANDLE;
     VkPipeline m_m2PipelineFast = VK_NULL_HANDLE;
+    VkPipeline m_m2PipelineCutNoWrite = VK_NULL_HANDLE;
+    VkPipeline m_m2PipelineCutDepth = VK_NULL_HANDLE, m_m2PipelineCutColor = VK_NULL_HANDLE;
+    VkShaderModule m_m2FragCutDModule = VK_NULL_HANDLE, m_m2FragCutCModule = VK_NULL_HANDLE;
+    int m_cutMode = 2;
+    VkPipeline m_m2PipelineFastLean = VK_NULL_HANDLE;
+    VkShaderModule m_m2FragLeanModule = VK_NULL_HANDLE;
+    unsigned m_secIndexStart = 0;
     VkFormat m_colorFormat = VK_FORMAT_UNDEFINED;
     VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;
     VkRenderPass m_pass = VK_NULL_HANDLE;
@@ -1751,6 +1882,8 @@ private:
     uint8_t* m_lutMapped = nullptr;
     uint32_t m_lastEyePixels = 0;
     bool m_built = false;
+    bool m_edgeFadeOff = true;
+    bool m_gammaFolded = false;
 
     BufferAndMemory m_vboBufferF[kFrames];
     float* m_vboMappedF[kFrames] = {};
@@ -1783,7 +1916,8 @@ private:
     std::vector<uint8_t> m_lutSrcCx, m_lutSrcGamma;
     bool m_lutValid = false;
     bool m_useRegions = false;
-    std::vector<uint32_t> m_primSlot;                       // unpacked t per texel, for the region scan
+    std::vector<uint32_t> m_primSlot;
+    std::vector<uint32_t> m_primLayer;                       // unpacked t per texel, for the region scan
     std::unordered_map<uint64_t, bool> m_regionHasHoles;      // region key -> contains texel 15
     uint64_t m_sheetGeneration = 0;
     uint64_t m_texHash = 0;
