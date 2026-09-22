@@ -96,6 +96,11 @@ if(ANDROID)
         message(STATUS "hello_xr: TCVR_BAKE_HWONLY -> preset hwonly bake en dur")
     endif()
 
+    if(TCVR_VK_BAKE)
+        # Vulkan Sega Rally immersive: the validated defaults are baked (no props needed after a reboot).
+        target_compile_definitions(hello_xr PRIVATE TCVR_VK_BAKE=1)
+        message(STATUS "hello_xr: TCVR_VK_BAKE -> Vulkan immersive defaults baked (res 1.2, 90 Hz)")
+    endif()
     if(TCVR_RAW_SHEET)
         target_compile_definitions(hello_xr PRIVATE TCVR_RAW_SHEET=1)
         message(STATUS "hello_xr: TCVR_RAW_SHEET -> direct texture sheet rendering")

@@ -978,7 +978,12 @@ struct OpenXrProgram : IOpenXrProgram {
                 // backgrounded and not rendering, and 51-58 in the foreground.
                 // This scale is the lever for that, and it is a setting rather
                 // than a constant because what it costs is a judgement call.
+#if defined(TCVR_VK_BAKE)
+                // Vulkan immersive: 1.2 holds 90 Hz locked with MSAA 4x (measured 22/09, 0% of seconds under 88).
+                float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.2f);
+#else
                 float scale = arcadexr::config::GetFloat("xr.resolution_scale", 1.0f);
+#endif
                 if (scale < 0.3f) scale = 0.3f;
                 if (scale > 2.0f) scale = 2.0f;   // allow >1.0 = supersampling (sharper, at fill cost)
                 swapchainCreateInfo.width = uint32_t(vp.recommendedImageRectWidth * scale);
