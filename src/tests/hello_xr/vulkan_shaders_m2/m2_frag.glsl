@@ -75,11 +75,6 @@ uint colorxlat16(uint i) { return u16at(i & 1u, colorxlat[i >> 1]); }
 uint lumaram8(uint i)    { return (lumaram[i >> 2] >> (8u * (i & 3u))) & 0xffu; }
 uint gamma8(uint i)      { return (gammaTab[i >> 2] >> (8u * (i & 3u))) & 0xffu; }
 
-uint sheet32(uint sheet, uint i) {
-    ivec2 at = ivec2(int(i & 1023u), int(i >> 10));
-    return (sheet == 0u) ? texelFetch(uSheetTex0, at, 0).r : texelFetch(uSheetTex1, at, 0).r;
-}
-
 uint get_texel(uint base_x, uint base_y, int x, int y, uint sheet) {
     int x2 = int(base_x) + x;
     int y2 = int(base_y) + y;
@@ -87,12 +82,8 @@ uint get_texel(uint base_x, uint base_y, int x, int y, uint sheet) {
         x2 -= 1024;
         y2 ^= 1024;
     }
-    uint offset = uint((y2 / 2) * 512 + (x2 / 2));
-    uint texel = sheet32(sheet, offset >> 1);
-    if ((offset & 1u) != 0u) texel >>= 16;
-    if ((y & 1) == 0)        texel >>= 8;
-    if ((x & 1) == 0)        texel >>= 4;
-    return texel & 0x0fu;
+    ivec2 at = ivec2(x2, y2);
+    return (sheet == 0u) ? texelFetch(uSheetTex0, at, 0).r : texelFetch(uSheetTex1, at, 0).r;
 }
 
 uint lerp_packed(uint x, uint y, uint a) {
@@ -138,22 +129,21 @@ uint fetch_bilinear_texel(Prim p, int miplevel, int u, int v, bool translucent) 
     uint tex01 = get_texel(tex_x, tex_y, u1, v0, sheet) << 4;
     uint tex10 = get_texel(tex_x, tex_y, u0, v1, sheet) << 4;
     uint tex11 = get_texel(tex_x, tex_y, u1, v1, sheet) << 4;
-    if (translucent) {
-        if (tex00 != 0xf0u) tex00 |= 0x00800000u;
-        if (tex01 != 0xf0u) tex01 |= 0x00800000u;
-        if (tex10 != 0xf0u) tex10 |= 0x00800000u;
-        if (tex11 != 0xf0u) tex11 |= 0x00800000u;
-        if (tex00 == 0x000000f0u) tex00 = tex01 & 0xffu;
-        if (tex01 == 0x000000f0u) tex01 = tex00 & 0xffu;
-        if (tex10 == 0x000000f0u) tex10 = tex11 & 0xffu;
-        if (tex11 == 0x000000f0u) tex11 = tex10 & 0xffu;
+    if (!translucent) {
+        return lerp_packed(lerp_packed(tex00, tex01, ufrac), lerp_packed(tex10, tex11, ufrac), vfrac);
     }
+    if (tex00 != 0xf0u) tex00 |= 0x00800000u;
+    if (tex01 != 0xf0u) tex01 |= 0x00800000u;
+    if (tex10 != 0xf0u) tex10 |= 0x00800000u;
+    if (tex11 != 0xf0u) tex11 |= 0x00800000u;
+    if (tex00 == 0x000000f0u) tex00 = tex01 & 0xffu;
+    if (tex01 == 0x000000f0u) tex01 = tex00 & 0xffu;
+    if (tex10 == 0x000000f0u) tex10 = tex11 & 0xffu;
+    if (tex11 == 0x000000f0u) tex11 = tex10 & 0xffu;
     uint tex0x = lerp_packed(tex00, tex01, ufrac);
     uint tex1x = lerp_packed(tex10, tex11, ufrac);
-    if (translucent) {
-        if (tex0x == 0x000000f0u) tex0x = tex1x & 0xffu;
-        if (tex1x == 0x000000f0u) tex1x = tex0x & 0xffu;
-    }
+    if (tex0x == 0x000000f0u) tex0x = tex1x & 0xffu;
+    if (tex1x == 0x000000f0u) tex1x = tex0x & 0xffu;
     return lerp_packed(tex0x, tex1x, vfrac);
 }
 

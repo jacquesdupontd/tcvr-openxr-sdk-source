@@ -747,11 +747,11 @@ struct RenderPass {
 
             at[colorRef.attachment].format = colorFmt;
             at[colorRef.attachment].samples = sampleCount;
-            at[colorRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            at[colorRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             at[colorRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             at[colorRef.attachment].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             at[colorRef.attachment].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            at[colorRef.attachment].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            at[colorRef.attachment].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             at[colorRef.attachment].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
             subpass.colorAttachmentCount = 1;
@@ -763,11 +763,11 @@ struct RenderPass {
 
             at[depthRef.attachment].format = depthFmt;
             at[depthRef.attachment].samples = sampleCount;
-            at[depthRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            at[depthRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            at[depthRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            at[depthRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
             at[depthRef.attachment].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             at[depthRef.attachment].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            at[depthRef.attachment].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            at[depthRef.attachment].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             at[depthRef.attachment].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
             subpass.pDepthStencilAttachment = &depthRef;

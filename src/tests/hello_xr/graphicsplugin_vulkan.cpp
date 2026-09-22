@@ -1177,9 +1177,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             swapchainData->TransitionLayout(imageIndex, &m_cmdBuffer[v], VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
 
-        vkCmdBeginRenderPass(cmd, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-        // Bind and clear eye render target
+        // Bind and clear eye render target via render pass LOAD_OP_CLEAR
         static std::array<VkClearValue, 2> clearValues;
         clearValues[0].color.float32[0] = m_clearColor[0];
         clearValues[0].color.float32[1] = m_clearColor[1];
@@ -1190,14 +1188,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         renderPassBeginInfo.clearValueCount = (uint32_t)clearValues.size();
         renderPassBeginInfo.pClearValues = clearValues.data();
 
-        std::array<VkClearAttachment, 2> clearAttachments{{
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, clearValues[0]},
-            {secondAttachmentAspect, 0, clearValues[1]},
-        }};
-
-        // imageArrayIndex already included in the VkImageView
-        VkClearRect clearRect{renderArea, 0, 1};
-        vkCmdClearAttachments(cmd, 2, &clearAttachments[0], 1, &clearRect);
+        vkCmdBeginRenderPass(cmd, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
         // Compute the view-projection transform.
         const auto& pose = layerView.pose;

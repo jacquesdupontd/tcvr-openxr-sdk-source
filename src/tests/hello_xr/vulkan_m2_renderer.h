@@ -469,7 +469,7 @@ public:
             ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
             ubo.uGround[0] = m_groundColor[0]; ubo.uGround[1] = m_groundColor[1]; ubo.uGround[2] = m_groundColor[2];
             ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1)));
-            ubo.uFilterMode = std::max(0, std::min(4, arcadexr::config::GetInt("m2.filter", 0)));
+            ubo.uFilterMode = std::max(0, std::min(4, arcadexr::config::GetInt("m2.filter", 1)));
             ubo.uMipBias = std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0)));
             ubo.uAlphaCoverage = arcadexr::config::GetInt("m2.alphaCoverage", 0);
             ubo.uContrast = arcadexr::config::GetFloat("contrast", 1.2f);
@@ -891,7 +891,7 @@ private:
 
         // 4. Staging Buffers
         for (int i = 0; i < 2; ++i) {
-            createMappedBuffer(m_sheetStagingBuffer[i], 1024 * 512 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            createMappedBuffer(m_sheetStagingBuffer[i], 1024 * 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                reinterpret_cast<void**>(&m_sheetStagingMapped[i]));
         }
 
@@ -902,16 +902,16 @@ private:
     }
 
     void AllocateTextures() {
-        // Sheet textures: 2 images, 1024x512, R32_UINT
+        // Sheet textures: 2 images, 1024x4096, R8_UINT
         for (int s = 0; s < 2; ++s) {
             VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             imgInfo.imageType = VK_IMAGE_TYPE_2D;
             imgInfo.extent.width = 1024;
-            imgInfo.extent.height = 512;
+            imgInfo.extent.height = 4096;
             imgInfo.extent.depth = 1;
             imgInfo.mipLevels = 1;
             imgInfo.arrayLayers = 1;
-            imgInfo.format = VK_FORMAT_R32_UINT;
+            imgInfo.format = VK_FORMAT_R8_UINT;
             imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -927,7 +927,7 @@ private:
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = m_sheetImage[s];
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = VK_FORMAT_R32_UINT;
+            viewInfo.format = VK_FORMAT_R8_UINT;
             viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             viewInfo.subresourceRange.baseMipLevel = 0;
             viewInfo.subresourceRange.levelCount = 1;
@@ -1156,8 +1156,32 @@ private:
             const uint32_t wordCount = frame.textureram_words;
             if (!words || wordCount == 0) continue;
 
-            const size_t copySize = std::min(size_t(wordCount) * sizeof(uint32_t), size_t(1024 * 512 * 4));
-            memcpy(m_sheetStagingMapped[sheet], words, copySize);
+            uint8_t* dst = reinterpret_cast<uint8_t*>(m_sheetStagingMapped[sheet]);
+            const uint32_t totalWords = std::min(wordCount, 524288u);
+            for (uint32_t word_idx = 0; word_idx < totalWords; ++word_idx) {
+                const uint32_t w = words[word_idx];
+                const uint32_t off0 = word_idx * 2;
+                const uint32_t yh0 = off0 / 512;
+                const uint32_t xh0 = off0 % 512;
+                const uint32_t x0 = xh0 * 2;
+                const uint32_t y0 = yh0 * 2;
+                const uint32_t w0 = w & 0xffff;
+                dst[y0 * 1024 + x0] = (w0 >> 12) & 0xf;
+                dst[y0 * 1024 + (x0 + 1)] = (w0 >> 8) & 0xf;
+                dst[(y0 + 1) * 1024 + x0] = (w0 >> 4) & 0xf;
+                dst[(y0 + 1) * 1024 + (x0 + 1)] = w0 & 0xf;
+
+                const uint32_t off1 = off0 + 1;
+                const uint32_t yh1 = off1 / 512;
+                const uint32_t xh1 = off1 % 512;
+                const uint32_t x1 = xh1 * 2;
+                const uint32_t y1 = yh1 * 2;
+                const uint32_t w1 = (w >> 16) & 0xffff;
+                dst[y1 * 1024 + x1] = (w1 >> 12) & 0xf;
+                dst[y1 * 1024 + (x1 + 1)] = (w1 >> 8) & 0xf;
+                dst[(y1 + 1) * 1024 + x1] = (w1 >> 4) & 0xf;
+                dst[(y1 + 1) * 1024 + (x1 + 1)] = w1 & 0xf;
+            }
 
             // Barrier: UNDEFINED or SHADER_READ_ONLY -> TRANSFER_DST
             VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1174,10 +1198,10 @@ private:
             VkBufferImageCopy region{};
             region.bufferOffset = 0;
             region.bufferRowLength = 1024;
-            region.bufferImageHeight = 512;
+            region.bufferImageHeight = 4096;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageOffset = {0, 0, 0};
-            region.imageExtent = {1024, 512, 1};
+            region.imageExtent = {1024, 4096, 1};
             vkCmdCopyBufferToImage(cmd, m_sheetStagingBuffer[sheet].buf, m_sheetImage[sheet],
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
