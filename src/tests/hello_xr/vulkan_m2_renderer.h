@@ -551,6 +551,8 @@ public:
         return true;
     }
 
+    bool HaveMainView() const { return m_haveMainView; }
+
     void Cleanup() {
         if (!m_initialized) return;
         m_initialized = false;

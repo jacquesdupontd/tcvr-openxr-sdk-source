@@ -40,6 +40,8 @@
 #include "game_profile.h"
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_renderer.h"
+#include <chrono>
+#include <algorithm>
 #include <algorithm>
 #include <cmath>
 
@@ -1081,17 +1083,22 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_cmdBuffer[1].Wait();
             m_cmdBuffer[0].Clear();
             m_cmdBuffer[1].Clear();
+            ReadGpuTimestamps();
         }
 
         VkCommandBuffer cmd = m_cmdBuffer[v].buf;
         m_cmdBuffer[v].Begin();
+        if (m_gpuQueryPool == VK_NULL_HANDLE) CreateGpuQueryPool();
+        if (m_gpuQueryPool != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(cmd, m_gpuQueryPool, uint32_t(v * 2), 2);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_gpuQueryPool, uint32_t(v * 2));
+        }
 
         // 1. If viewIndex == 0, check for new MAME frame and upload to m_screenImage via staging buffer
         if (viewIndex == 0) {
             if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m_m2SceneRequested = true;
-                arcadexr::hardware::sega_model2::EnableScene(1);
-                Log::Write(Log::Level::Info, "TCVR_M2VK: Enabled Model 2 scene recording (mode 1)");
+                SetM2SceneMode(1);
             }
             if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 const tcvr_m2_frame* m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
@@ -1273,6 +1280,19 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
 
         vkCmdEndRenderPass(cmd);
+        if (m_gpuQueryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_gpuQueryPool, uint32_t(v * 2 + 1));
+            m_gpuQueryWritten[v] = true;
+        }
+        // Scene recording mode, decided once per frame on the left eye. Mode 2 = MAME records
+        // the scene INSTEAD of rasterising it (its CPU raster costs ~10 ms/frame, which is what
+        // dropped the emulation to ~53 fps and pitched the sound down). Only while the immersive
+        // pass really drew a centred main view (a race); menus/intro keep mode 1 so the flat
+        // fallback always has a fresh picture.
+        if (viewIndex == 0 && m_m2SceneRequested) {
+            const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 1) != 0;
+            SetM2SceneMode((m2ImmersiveDrawn && m_m2Renderer.HaveMainView() && allowSkip) ? 2 : 1);
+        }
 
         m_cmdBuffer[v].End();
         m_cmdBuffer[v].Exec(m_vkQueue);
@@ -1291,6 +1311,52 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 #endif
     }
 
+    void SetM2SceneMode(int mode) {
+        if (mode == m_m2SceneMode) return;
+        m_m2SceneMode = mode;
+        arcadexr::hardware::sega_model2::EnableScene(mode);
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK scene recording mode %d (%s)", mode,
+                                         mode >= 2 ? "GPU draws it, MAME does not rasterise" : "alongside MAME's CPU raster"));
+    }
+
+    // GPU time per eye, from Vulkan timestamps around each eye's command buffer (not
+    // inside the render pass: on a tiler that would only time the binning). Read one
+    // frame late, after the fence, so it never stalls. Logged as TCVR_VKGPU once a
+    // second: median/max of the per-frame sum of both eyes, in ms.
+    void CreateGpuQueryPool() {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(m_vkPhysicalDevice, &props);
+        m_timestampPeriodNs = props.limits.timestampPeriod;
+        if (props.limits.timestampComputeAndGraphics == VK_FALSE || m_timestampPeriodNs <= 0.0f) {
+            m_gpuQueryPool = VK_NULL_HANDLE;
+            return;
+        }
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 4;
+        if (vkCreateQueryPool(m_vkDevice, &qi, nullptr, &m_gpuQueryPool) != VK_SUCCESS) m_gpuQueryPool = VK_NULL_HANDLE;
+    }
+
+    void ReadGpuTimestamps() {
+        if (m_gpuQueryPool == VK_NULL_HANDLE || !m_gpuQueryWritten[0] || !m_gpuQueryWritten[1]) return;
+        uint64_t ts[4] = {};
+        if (vkGetQueryPoolResults(m_vkDevice, m_gpuQueryPool, 0, 4, sizeof(ts), ts, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+            return;
+        const double ms = (double(ts[1] - ts[0]) + double(ts[3] - ts[2])) * m_timestampPeriodNs * 1e-6;
+        m_gpuSamples.push_back(float(ms));
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_gpuLogAt >= std::chrono::seconds(1) && !m_gpuSamples.empty()) {
+            std::vector<float> s = m_gpuSamples;
+            std::sort(s.begin(), s.end());
+            const float med = s[s.size() / 2], p90 = s[(s.size() * 9) / 10], mx = s.back();
+            Log::Write(Log::Level::Info, Fmt("TCVR_VKGPU frames=%zu gpuMs med=%.2f p90=%.2f max=%.2f (both eyes) mode=%d",
+                                             s.size(), med, p90, mx, m_m2SceneMode));
+            m_gpuSamples.clear();
+            m_gpuLogAt = now;
+        }
+    }
+
     uint32_t GetSupportedSwapchainSampleCount(const XrViewConfigurationView&) override { return VK_SAMPLE_COUNT_1_BIT; }
 
     void SetClearColor(const std::array<float, 4> clearColor) override { m_clearColor = clearColor; }
@@ -1299,6 +1365,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (m_vkDevice != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(m_vkDevice);
             m_m2Renderer.Cleanup();
+            if (m_gpuQueryPool != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(m_vkDevice, m_gpuQueryPool, nullptr);
+                m_gpuQueryPool = VK_NULL_HANDLE;
+            }
             if (m_screenPipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_vkDevice, m_screenPipeline, nullptr);
                 m_screenPipeline = VK_NULL_HANDLE;
@@ -1387,6 +1457,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     arcadexr::vulkan::VulkanModel2Renderer m_m2Renderer;
     bool m_m2RendererInitialized{false};
     bool m_m2SceneRequested{false};
+    int m_m2SceneMode{-1};
+    VkQueryPool m_gpuQueryPool{VK_NULL_HANDLE};
+    bool m_gpuQueryWritten[2]{false, false};
+    float m_timestampPeriodNs{0.0f};
+    std::vector<float> m_gpuSamples;
+    std::chrono::steady_clock::time_point m_gpuLogAt{};
 
     PipelineLayout m_computePipelineLayout{};
     VkDescriptorSet m_ComputeDescriptorSet;
