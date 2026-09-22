@@ -35,6 +35,13 @@
 
 #include "framebuffer_bridge.h"
 #include "virtual_screen.h"
+#include "scene_bridge.h"
+#include "settings.h"
+#include "game_profile.h"
+#include "m2_pipeline_types.h"
+#include "vulkan_m2_renderer.h"
+#include <algorithm>
+#include <cmath>
 
 struct ScreenVertex {
     XrVector3f Position;
@@ -1067,6 +1074,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         // 1. If viewIndex == 0, check for new MAME frame and upload to m_screenImage via staging buffer
         if (viewIndex == 0) {
+            if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
+                m_m2SceneRequested = true;
+                arcadexr::hardware::sega_model2::EnableScene(1);
+                Log::Write(Log::Level::Info, "TCVR_M2VK: Enabled Model 2 scene recording (mode 1)");
+            }
+            if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
+                const tcvr_m2_frame* m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
+                if (m2Frame) {
+                    m_m2Renderer.PrepareFrame(*m2Frame, m_cmdBuffer.buf);
+                }
+            }
             arcadexr::video::FrameInfo info;
             if (arcadexr::video::PeekLatestFrameInfo(info)) {
                 if (info.sequence != m_lastScreenSequence || (uint32_t)info.width != m_screenWidth || (uint32_t)info.height != m_screenHeight) {
@@ -1178,44 +1196,58 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f vp;
         XrMatrix4x4f_Multiply(&vp, &proj, &view);
 
-        // Render Virtual Arcade Screen
-        arcadexr::gun::ScreenPlane screen;
-        if (m_screenImage != VK_NULL_HANDLE && arcadexr::video::GetVirtualScreen(screen)) {
-            if (m_screenPipeline == VK_NULL_HANDLE) {
-                CreateScreenPipeline(renderPassBeginInfo.renderPass);
+        // Model 2 Native Immersive Rendering
+        const std::string presentation = arcadexr::profiles::GetString("presentation", "immersive");
+        const bool immersiveAllowed = (presentation == "immersive" && arcadexr::profiles::GetInt("m2.immersive", 1) != 0);
+        bool m2ImmersiveDrawn = false;
+        if (immersiveAllowed) {
+            if (!m_m2RendererInitialized) {
+                m_m2Renderer.Initialize(m_vkDevice, &m_memAllocator, renderPassBeginInfo.renderPass);
+                m_m2RendererInitialized = true;
             }
-            if (m_screenWidth > 0 && m_screenHeight > 0) {
-                arcadexr::video::UpdateVirtualScreenAspect(static_cast<float>(m_screenWidth) / static_cast<float>(m_screenHeight));
-                arcadexr::video::GetVirtualScreen(screen);
+            m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, m_cmdBuffer.buf, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
+        }
+
+        // Render Virtual Arcade Screen fallback
+        if (!m2ImmersiveDrawn) {
+            arcadexr::gun::ScreenPlane screen;
+            if (m_screenImage != VK_NULL_HANDLE && arcadexr::video::GetVirtualScreen(screen)) {
+                if (m_screenPipeline == VK_NULL_HANDLE) {
+                    CreateScreenPipeline(renderPassBeginInfo.renderPass);
+                }
+                if (m_screenWidth > 0 && m_screenHeight > 0) {
+                    arcadexr::video::UpdateVirtualScreenAspect(static_cast<float>(m_screenWidth) / static_cast<float>(m_screenHeight));
+                    arcadexr::video::GetVirtualScreen(screen);
+                }
+
+                XrMatrix4x4f model{};
+                model.m[0] = screen.right.x * screen.width;
+                model.m[1] = screen.right.y * screen.width;
+                model.m[2] = screen.right.z * screen.width;
+                model.m[4] = screen.up.x * screen.height;
+                model.m[5] = screen.up.y * screen.height;
+                model.m[6] = screen.up.z * screen.height;
+                model.m[8] = screen.normal.x;
+                model.m[9] = screen.normal.y;
+                model.m[10] = screen.normal.z;
+                model.m[12] = screen.center.x;
+                model.m[13] = screen.center.y;
+                model.m[14] = screen.center.z;
+                model.m[15] = 1.0f;
+
+                XrMatrix4x4f mvp;
+                XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+
+                vkCmdBindPipeline(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
+                vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
+                                        0, 1, &m_screenDescriptorSet, 0, nullptr);
+                vkCmdPushConstants(m_cmdBuffer.buf, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+
+                vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_screenDrawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+                VkDeviceSize vtxOffset = 0;
+                vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_screenDrawBuffer.vtx.buf, &vtxOffset);
+                vkCmdDrawIndexed(m_cmdBuffer.buf, 6, 1, 0, 0, 0);
             }
-
-            XrMatrix4x4f model{};
-            model.m[0] = screen.right.x * screen.width;
-            model.m[1] = screen.right.y * screen.width;
-            model.m[2] = screen.right.z * screen.width;
-            model.m[4] = screen.up.x * screen.height;
-            model.m[5] = screen.up.y * screen.height;
-            model.m[6] = screen.up.z * screen.height;
-            model.m[8] = screen.normal.x;
-            model.m[9] = screen.normal.y;
-            model.m[10] = screen.normal.z;
-            model.m[12] = screen.center.x;
-            model.m[13] = screen.center.y;
-            model.m[14] = screen.center.z;
-            model.m[15] = 1.0f;
-
-            XrMatrix4x4f mvp;
-            XrMatrix4x4f_Multiply(&mvp, &vp, &model);
-
-            vkCmdBindPipeline(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
-            vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
-                                    0, 1, &m_screenDescriptorSet, 0, nullptr);
-            vkCmdPushConstants(m_cmdBuffer.buf, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
-
-            vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_screenDrawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
-            VkDeviceSize vtxOffset = 0;
-            vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_screenDrawBuffer.vtx.buf, &vtxOffset);
-            vkCmdDrawIndexed(m_cmdBuffer.buf, 6, 1, 0, 0, 0);
         }
 
         // Render cubes
@@ -1259,6 +1291,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     ~VulkanGraphicsPlugin() override {
         if (m_vkDevice != VK_NULL_HANDLE) {
+            m_m2Renderer.Cleanup();
             if (m_screenPipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_vkDevice, m_screenPipeline, nullptr);
                 m_screenPipeline = VK_NULL_HANDLE;
@@ -1343,6 +1376,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkBuffer m_stagingBuffer{VK_NULL_HANDLE};
     VkDeviceMemory m_stagingBufferMemory{VK_NULL_HANDLE};
     VkDeviceSize m_stagingBufferSize{0};
+
+    arcadexr::vulkan::VulkanModel2Renderer m_m2Renderer;
+    bool m_m2RendererInitialized{false};
+    bool m_m2SceneRequested{false};
 
     PipelineLayout m_computePipelineLayout{};
     VkDescriptorSet m_ComputeDescriptorSet;
