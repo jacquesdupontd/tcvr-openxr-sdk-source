@@ -40,6 +40,9 @@
 #include "game_profile.h"
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_renderer.h"
+#include "vulkan_overlay.h"
+#include "menu.h"
+#include "aim_state.h"
 #include <chrono>
 #include <map>
 #include <algorithm>
@@ -59,6 +62,18 @@ static constexpr ScreenVertex c_screenVertices[] = {
 };
 
 static constexpr uint16_t c_screenIndices[] = {0, 1, 2, 0, 2, 3};
+
+// Push constants of vulkan_shaders_ov/screen_*.glsl (std430 push block layout).
+struct ScreenPC {
+    float mvp[16];
+    float aim[2];
+    float srcSize[2];
+    int32_t aimVisible, calibrating, filter;
+    float sharpen;
+};
+static_assert(sizeof(ScreenPC) == 96, "ScreenPC layout");
+#include "ov_screen_vert_spv.h"
+#include "ov_screen_frag_spv.h"
 
 namespace {
 
@@ -822,12 +837,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_drawBuffer.UpdateVertices(span<const Geometry::Vertex>(Geometry::c_cubeVertices, numCubeVerticies), 0);
 
         // Screen shader program & pipeline layout
-        std::vector<uint32_t> screenVertexSPIRV = SPV_PREFIX
-#include "screen_vert.spv"
-            SPV_SUFFIX;
-        std::vector<uint32_t> screenFragmentSPIRV = SPV_PREFIX
-#include "screen_frag.spv"
-            SPV_SUFFIX;
+        // Screen shaders: port of the GLES screen path (Catmull-Rom, crosshair, calibration), vulkan_shaders_ov/.
+        std::vector<uint32_t> screenVertexSPIRV(sizeof(c_ovScreenVertSpv) / 4), screenFragmentSPIRV(sizeof(c_ovScreenFragSpv) / 4);
+        std::memcpy(screenVertexSPIRV.data(), c_ovScreenVertSpv, sizeof(c_ovScreenVertSpv));
+        std::memcpy(screenFragmentSPIRV.data(), c_ovScreenFragSpv, sizeof(c_ovScreenFragSpv));
         m_screenShaderProgram.Init(m_vkDevice);
         m_screenShaderProgram.LoadVertexShader(screenVertexSPIRV);
         m_screenShaderProgram.LoadFragmentShader(screenFragmentSPIRV);
@@ -844,9 +857,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_vkDevice, &descLayoutInfo, nullptr, &m_screenDescriptorSetLayout));
 
         VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pcr.offset = 0;
-        pcr.size = sizeof(XrMatrix4x4f);
+        pcr.size = sizeof(ScreenPC);
 
         VkPipelineLayoutCreateInfo pipeLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipeLayoutInfo.setLayoutCount = 1;
@@ -1190,6 +1203,18 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // 1. If viewIndex == 0, commit the built scene (GPU-visible copies, uploads) and upload the MAME frame
         if (viewIndex == 0) {
             if (m2Frame) m_m2Renderer.CommitFrame(*m2Frame, cmd);   // frozen: same built arrays re-committed
+            // Game selector menu: CPU-drawn picture, uploaded when it changed.
+            if (arcadexr::ui::Menu::Get().IsOpen()) {
+                if (!m_overlayInit) {
+                    m_overlay.Init(m_vkDevice, &m_memAllocator, VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt));
+                    m_overlayInit = true;
+                }
+                std::vector<unsigned char> rgba;
+                int mw = 0, mh = 0;
+                if (arcadexr::ui::Menu::Get().Render(rgba, mw, mh) || !m_overlay.HaveMenuImage()) {
+                    if (!rgba.empty()) m_overlay.UploadMenu(cmd, rgba, mw, mh);
+                }
+            }
             arcadexr::video::FrameInfo info;
             // The flat framebuffer only feeds the screen fallback: skip its 760 KB copy while the
             // immersive pass is the one drawing (it resumes the first frame the fallback runs).
@@ -1361,7 +1386,18 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_screenPipelineLayout,
                                         0, 1, &m_screenDescriptorSet, 0, nullptr);
-                vkCmdPushConstants(cmd, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+                ScreenPC spc{};
+                std::memcpy(spc.mvp, mvp.m, sizeof(spc.mvp));
+                const auto aim = arcadexr::gun::GetAimState();
+                spc.aim[0] = aim.normalized_x; spc.aim[1] = aim.normalized_y;
+                spc.srcSize[0] = float(m_screenWidth); spc.srcSize[1] = float(m_screenHeight);
+                spc.aimVisible = aim.show_crosshair ? 1 : 0;
+                spc.calibrating = aim.calibrating ? 1 : 0;
+                // "edge" / "catmull" -> Catmull-Rom (the GLES edge pass adds FXAA on top: not ported yet)
+                const std::string filt = arcadexr::profiles::GetString("filter", "edge");
+                spc.filter = (filt == "nearest" || filt == "bilinear") ? 1 : 3;
+                spc.sharpen = float(std::atof(arcadexr::profiles::GetString("sharpen", "0").c_str()));
+                vkCmdPushConstants(cmd, m_screenPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(spc), &spc);
 
                 VkDeviceSize vtxOffset = 0;
                 vkCmdBindIndexBuffer(cmd, m_screenDrawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
@@ -1389,6 +1425,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         vkCmdEndRenderPass(cmd);
         }  // legacy pass (no immersive frame)
+        RenderOverlay(cmd, viewIndex, layerView, swapchainData, imageIndex, renderArea);
         // Debug dump of the LEFT eye as rendered (debug.tcvr.dump=<tag>): copied into a host buffer,
         // written as files/dump-<tag>-vkL.ppm after the fence. The compositor screencap is black
         // while the headset is worn; this is the image the app really produced.
@@ -1484,6 +1521,61 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         for (uint32_t i = 0; i < count; ++i) arr[i].next = &v[i];
     }
 
+    // Menu and pistol on top of the eye image (ports of RenderMenu / the lit gun of the GLES plugin).
+    void RenderOverlay(VkCommandBuffer cmd, uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
+                       VulkanSwapchainImageData* swapchainData, uint32_t imageIndex, const VkRect2D& renderArea) {
+        auto& menu = arcadexr::ui::Menu::Get();
+        const bool menuOpen = menu.IsOpen();
+        auto guns = arcadexr::gun::GetGunPoses();
+        const bool drawGuns = guns.count > 0 && !menuOpen && !arcadexr::profiles::IsDriving();
+        if (!menuOpen && !drawGuns) { m_menuFramePoseValid = false; return; }
+        if (!m_overlayInit) {
+            m_overlay.Init(m_vkDevice, &m_memAllocator, VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt));
+            m_overlayInit = true;
+        }
+        const auto& pose = layerView.pose;
+        XrMatrix4x4f proj, toView, view, vp;
+        XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_VULKAN, layerView.fov, 0.05f, 100.0f);
+        XrMatrix4x4f_CreateFromRigidTransform(&toView, &pose);
+        XrMatrix4x4f_InvertRigidBody(&view, &toView);
+        XrMatrix4x4f_Multiply(&vp, &proj, &view);
+        const VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
+        m_overlay.Begin(cmd, viewIndex, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea);
+        if (drawGuns) {
+            for (int g = 0; g < guns.count; ++g) {
+                XrMatrix4x4f model, mvp;
+                const XrVector3f unit{1, 1, 1};
+                XrMatrix4x4f_CreateTranslationRotationScale(&model, &guns.pose[g].position, &guns.pose[g].orientation, &unit);
+                XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+                const float eye[3] = {pose.position.x, pose.position.y, pose.position.z};
+                m_overlay.DrawGun(cmd, mvp.m, model.m, eye);
+            }
+        }
+        if (menuOpen) {
+            // Anchored where the head was when the frame started (left eye), 1.4 m ahead, like the GLES path.
+            if (viewIndex == 0 || !m_menuFramePoseValid) { m_menuFramePose = pose; m_menuFramePoseValid = true; }
+            const XrPosef& anchor = m_menuFramePose;
+            const XrVector3f lr{1, 0, 0}, lu{0, 1, 0}, ln{0, 0, 1};
+            XrVector3f right, up, normal;
+            XrQuaternionf_RotateVector3f(&right, &anchor.orientation, &lr);
+            XrQuaternionf_RotateVector3f(&up, &anchor.orientation, &lu);
+            XrQuaternionf_RotateVector3f(&normal, &anchor.orientation, &ln);
+            const float width = 0.95f, height = width / m_overlay.MenuAspect();
+            XrMatrix4x4f model{};
+            model.m[0] = right.x * width; model.m[1] = right.y * width; model.m[2] = right.z * width;
+            model.m[4] = up.x * height; model.m[5] = up.y * height; model.m[6] = up.z * height;
+            model.m[8] = normal.x; model.m[9] = normal.y; model.m[10] = normal.z;
+            model.m[12] = anchor.position.x - normal.x * 1.4f;
+            model.m[13] = anchor.position.y - normal.y * 1.4f;
+            model.m[14] = anchor.position.z - normal.z * 1.4f;
+            model.m[15] = 1.0f;
+            XrMatrix4x4f mvp;
+            XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+            m_overlay.DrawMenu(cmd, mvp.m);
+        }
+        m_overlay.End(cmd);
+    }
+
     void WriteDump() {
         m_dumpState = 0;
         m_dumpDoneTag = m_dumpTag;
@@ -1566,6 +1658,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (m_vkDevice != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(m_vkDevice);
             m_m2Renderer.Cleanup();
+            m_overlay.Destroy();
             if (m_gpuQueryPool != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(m_vkDevice, m_gpuQueryPool, nullptr);
                 m_gpuQueryPool = VK_NULL_HANDLE;
@@ -1665,6 +1758,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_m2SceneMode{-1};
     bool m_fdmEnabled{false};
     bool m_lastM2Drawn{false};
+    arcadexr::vulkan::VulkanOverlay m_overlay;
+    bool m_overlayInit{false};
+    XrPosef m_menuFramePose{};
+    bool m_menuFramePoseValid{false};
     int m_dumpState{0};
     std::string m_dumpTag, m_dumpDoneTag;
     uint32_t m_dumpW{0}, m_dumpH{0}, m_dumpCb{0};

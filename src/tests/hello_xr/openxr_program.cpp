@@ -1427,6 +1427,11 @@ struct OpenXrProgram : IOpenXrProgram {
                 XrActionStateBoolean tglState{XR_TYPE_ACTION_STATE_BOOLEAN};
                 if (XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &tgl, &tglState)) && tglState.isActive && tglState.changedSinceLastSync && tglState.currentState) menu.Toggle();
             }
+            {   // bench: debug.tcvr.menu_toggle=<n> toggles the menu once per new value (tests without a controller)
+                static int s_lastMenuToggle = 0;
+                const int mt = arcadexr::config::GetInt("menu.toggle", 0);
+                if (mt != s_lastMenuToggle) { s_lastMenuToggle = mt; if (mt != 0) menu.Toggle(); }
+            }
             if (menu.IsOpen()) {
                 XrActionStateGetInfo navInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuNavAction, XR_NULL_PATH};
                 XrActionStateVector2f nav{XR_TYPE_ACTION_STATE_VECTOR2F};
