@@ -107,7 +107,8 @@ public:
             DestroyMenuImage();
             m_menuW = w; m_menuH = h;
             VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_SRGB;   // menu bytes are display values (see screen texture) ii.extent = {uint32_t(w), uint32_t(h), 1};
+            // Menu bytes are display values (see the screen texture): _SRGB so sampling decodes them.
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_SRGB; ii.extent = {uint32_t(w), uint32_t(h), 1};
             ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             XRC_CHECK_THROW_VKCMD(vkCreateImage(m_dev, &ii, nullptr, &m_menuImage));
