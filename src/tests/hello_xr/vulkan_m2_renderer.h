@@ -355,6 +355,15 @@ public:
             }
         }
 
+        {   // Model 1 menu screen: no horizon AND few polygons (a course select has a few 3D icons, a race thousands);
+            // held for half a second either way -- a race that loses its horizon for a moment is not a menu.
+            const bool looksMenu = m_directColour && m_horizonGeo < 0.0f && kn < 400u;
+            m_menuFrames = looksMenu ? std::min(m_menuFrames + 1, 1000) : std::max(m_menuFrames - 1, -1000);
+            if (m_menuFrames >= 30) m_isMenuM1 = true;
+            if (m_menuFrames <= -30) m_isMenuM1 = false;
+            if (!looksMenu && m_menuFrames > 0) m_menuFrames = 0;
+            if (looksMenu && m_menuFrames < 0) m_menuFrames = 0;
+        }
         m_mainClip[0] = mainL; m_mainClip[1] = mainT; m_mainClip[2] = mainR; m_mainClip[3] = mainB;
         m_mainCenter[0] = mainCx; m_mainCenter[1] = mainCy;
 
@@ -682,12 +691,22 @@ public:
         const float clipRow = (groundFill && m_horizonGeo >= 0.0f) ? m_horizonGeo + 2.0f : 0.0f;
 
         float pitchTarget = 0.0f;
-        if (arcadexr::config::GetInt("m2.immersivePitch", 1) != 0 && m_haveMainView && m_horizonGeo >= 0.0f) {
+        // Model 1: the horizon estimate swings with far mountains above the real horizon (0.01 to 0.35 rad measured
+        // in a race, 24/09) and the "levelling" tilted the world by up to 20 degrees. Its camera is nearly level:
+        // no levelling by default (immersive.pitchLevel=1 to re-enable).
+        const bool levelPitch = m_directColour ? arcadexr::profiles::GetInt("immersive.pitchLevel", 0) != 0
+                                               : arcadexr::config::GetInt("m2.immersivePitch", 1) != 0;
+        if (levelPitch && m_haveMainView && m_horizonGeo >= 0.0f) {
             const float t = ((384.0f - float(m_mainCenter[1])) - m_horizonGeo) / std::max(focusY, 1.0f);
             pitchTarget = std::max(-0.35f, std::min(0.35f, ::atanf(t)));
         }
+        // Horizon lost for a moment in a race (Model 1): keep the last pitch rather than swing back to level.
+        if (m_directColour && m_haveMainView && m_horizonGeo < 0.0f && !m_isMenuM1) pitchTarget = m_lastPitchTarget;
+        else if (viewIndex == 0) m_lastPitchTarget = pitchTarget;
         pitchTarget += arcadexr::config::GetFloat("m2.immersivePitchOffset", 0.0f);
         if (viewIndex == 0) m_m2Pitch += (pitchTarget - m_m2Pitch) * 0.1f;
+        if (viewIndex == 0 && !m_flatMode && (++m_pitchLogTick % 30u) == 0u)
+            Log::Write(Log::Level::Info, Fmt("TCVR_PITCH horizon=%.1f target=%.4f applied=%.4f menu=%d", m_horizonGeo, pitchTarget, m_m2Pitch, m_backNoTile ? 1 : 0));
 
         const float cp = ::cosf(m_m2Pitch), sp = ::sinf(m_m2Pitch);
         const arcadexr::gun::Vec3 upP{cp * screen.up.x - sp * screen.normal.x, cp * screen.up.y - sp * screen.normal.y, cp * screen.up.z - sp * screen.normal.z};
@@ -749,7 +768,7 @@ public:
         // A menu of the game (no main 3D view): its 2D back layer is part of the screen, not a sky -- same plane as the
         // HUD, level, not repeated (the course select showed ten copies of a course, and the selection frame of the
         // front layer did not sit on the course of the back one).
-        const bool menuScreen = !m_flatMode && (!m_haveMainView || (m_directColour && m_horizonGeo < 0.0f));
+        const bool menuScreen = !m_flatMode && (!m_haveMainView || (m_directColour && m_isMenuM1));
         m_backNoTile = menuScreen;
         const bool skyAnchor = !menuScreen && !m_flatMode && m_horizonGeo >= 0.0f &&
             arcadexr::profiles::GetInt("immersive.skyAnchor", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;   // GOLD (Sega Rally) unchanged by default
@@ -2537,6 +2556,10 @@ private:
     bool m_frontFullscreen = false;
     bool m_backNoTile = false;
     bool m_directColour = false;
+    unsigned m_pitchLogTick = 0;
+    int m_menuFrames = 0;
+    bool m_isMenuM1 = false;
+    float m_lastPitchTarget = 0.0f;
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
     // Geometry unpack state
