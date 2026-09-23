@@ -1213,7 +1213,19 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     const auto tp = clk::now();
                     m_m2Renderer.BuildFrame(*m2Frame);
                     m_cpuPrepMs += std::chrono::duration<float, std::milli>(clk::now() - tp).count();
+                    m_lastM2RenderedSeq = m2Frame->sequence;
                 }
+            }
+            // Arcade cadence for the Model 2 chain (23/09, Virtua Racing judder): the game makes 57.5 images a
+            // second; at 90 Hz each stays up 1 then 2 refreshes, irregularly. 120 Hz + one draw per new arcade image
+            // = 2 refreshes each (a 3rd about 5 times a second). Its own flag: never fights the System 22 one.
+            {
+                const bool m2Cadence = m_lastM2Drawn && arcadexr::profiles::GetInt("immersive.cadence", 0) != 0;
+                if (m2Cadence != m_m2CadenceRequested) {
+                    arcadexr::xr::RequestRateForGame(m2Cadence ? 120.0f : 90.0f, m2Cadence ? "Model 2 chain: 2 refreshes per arcade frame" : "leaving Model 2 cadence");
+                    m_m2CadenceRequested = m2Cadence;
+                }
+                m_m2CadenceActive = m2Cadence;
             }
         }
 
@@ -1600,6 +1612,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // (no 2-1-2-1 judder on 90 Hz, and an alternating 30 Hz effect stays regular) and each drawn frame has
     // two refreshes of GPU time.
     bool RenderThisFrame() override {
+        if (m_m2CadenceActive && !m_cadenceActive) {
+            if (arcadexr::config::GetInt("m2.freeze", 0) != 0) return true;
+            const tcvr_m2_frame* f = arcadexr::hardware::sega_model2::AcquireScene();
+            ++m_framesSinceRender;
+            const bool fresh = f && f->sequence != m_lastM2RenderedSeq;
+            if (fresh || m_framesSinceRender >= 3) { m_framesSinceRender = 0; return true; }
+            return false;
+        }
         if (!m_cadenceActive) return true;
         namespace s22 = arcadexr::hardware::namco_system22;
         if (arcadexr::config::GetInt("s22.freeze", 0) != 0) return (++m_framesSinceRender & 1) == 0;   // bench: half rate
@@ -1876,6 +1896,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         return s_s22Self->m_m2AimLive && s_s22Self->m_m2Renderer.Aim(o, d, nx, ny, hit);
     }
     bool m_m2AimLive = false;
+    bool m_m2CadenceRequested = false, m_m2CadenceActive = false;
+    uint64_t m_lastM2RenderedSeq = 0;
 
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
         if (m_m2RendererInitialized) return;
