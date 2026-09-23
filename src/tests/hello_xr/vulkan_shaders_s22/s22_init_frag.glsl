@@ -8,8 +8,11 @@ layout(location = 1) out vec4 oPri;
 void main() {
     ivec2 p;
     bool hasText = textTexel(p);
+    vec2 q; bool onPlane = textCoord(q);
+    vec2 tpp = abs(dFdx(q)) + abs(dFdy(q));
     uvec3 c = Bg.xyz;
-    if (hasText && (priAt(p) & 4u) != 0u) c = mixText(p, c, 4);
+    if (Mix2.z != 0u && onPlane) c = uvec3(mixTextSharp(q, tpp, c, 4, 0u, 4u) + 0.5);
+    else if (hasText && (priAt(p) & 4u) != 0u) c = mixText(p, c, 4);
     oColor = vec4(vec3(c) / 255.0, 1.0);
     oPri = vec4(0.0);
 }

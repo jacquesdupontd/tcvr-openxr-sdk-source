@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -289,10 +290,17 @@ public:
         if (m_bankReadyMask == 0xffffu) Log::Write(Log::Level::Info, "TCVR_S22VK pen banks: 16/16 decoded and uploaded");
     }
     void SetFilter(int mode) { m_filter = mode; }
+    void SetHudSharp(int bits) { m_hudSharp = bits; }
+    void SetTextDiag(int on) { m_textDiag = on; }
+    void RequestPrimDump() { m_dumpPrims = true; }
+    bool m_dumpPrims = false;
+    int m_textDiag = 0;
+    int m_hudSharp = 3;
     static constexpr uint32_t kBankMips = 9;   // 4096 .. 16
     static size_t BankMipBytes() { size_t n = 0; for (uint32_t l = 0; l < kBankMips; ++l) n += size_t(4096u >> l) * (4096u >> l); return n; }
     void SetDiagAlternating(bool on) { m_diagAlt = on; }
     void SetAltFix(bool on) { m_altFix = on; }
+    void SetAltMaxGroup(int n) { m_altMaxGroup = std::max(1, n); }
     // A 3D primitive group (same render state) drawn one arcade frame out of two - Dirt Dash's car
     // shadows, measured 23/09 with s22.diagAlt: 8 quads present, then absent, every other frame. A CRT's
     // phosphor showed that as a steady half-strength shadow; an XR display shows a 30 Hz flash. Drawing
@@ -300,11 +308,14 @@ public:
     // (no image-space history, so no ghosting when the head moves): present frames draw it at 50 %,
     // absent frames redraw the previous frame's copies at 50 %. Detection is generic (presence history
     // per group), nothing is listed per game.
-    static bool AltKeyEligible(const tcvr_scene_prim& p) { return p.kind == 0 && p.direct == 0; }
+    // 3D polygons AND sprites: measured in a real race (23/09), the flashing car shadows are mostly black
+    // sprites (kind 1, rgb 0, alpha animated every frame) drawn 4 at a time, one frame out of two.
+    static bool AltKeyEligible(const tcvr_scene_prim& p) { return (p.kind == 0 && p.direct == 0) || p.kind == 1; }
     static uint64_t AltKey(const tcvr_scene_prim& p) {
         const uint32_t v[] = {p.pens_offset, p.bn, p.penmask, p.penshift, p.texture_enabled, p.shade_enabled, p.fog_mode,
                               p.pfade_enabled, uint32_t(int(p.poly_r)), uint32_t(int(p.poly_g)), uint32_t(int(p.poly_b)),
-                              p.alpha_enabled, uint32_t(p.alpha), p.alpha_pen, p.fade_enabled, p.prioverchar};
+                              p.alpha_enabled, p.alpha_pen, p.fade_enabled, p.prioverchar, p.kind, p.direct, p.sprite_code};
+        // alpha is NOT in the key: the shadow sprites animate it every frame.
         uint64_t h = 1469598103934665603ull;
         for (uint32_t x : v) { h ^= x; h *= 1099511628211ull; }
         return h;
@@ -318,6 +329,11 @@ public:
     };
     static bool Centroid(const tcvr_scene_prim& p, const tcvr_scene_vertex* v, float& sx, float& sy, float& z) {
         sx = sy = z = 0.0f;
+        if (p.kind == 1) {   // sprites: screen coordinates already, no depth to compare
+            for (uint32_t i = 0; i < p.vertex_count; ++i) { sx += v[i].x; sy += v[i].y; }
+            sx /= float(p.vertex_count); sy /= float(p.vertex_count); z = 1.0f;
+            return true;
+        }
         for (uint32_t i = 0; i < p.vertex_count; ++i) {
             if (v[i].z <= 1e-3f) return false;
             sx += v[i].x / v[i].z; sy += v[i].y / v[i].z; z += v[i].z;
@@ -337,7 +353,7 @@ public:
             const tcvr_scene_prim& p = f.prims[i];
             if (!AltKeyEligible(p) || p.vertex_count < 3 || p.first_vertex + p.vertex_count > f.vertex_count) continue;
             const uint64_t key = AltKey(p);
-            if (count[key] > 16) continue;
+            if (count[key] > m_altMaxGroup) continue;
             const tcvr_scene_vertex* v = f.vertices + p.first_vertex;
             float sx, sy, z;
             if (!Centroid(p, v, sx, sy, z)) continue;
@@ -373,6 +389,7 @@ public:
         }
     }
     bool m_altFix = true;
+    int m_altMaxGroup = 96;   // groups larger than this (the road: hundreds of quads) are not tracked
     uint64_t m_altSeq = ~0ull;
     std::vector<AltTrack> m_tracks;
     std::vector<uint8_t> m_altHalfPrim;
@@ -441,6 +458,42 @@ public:
             if (!m_fogBgValid && pr.fog_mode == 2) { m_fogBg[0] = pr.fog_r; m_fogBg[1] = pr.fog_g; m_fogBg[2] = pr.fog_b; m_fogBgValid = true; }
         }
         if (m_diagAlt) DiagAlternating(f);
+        if (m_dumpPrims) {   // diagnostic (s22.dumpPrims=1): every sprite of this frame, raw fields
+            m_dumpPrims = false;
+            {   // text layer + priority marks over the RECORD TIME label area (x 30..150, y 105..140)
+                int pri4 = 0, textNz = 0; uint32_t hist[8] = {};
+                for (int y = 105; y < 140 && y < f.height; ++y)
+                    for (int x = 30; x < 150; ++x) {
+                        const uint8_t pv = f.pri ? f.pri[size_t(y) * f.pri_stride + x] : 0;
+                        const uint16_t tv = f.text ? f.text[size_t(y) * f.text_stride + x] : 0;
+                        pri4 += (pv & 4) != 0; textNz += tv != 0; hist[pv & 7]++;
+                    }
+                {
+                    std::map<int, int> vals;
+                    for (int y = 105; y < 140 && y < f.height; ++y)
+                        for (int x = 30; x < 150; ++x)
+                            if (f.pri && (f.pri[size_t(y) * f.pri_stride + x] & 4)) vals[f.text[size_t(y) * f.text_stride + x]]++;
+                    std::string sv;
+                    for (auto& kv : vals) {
+                        const uint32_t si = ((uint32_t(kv.first) << 2) | f.mix_spot_palbase) & 0x3ff;
+                        sv += Fmt(" %x:%d(spot[%x]=%x)", kv.first, kv.second, si, f.spotram ? f.spotram[si] : 0xffff);
+                    }
+                    Log::Write(Log::Level::Info, Fmt("TCVR_S22TXT mix: palbase=%x spot=%u/%u/%u fade=%u/%u alpha f=%u mask=%x chk=%x..%x | text values:%s",
+                        f.text_palbase, f.mix_spot_enabled, f.mix_spot_factor, f.mix_spot_palbase, f.mix_fade_enabled, f.mix_fade_factor,
+                        f.mix_alpha_factor, f.mix_alpha_mask, f.mix_alpha_check12, f.mix_alpha_check13, sv.c_str()));
+                }
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22TXT zone RECORD TIME: pri&4=%d text!=0=%d pri hist %u %u %u %u %u %u %u %u pri=%p text=%p",
+                    pri4, textNz, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], (const void*)f.pri, (const void*)f.text));
+            }
+            for (uint32_t i = 0; i < f.prim_count; ++i) {
+                const tcvr_scene_prim& p = f.prims[i];
+                if (p.kind != 1 || p.vertex_count < 4) continue;
+                const tcvr_scene_vertex* v = f.vertices + p.first_vertex;
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22SPR #%u x=%.0f..%.0f y=%.0f..%.0f code=%u pens=%u aen=%u a=%d apen=%u fog=%u/%d fade=%u/%d prio=%u clip=%d,%d,%d,%d flip=%u%u uv=%.0f,%.0f..%.0f,%.0f",
+                    i, v[0].x, v[2].x, v[0].y, v[2].y, p.sprite_code, p.pens_offset, p.alpha_enabled, p.alpha, p.alpha_pen, p.fog_mode, p.fogfactor,
+                    p.fade_enabled, p.fadefactor, p.prioverchar, p.clip_l, p.clip_t, p.clip_r, p.clip_b, p.flipx, p.flipy, v[0].u, v[0].v, v[2].u, v[2].v));
+            }
+        }
         m_groupCentre.clear();
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
@@ -455,7 +508,12 @@ public:
         // UpdateAlternation). The vertex carries the index of its row in OUR table (not MAME's index).
         auto emit = [&](const tcvr_scene_prim& pr0, const tcvr_scene_vertex* verts, bool half) {
             tcvr_scene_prim pr = pr0;
-            if (half) { pr.alpha_enabled = 1; pr.alpha = 128; }
+            if (half) {
+                // Polygons: weight = (255 - alpha) / 256 -> 128 = half. Sprites: weight = alpha / 256 -> halve it.
+                if (pr.kind == 1) pr.alpha = std::max(1, (pr.alpha_enabled ? pr.alpha : 255) / 2);
+                else pr.alpha = 128;
+                pr.alpha_enabled = 1;
+            }
             const float primIdx = float(m_primData.size() / 64);
             float spriteDepth = 0.0f;
             if (pr.kind == 0 && pr.direct == 0) { neighbourZoom = pr.zoom; if (pr.zoom > 0.0f) m_lastZoom = pr.zoom; }
@@ -777,6 +835,7 @@ public:
         vkCmdEndRenderPass(cmd);
         Ubo uc = u;
         uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? 1 : 0;
+        uc.Flags[2] = m_textDiag == 1 ? 77 : (m_textDiag == 2 ? 78 : (m_textDiag == 3 ? 79 : 0));
         std::memcpy(S.uboMap[6], &uc, sizeof(uc));
         VkRenderPassBeginInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         ci.renderPass = m_rpComp; ci.framebuffer = m_flatOutFb; ci.renderArea = {{0, 0}, {w, h}};
@@ -934,6 +993,8 @@ private:
         u.Mix0[2] = int(f.mix_spot_palbase); u.Mix0[3] = int(f.text_palbase);
         u.Mix1[0] = f.mix_fade_enabled; u.Mix1[1] = f.mix_fade_factor & 0xff; u.Mix1[2] = f.mix_alpha_factor & 0xff; u.Mix1[3] = f.mix_alpha_mask & 0xf;
         u.Mix2[0] = f.mix_alpha_check12 & 0xff; u.Mix2[1] = f.mix_alpha_check13 & 0xff;
+        u.Mix2[2] = (m_filter >= 3 && (m_hudSharp & 1)) ? 1u : 0u;   // text layer in mode 3 (s22.hudSharp bit 0)
+        u.Mix2[3] = (m_filter >= 3 && (m_hudSharp & 2)) ? 1u : 0u;   // sprites in mode 3 (bit 1)
         u.FadeColor[0] = unsigned(f.mix_fade_r); u.FadeColor[1] = unsigned(f.mix_fade_g); u.FadeColor[2] = unsigned(f.mix_fade_b);
         u.Bias[0] = (mvp && m_settings.depthTest) ? m_settings.depthBias : 0.0f;
         u.Bias[3] = m_settings.nearClip;

@@ -20,8 +20,19 @@ void main() {
         cur = mix(cur, (cur + prev) * 0.5, integrate);
     }
     uvec3 c = uvec3(cur * 255.0 + 0.5);
-    uint pri = (hasText ? (priAt(p) & 4u) : 0u) | uint(texelFetch(ScenePri, ivec2(uv * vec2(textureSize(ScenePri, 0))), 0).r * 255.0 + 0.5);
-    if (pri == 6u) c = mixText(p, c, 6);
+    vec2 q; bool onPlane = textCoord(q);
+    vec2 tpp = abs(dFdx(q)) + abs(dFdy(q));
+    uint scenePri = uint(texelFetch(ScenePri, ivec2(uv * vec2(textureSize(ScenePri, 0))), 0).r * 255.0 + 0.5);
+    if (Flags.z == 78) {   // diagnostic: the text layer alone as the GPU reads it (red = opaque mark, green = text index != 0)
+        oColor = vec4((priAt(p) & 4u) != 0u ? 1.0 : 0.0, textAt(p) != 0u ? 1.0 : 0.0, 0.0, 1.0);
+        return;
+    }
+    if ((Flags.z == 77 || Flags.z == 79) && hasText && (priAt(p) & 4u) != 0u) c = mixText(p, c, 6);   // diagnostic: text ignoring priority
+    else if (Mix2.z != 0u && onPlane) c = uvec3(mixTextSharp(q, tpp, c, 6, scenePri, 6u) + 0.5);
+    else {
+        uint pri = (hasText ? (priAt(p) & 4u) : 0u) | scenePri;
+        if (pri == 6u) c = mixText(p, c, 6);
+    }
     uvec3 g = uvec3(gammaAt(c.r), gammaAt(256u + c.g), gammaAt(512u + c.b));
     oColor = vec4(vec3(g) / 255.0, 1.0);
 }

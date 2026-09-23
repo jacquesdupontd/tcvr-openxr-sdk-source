@@ -1677,8 +1677,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         m_s22.PumpBanks(cmd);
         m_s22.SetFilter(arcadexr::config::GetInt("s22.filter", 3));   // 0 texel-exact, 1 bilinear, 2 + index mipmaps, 3 sharp + anisotropic
+        m_s22.SetHudSharp(arcadexr::config::GetInt("s22.hudSharp", 3));
+        m_s22.SetTextDiag(arcadexr::config::GetInt("s22.textDiag", 0));
+        {
+            const int req = arcadexr::config::GetInt("s22.dumpPrims", 0);
+            if (req != 0 && req != m_primDumpDone) { m_primDumpDone = req; m_s22.RequestPrimDump(); }
+        }
         m_s22.SetDiagAlternating(arcadexr::config::GetInt("s22.diagAlt", 0) != 0);
         m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 1) != 0);
+        m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 96));
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
         m_s22Prepared = true;
@@ -2066,6 +2073,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkImageView m_flatBoundView{VK_NULL_HANDLE};
     uint32_t m_flatW{0}, m_flatH{0};
     float m_viewportScale{1.0f};
+    int m_primDumpDone{0};
     bool m_s22FlatWanted{false}, m_s22Prepared{false};
     arcadexr::vulkan::VulkanOverlay m_overlay;
     bool m_overlayInit{false};

@@ -12,7 +12,7 @@ layout(set = 0, binding = 0, std140) uniform S22 {
     uvec4 Bg;             // background rgb
     ivec4 Mix0;           // SpotEnabled, SpotFactor, SpotPalbase, TextPalbase
     uvec4 Mix1;           // FadeEnabled, FadeFactor, AlphaFactor, AlphaMask
-    uvec4 Mix2;           // AlphaCheck12, AlphaCheck13
+    uvec4 Mix2;           // AlphaCheck12, AlphaCheck13, HUD mode 3 (sharp text/sprites),
     uvec4 FadeColor;
     vec4 Bias;            // relative painter-order depth offset per primitive, EyeOffset, Convergence, near plane (m)
 };

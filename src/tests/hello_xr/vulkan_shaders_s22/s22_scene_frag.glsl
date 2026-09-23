@@ -79,7 +79,7 @@ void main() {
     int fadef = int(t6.w + 0.5);
     uvec3 polyc = uvec3(t7.yzw + 0.5);
 #endif
-    uvec3 c; uint pen; float srcWeight = 1.0;
+    uvec3 c; uint pen; float srcWeight = 1.0; float spriteCov = 1.0;
 #ifndef POLY3D
     if (t0.x < 0.5) {
 #else
@@ -168,15 +168,36 @@ void main() {
 #ifndef POLY3D
     else {
         int code = int(t8.z + 0.5);
-        int tx = clamp(int(vTex.x - t8.w), 0, Sprite.x - 1);
-        int ty = clamp(int(vTex.y - t9.x), 0, Sprite.y - 1);
         int spr = Flags.w;
-        pen = texelFetch(SpriteAtlas, ivec2((code % spr) * Sprite.x + tx, (code / spr) * Sprite.y + ty), 0).r;
-        if (pen == 0xffu) discard;
-        c = penRGB(pensOff + pen);
+        ivec2 cell = ivec2((code % spr) * Sprite.x, (code / spr) * Sprite.y);
+        vec2 st = vec2(vTex.x - t8.w, vTex.y - t9.x);
+        pen = texelFetch(SpriteAtlas, cell + clamp(ivec2(floor(st)), ivec2(0), Sprite.xy - 1), 0).r;
+        if (Mix2.w != 0u) {
+            // Mode 3 (HUD icons, sprites): each sprite pixel stays a solid block, one output pixel of blend at its
+            // borders; transparent pixels (0xff) give the coverage, so edges are antialiased instead of stairs.
+            vec2 tpp = max(abs(tdx) + abs(tdy), vec2(1e-4));
+            vec2 pp = st - 0.5;
+            vec2 i0 = floor(pp);
+            vec2 f = clamp((pp - i0 - 0.5) / tpp + 0.5, 0.0, 1.0);
+            vec3 acc = vec3(0.0);
+            float cov = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                ivec2 o = ivec2(k & 1, k >> 1);
+                uint pk = texelFetch(SpriteAtlas, cell + clamp(ivec2(i0) + o, ivec2(0), Sprite.xy - 1), 0).r;
+                float w = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+                if (pk != 0xffu) { acc += w * vec3(penRGB(pensOff + pk)); cov += w; }
+            }
+            if (cov < 0.02) discard;
+            c = uvec3(acc / cov + 0.5);
+            spriteCov = cov;
+        } else {
+            if (pen == 0xffu) discard;
+            c = penRGB(pensOff + pen);
+        }
         if (fogMode == 1 && fogfactor != 0) c = blend(c, fogc, uint(255 - fogfactor));
         if (fadeEn && fadef != 0) c = blend(c, fadec, uint(255 - fadef));
         if (alpha != 0xff && (alphaEn || pen == alphaPen)) srcWeight = float(alpha) / 256.0;
+        srcWeight *= spriteCov;
     }
 #endif
     oColor = vec4(vec3(c) / 255.0, srcWeight);
