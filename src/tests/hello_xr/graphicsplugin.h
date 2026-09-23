@@ -73,6 +73,9 @@ struct IGraphicsPlugin {
     // does this plugin render with the runtime's density maps, and chain the structs that
     // receive them to each swapchain image before xrEnumerateSwapchainImages. No-op elsewhere.
     virtual bool WantsFoveationFdm() const { return false; }
+    // Fraction of each view swapchain the app renders into (subImage.imageRect). The runtime compositor
+    // scales that rectangle to the display as part of its reprojection, at no cost to the app.
+    virtual float ViewportScale() const { return 1.0f; }
     virtual void ChainFoveationImages(ISwapchainImageData* /*images*/, uint32_t /*count*/) {}
 
     // AppSW (XR_FB_space_warp) first light: fill a motion-vector swapchain image

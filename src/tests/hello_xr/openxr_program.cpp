@@ -1928,7 +1928,12 @@ struct OpenXrProgram : IOpenXrProgram {
             projectionLayerViews[i].fov = m_views[i].fov;
             projectionLayerViews[i].subImage.swapchain = viewSwapchain.handle;
             projectionLayerViews[i].subImage.imageRect.offset = {0, 0};
-            projectionLayerViews[i].subImage.imageRect.extent = {viewSwapchain.width, viewSwapchain.height};
+            {
+                // Dynamic resolution: render into a sub-rectangle, the compositor scales it (free).
+                const float vs = std::max(0.25f, std::min(1.0f, m_graphicsPlugin->ViewportScale()));
+                projectionLayerViews[i].subImage.imageRect.extent = {std::max(64, int(float(viewSwapchain.width) * vs)),
+                                                                      std::max(64, int(float(viewSwapchain.height) * vs))};
+            }
 
             // When AppSW is active the space-warp info carries its own depth, so
             // the plain depth layer is not chained (avoids referencing the same

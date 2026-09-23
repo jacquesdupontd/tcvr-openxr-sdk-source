@@ -1570,6 +1570,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
 
     bool WantsFoveationFdm() const override { return m_fdmEnabled; }
+    float ViewportScale() const override { return m_viewportScale; }
 
     void ChainFoveationImages(ISwapchainImageData* images, uint32_t count) override {
         auto& v = m_fdmImages[images];
@@ -1639,6 +1640,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     void PrepareSystem22(VkCommandBuffer cmd, VulkanSwapchainImageData* swapchainData) {
         namespace s22 = arcadexr::hardware::namco_system22;
         m_s22Active = false;
+        m_viewportScale = 1.0f;
         m_s22Prepared = false;
         const bool isS22 = arcadexr::profiles::IsSystem22() && s22::HaveSceneSource();
         const bool want = isS22 && arcadexr::profiles::GetString("render", "cpu") == "gpu" &&
@@ -1683,6 +1685,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (!want) return;   // flat: drawn after the Model 2 flat block (RenderSystem22Flat)
         if ((arcadexr::config::GetInt("s22.skip", 0) & 8) == 0) m_s22.RenderDepthMap(cmd);
         m_s22Active = true;
+        // Immersive System 22 renders its scene at immersive.scale: into a sub-rectangle of the swapchain
+        // (applied from the next frame), so the composite also runs at that size and the compositor scales.
+        if (arcadexr::config::GetInt("s22.viewportScale", 1) != 0)
+            m_viewportScale = std::max(0.3f, std::min(1.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f)));
     }
 
     bool RenderSystem22Eye(VkCommandBuffer cmd, uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,
@@ -1721,6 +1727,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.lean = arcadexr::config::GetInt("s22.lean", 1);
         st.skip = arcadexr::config::GetInt("s22.skip", 0);
         st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
+        st.merged = arcadexr::config::GetInt("s22.merged", 1) != 0;
         st.depthBias = arcadexr::config::GetFloat("s22.depthBiasRel", 2.5e-7f);
         st.nearClip = nearMetres;
         {
@@ -1734,8 +1741,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.texSamples = texAa <= 0 ? 1 : (texAa == 1 ? 4 : 16);
         st.spriteMinDepth = arcadexr::config::GetFloat("immersive.spriteMinDepth", 50.0f);
         const float scale = std::max(0.3f, std::min(2.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f)));
-        const VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
-        return m_s22.RenderEye(cmd, viewIndex, mvp.m, hudMvp.m, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, scale, st);
+        VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
+        float renderScale = scale;
+        if (renderArea.extent.width < ext.width) { ext = renderArea.extent; renderScale = 1.0f; }   // sub-rectangle: already scaled
+        return m_s22.RenderEye(cmd, viewIndex, mvp.m, hudMvp.m, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, renderScale, st);
     }
 
     bool S22Aim(const XrVector3f& origin, const XrVector3f& direction, float& nx, float& ny, XrVector3f& hitWorld) {
@@ -2056,6 +2065,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkSampler m_flatSampler{VK_NULL_HANDLE};
     VkImageView m_flatBoundView{VK_NULL_HANDLE};
     uint32_t m_flatW{0}, m_flatH{0};
+    float m_viewportScale{1.0f};
     bool m_s22FlatWanted{false}, m_s22Prepared{false};
     arcadexr::vulkan::VulkanOverlay m_overlay;
     bool m_overlayInit{false};

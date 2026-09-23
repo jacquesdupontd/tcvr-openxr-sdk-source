@@ -41,6 +41,7 @@
 #include "s22_scene_frag_p3n_spv.h"
 #include "s22_depth_frag_spv.h"
 #include "s22_comp_frag_spv.h"
+#include "s22_comp_merged_frag_spv.h"
 
 namespace arcadexr::vulkan {
 
@@ -78,7 +79,8 @@ public:
         unsigned voidRGB[3] = {28, 30, 38};
         int texSamples = 4;
         float spriteMinDepth = 50.0f;
-        bool darkFlicker = false;   // profile temporal.darkFlicker (Dirt Dash): CRT-like integration of dark 30 Hz flashes
+        bool darkFlicker = false;
+        bool merged = true;   // full resolution: scene + composite in one render pass (s22.merged)   // profile temporal.darkFlicker (Dirt Dash): CRT-like integration of dark 30 Hz flashes
     };
 
     bool Ready() const { return m_ready; }
@@ -111,16 +113,20 @@ public:
         DestroyDepthMap();
         for (int s = 0; s < kFrames; ++s) DestroySlot(s);
         auto dp = [&](VkPipeline& p) { if (p) vkDestroyPipeline(m_dev, p, nullptr); p = VK_NULL_HANDLE; };
+        dp(m_mInit); dp(m_mScene3D); dp(m_mSceneHud); dp(m_mP3); dp(m_mP3NoAa); dp(m_mComp);
+        for (auto& f : m_mergedFbs) { vkDestroyFramebuffer(m_dev, f.fb, nullptr); vkDestroyImageView(m_dev, f.view, nullptr); }
+        m_mergedFbs.clear();
+        for (int e = 0; e < 2; ++e) DestroyMergedTarget(m_mt[e]);
         dp(m_pInit); dp(m_pScene3D); dp(m_pP3); dp(m_pP3NoAa); dp(m_pSceneHud); dp(m_pDepth); dp(m_pComp);
         auto drp = [&](VkRenderPass& r) { if (r) vkDestroyRenderPass(m_dev, r, nullptr); r = VK_NULL_HANDLE; };
-        drp(m_rpDepth); drp(m_rpScene); drp(m_rpComp);
+        drp(m_rpDepth); drp(m_rpScene); drp(m_rpComp); drp(m_rpMerged);
         if (m_layout) vkDestroyPipelineLayout(m_dev, m_layout, nullptr);
         if (m_setLayout) vkDestroyDescriptorSetLayout(m_dev, m_setLayout, nullptr);
         if (m_pool) vkDestroyDescriptorPool(m_dev, m_pool, nullptr);
         if (m_nearest) vkDestroySampler(m_dev, m_nearest, nullptr);
         if (m_linear) vkDestroySampler(m_dev, m_linear, nullptr);
         if (m_repeatNearest) vkDestroySampler(m_dev, m_repeatNearest, nullptr);
-        DestroyImage(m_dummyU); DestroyImage(m_dummyF); DestroyImage(m_dummyArr); DestroyImage(m_dummyU16);
+        DestroyImage(m_dummyU); DestroyImage(m_dummyF); DestroyImage(m_dummyArr); DestroyImage(m_dummyU16); DestroyImage(m_dummyIn);
         m_dev = VK_NULL_HANDLE; m_ready = false;
     }
 
@@ -591,6 +597,15 @@ public:
         Slot& S = m_slots[m_slot];
         const uint32_t rw = std::max(64u, uint32_t(float(outExt.width) * renderScale));
         const uint32_t rh = std::max(64u, uint32_t(float(outExt.height) * renderScale));
+        if (!m_mergedLogged) {
+            m_mergedLogged = true;
+            Log::Write(Log::Level::Info, Fmt("TCVR_S22VK merged? want=%d rp=%d r=%ux%u out=%ux%u area=%d,%d %ux%u", int(st.merged),
+                                             int(m_rpMerged != VK_NULL_HANDLE), rw, rh, outExt.width, outExt.height, area.offset.x,
+                                             area.offset.y, area.extent.width, area.extent.height));
+        }
+        if (st.merged && m_rpMerged && rw == outExt.width && rh == outExt.height && area.offset.x == 0 && area.offset.y == 0 &&
+            area.extent.width == outExt.width && area.extent.height == outExt.height)
+            return RenderEyeMerged(cmd, eye, mvp, hudMvp, target, outExt, st);
         EyeTarget& T = m_eye[eye];
         if (T.w != rw || T.h != rh) { vkDeviceWaitIdle(m_dev); DestroyEyeTarget(T); CreateEyeTarget(T, rw, rh); m_setsDirty = true; }
         UpdateSetsIfDirty();
@@ -650,6 +665,71 @@ public:
         vkCmdSetViewport(cmd, 0, 1, &vp);
         vkCmdSetScissor(cmd, 0, 1, &area);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pComp);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[3 + eye], 0, nullptr);
+        if ((st.skip & 4) == 0) vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+        return true;
+    }
+
+    // Full resolution: scene and composite in ONE render pass (see m_rpMerged). No dark-flicker history here
+    // (the image-space pass is off in Vulkan; alternating primitives are handled in the scene).
+    bool RenderEyeMerged(VkCommandBuffer cmd, uint32_t eye, const float mvp[16], const float hudMvp[16], VkImage target,
+                         VkExtent2D ext, const Settings& st) {
+        Slot& S = m_slots[m_slot];
+        MergedTarget& M = m_mt[eye];
+        if (M.w != ext.width || M.h != ext.height) {
+            vkDeviceWaitIdle(m_dev);
+            for (auto it = m_mergedFbs.begin(); it != m_mergedFbs.end();)
+                if (it->eye == int(eye)) { vkDestroyFramebuffer(m_dev, it->fb, nullptr); vkDestroyImageView(m_dev, it->view, nullptr); it = m_mergedFbs.erase(it); }
+                else ++it;
+            DestroyMergedTarget(M); CreateMergedTarget(M, ext.width, ext.height); m_setsDirty = true;
+        }
+        UpdateSetsIfDirty();
+        m_settings = st;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        for (auto& f : m_mergedFbs) if (f.image == target) fb = f.fb;
+        if (!fb) {
+            MergedFb f{}; f.image = target; f.eye = int(eye);
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = target; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = m_eyeFormat;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &vi, nullptr, &f.view));
+            VkImageView v[6] = {M.msColor.view, M.msPri.view, M.depth.view, M.rColor.view, M.rPri.view, f.view};
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = m_rpMerged; fi.attachmentCount = 6; fi.pAttachments = v;
+            fi.width = ext.width; fi.height = ext.height; fi.layers = 1;
+            XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_dev, &fi, nullptr, &f.fb));
+            m_mergedFbs.push_back(f); fb = f.fb;
+        }
+        Ubo u{};
+        FillCommonUbo(u, mvp, hudMvp, float(ext.width), float(ext.height));
+        std::memcpy(S.uboMap[eye], &u, sizeof(u));
+        Ubo uc = u;
+        uc.ScreenOut[2] = float(ext.width) / float(std::max(1, m_textW));
+        uc.ScreenOut[3] = float(ext.height) / float(std::max(1, m_textH));
+        std::memcpy(S.uboMap[3 + eye], &uc, sizeof(uc));
+        VkClearValue cv[6]{};
+        cv[2].depthStencil = {0.0f, 0};   // reversed depth
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = m_rpMerged; bi.framebuffer = fb; bi.renderArea = {{0, 0}, ext};
+        bi.clearValueCount = 6; bi.pClearValues = cv;
+        vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        SetVp(cmd, ext.width, ext.height);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[eye], 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_mInit);
+        if ((st.skip & 1) == 0) vkCmdDraw(cmd, 3, 1, 0, 0);
+        if (m_lastIndices > 0 && (st.skip & 2) == 0) {
+            BindGeometry(cmd, S);
+            for (const Run& r : m_runs) {
+                if (!r.count) continue;
+                VkPipeline pl = (r.hud || !st.depthTest) ? m_mSceneHud
+                               : (st.lean == 0 ? m_mScene3D : (st.texSamples > 1 ? m_mP3 : m_mP3NoAa));
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+                vkCmdDrawIndexed(cmd, r.count, 1, r.first, 0, 0);
+            }
+        }
+        vkCmdNextSubpass(cmd, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_mComp);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &S.set[3 + eye], 0, nullptr);
         if ((st.skip & 4) == 0) vkCmdDraw(cmd, 3, 1, 0, 0);
         vkCmdEndRenderPass(cmd);
@@ -805,6 +885,26 @@ private:
         T.seq = m_frame.sequence;
     }
     struct CompFb { VkImage image; VkImageView view; VkFramebuffer fb; };
+    struct MergedTarget { uint32_t w = 0, h = 0; Img msColor, msPri, depth, rColor, rPri; };
+    struct MergedFb { VkImage image; int eye; VkImageView view; VkFramebuffer fb; };
+    MergedTarget m_mt[2];
+    bool m_mergedLogged = false;
+    std::vector<MergedFb> m_mergedFbs;
+    Img m_dummyIn;
+    void CreateMergedTarget(MergedTarget& M, uint32_t w, uint32_t h) {
+        const VkImageUsageFlags att = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        M.w = w; M.h = h;
+        M.msColor = NewImage(VK_FORMAT_R8G8B8A8_UNORM, w, h, att, m_samples, true);
+        M.msPri = NewImage(VK_FORMAT_R8_UNORM, w, h, att, m_samples, true);
+        M.depth = NewImage(VK_FORMAT_D32_SFLOAT, w, h, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m_samples, true, VK_IMAGE_ASPECT_DEPTH_BIT);
+        M.rColor = NewImage(VK_FORMAT_R8G8B8A8_UNORM, w, h, att | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT, true);
+        M.rPri = NewImage(VK_FORMAT_R8_UNORM, w, h, att | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT, true);
+        Log::Write(Log::Level::Info, Fmt("TCVR_S22VK merged target %ux%u MSAA x%d (scene + composite on-tile)", w, h, int(m_samples)));
+    }
+    void DestroyMergedTarget(MergedTarget& M) {
+        DestroyImage(M.msColor); DestroyImage(M.msPri); DestroyImage(M.depth); DestroyImage(M.rColor); DestroyImage(M.rPri);
+        M = MergedTarget{};
+    }
 
     bool IsMsaa() const { return m_samples != VK_SAMPLE_COUNT_1_BIT; }
 
@@ -876,16 +976,20 @@ private:
         add(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         for (uint32_t i = 1; i <= 7; ++i) add(i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         for (uint32_t i = 8; i <= 16; ++i) add(i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        for (uint32_t i = 17; i <= 18; ++i) {   // merged pass: resolved scene colour / priority, read on-tile
+            VkDescriptorSetLayoutBinding x{}; x.binding = i; x.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; x.descriptorCount = 1;
+            x.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; b.push_back(x);
+        }
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount = uint32_t(b.size()); li.pBindings = b.data();
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_dev, &li, nullptr, &m_setLayout));
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1; pli.pSetLayouts = &m_setLayout;
         XRC_CHECK_THROW_VKCMD(vkCreatePipelineLayout(m_dev, &pli, nullptr, &m_layout));
-        VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
-                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 160}};
+        VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
+                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 160}, {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 32}};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.maxSets = 16; pi.poolSizeCount = 3; pi.pPoolSizes = ps;
+        pi.maxSets = 16; pi.poolSizeCount = 4; pi.pPoolSizes = ps;
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_dev, &pi, nullptr, &m_pool));
     }
 
@@ -968,6 +1072,44 @@ private:
             ri.attachmentCount = 1; ri.pAttachments = &at; ri.subpassCount = 1; ri.pSubpasses = &sp; ri.dependencyCount = 1; ri.pDependencies = &dep;
             XRC_CHECK_THROW_VKCMD(vkCreateRenderPass(m_dev, &ri, nullptr, &m_rpComp));
         }
+        // M: merged full-resolution pass (MSAA only). Subpass 0 = scene (MSAA colour + priority + depth, all
+        // transient) resolved into two transient single-sample images; subpass 1 = composite reading those
+        // as input attachments, writing the eye image. Nothing but the eye image leaves the tile.
+        if (IsMsaa()) {
+            std::vector<VkAttachmentDescription> at = {
+                Att(VK_FORMAT_R8G8B8A8_UNORM, m_samples, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL),
+                Att(VK_FORMAT_R8_UNORM, m_samples, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL),
+                Att(VK_FORMAT_D32_SFLOAT, m_samples, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+                Att(VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+                Att(VK_FORMAT_R8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+                Att(m_eyeFormat, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)};
+            VkAttachmentReference c0[2] = {{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}};
+            VkAttachmentReference r0[2] = {{3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {4, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}};
+            VkAttachmentReference d0{2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+            VkAttachmentReference in1[2] = {{3, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {4, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+            VkAttachmentReference c1{5, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription sp[2]{};
+            sp[0].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            sp[0].colorAttachmentCount = 2; sp[0].pColorAttachments = c0; sp[0].pResolveAttachments = r0; sp[0].pDepthStencilAttachment = &d0;
+            sp[1].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            sp[1].inputAttachmentCount = 2; sp[1].pInputAttachments = in1; sp[1].colorAttachmentCount = 1; sp[1].pColorAttachments = &c1;
+            VkSubpassDependency d01{};
+            d01.srcSubpass = 0; d01.dstSubpass = 1;
+            d01.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; d01.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            d01.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; d01.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+            d01.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+            VkSubpassDependency md[2] = {dep, d01};
+            VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            ri.attachmentCount = uint32_t(at.size()); ri.pAttachments = at.data(); ri.subpassCount = 2; ri.pSubpasses = sp;
+            ri.dependencyCount = 2; ri.pDependencies = md;
+            XRC_CHECK_THROW_VKCMD(vkCreateRenderPass(m_dev, &ri, nullptr, &m_rpMerged));
+        }
     }
 
     void CreatePipelines() {
@@ -1019,9 +1161,11 @@ private:
         pi.stageCount = 2; pi.pStages = st; pi.pInputAssemblyState = &ia; pi.pViewportState = &vps;
         pi.pRasterizationState = &rs; pi.pDynamicState = &ds; pi.layout = m_layout;
         auto make = [&](VkShaderModule v, VkShaderModule f, VkPipelineVertexInputStateCreateInfo* vi, VkPipelineMultisampleStateCreateInfo* ms,
-                        VkPipelineDepthStencilStateCreateInfo* dss, VkPipelineColorBlendStateCreateInfo* cb, VkRenderPass rp, VkPipeline* out) {
+                        VkPipelineDepthStencilStateCreateInfo* dss, VkPipelineColorBlendStateCreateInfo* cb, VkRenderPass rp, VkPipeline* out,
+                        uint32_t subpass = 0) {
             st[0].module = v; st[1].module = f;
             pi.pVertexInputState = vi; pi.pMultisampleState = ms; pi.pDepthStencilState = dss; pi.pColorBlendState = cb; pi.renderPass = rp;
+            pi.subpass = subpass;
             XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_dev, VK_NULL_HANDLE, 1, &pi, nullptr, out));
         };
         make(qv, ifr, &viNone, &msN, &dsOff, &cbInit, m_rpScene, &m_pInit);
@@ -1036,6 +1180,18 @@ private:
         vkDestroyShaderModule(m_dev, p3, nullptr); vkDestroyShaderModule(m_dev, p3n, nullptr);
         make(sv, df, &viScene, &ms1, &dsLess, &cbOne, m_rpDepth, &m_pDepth);
         make(qv, cf, &viNone, &ms1, &dsOff, &cbOne, m_rpComp, &m_pComp);
+        if (m_rpMerged) {   // same pipelines, compatible with the merged pass (subpass 0), + its composite (subpass 1)
+            VkShaderModule p3m = Mod(c_s22SceneFragP3Spv, sizeof(c_s22SceneFragP3Spv));
+            VkShaderModule p3nm = Mod(c_s22SceneFragP3NoAaSpv, sizeof(c_s22SceneFragP3NoAaSpv));
+            VkShaderModule cmf = Mod(c_s22CompMergedFragSpv, sizeof(c_s22CompMergedFragSpv));
+            make(qv, ifr, &viNone, &msN, &dsOff, &cbInit, m_rpMerged, &m_mInit);
+            make(sv, sf, &viScene, &msN, &dsTest, &cbScene, m_rpMerged, &m_mScene3D);
+            make(sv, sf, &viScene, &msN, &dsOff, &cbScene, m_rpMerged, &m_mSceneHud);
+            make(sv, p3m, &viScene, &msN, &dsTest, &cbScene, m_rpMerged, &m_mP3);
+            make(sv, p3nm, &viScene, &msN, &dsTest, &cbScene, m_rpMerged, &m_mP3NoAa);
+            make(qv, cmf, &viNone, &ms1, &dsOff, &cbOne, m_rpMerged, &m_mComp, 1);
+            for (VkShaderModule m : {p3m, p3nm, cmf}) vkDestroyShaderModule(m_dev, m, nullptr);
+        }
         for (VkShaderModule m : {qv, ifr, sv, sf, df, cf}) vkDestroyShaderModule(m_dev, m, nullptr);
     }
 
@@ -1053,6 +1209,7 @@ private:
         m_dummyF = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         m_dummyArr = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                               VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 2);
+        m_dummyIn = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         m_dummyU16 = NewImage(VK_FORMAT_R8_UINT, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                               VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         m_dummyPending = true;
@@ -1103,7 +1260,7 @@ private:
         Barrier(cmd, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         if (m_dummyPending) {   // the dummies ride on the first asset upload
-            for (Img* d : {&m_dummyU, &m_dummyF, &m_dummyArr, &m_dummyU16}) {
+            for (Img* d : {&m_dummyU, &m_dummyF, &m_dummyArr, &m_dummyU16, &m_dummyIn}) {
                 Barrier(cmd, d->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
             }
@@ -1253,6 +1410,17 @@ private:
                     x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; x.pImageInfo = &imgs[b];
                     w.push_back(x);
                 }
+                // Merged pass inputs (composite sets of the two eyes): this eye's transient resolved images.
+                const int me = (k == 4) ? 1 : 0;
+                VkDescriptorImageInfo ins[2] = {
+                    {VK_NULL_HANDLE, m_mt[me].rColor.view ? m_mt[me].rColor.view : m_dummyIn.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                    {VK_NULL_HANDLE, m_mt[me].rPri.view ? m_mt[me].rPri.view : m_dummyIn.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+                for (uint32_t b = 0; b < 2; ++b) {
+                    VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                    x.dstSet = S.set[k]; x.dstBinding = 17 + b; x.descriptorCount = 1;
+                    x.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; x.pImageInfo = &ins[b];
+                    w.push_back(x);
+                }
                 vkUpdateDescriptorSets(m_dev, uint32_t(w.size()), w.data(), 0, nullptr);
             }
         }
@@ -1268,6 +1436,9 @@ private:
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkDescriptorPool m_pool = VK_NULL_HANDLE;
     VkRenderPass m_rpDepth = VK_NULL_HANDLE, m_rpScene = VK_NULL_HANDLE, m_rpComp = VK_NULL_HANDLE;
+    VkRenderPass m_rpMerged = VK_NULL_HANDLE;
+    VkPipeline m_mInit = VK_NULL_HANDLE, m_mScene3D = VK_NULL_HANDLE, m_mSceneHud = VK_NULL_HANDLE, m_mP3 = VK_NULL_HANDLE,
+               m_mP3NoAa = VK_NULL_HANDLE, m_mComp = VK_NULL_HANDLE;
     VkPipeline m_pInit = VK_NULL_HANDLE, m_pScene3D = VK_NULL_HANDLE, m_pP3 = VK_NULL_HANDLE, m_pP3NoAa = VK_NULL_HANDLE, m_pSceneHud = VK_NULL_HANDLE, m_pDepth = VK_NULL_HANDLE, m_pComp = VK_NULL_HANDLE;
     VkSampler m_nearest = VK_NULL_HANDLE, m_linear = VK_NULL_HANDLE;
     Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dummyArr, m_dummyU16, m_dmDepth, m_penBanks;
