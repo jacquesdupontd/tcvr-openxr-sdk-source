@@ -62,7 +62,7 @@ struct PlanePushConstants {
     int32_t uKeyZero;
     float uUvScaleX;   // content width / texture width: the 2D image is 496 wide in a 512-wide texture
     float uClipRow;    // > 0: the back layer is not drawn below this board row (ground fill, gun games)
-    float pad2;
+    float uNoTile;     // 1: the back layer is a menu page -- only inside the arcade frame, not repeated
 };
 
 }  // namespace arcadexr::vulkan

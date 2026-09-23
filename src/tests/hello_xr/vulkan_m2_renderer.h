@@ -692,9 +692,14 @@ public:
         XrMatrix4x4f mvp;
         XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
 
-        const float hudDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 10.0f));
+        // HUD at 2 m (23/09-24/09): at 10 m it was drawn OVER 3D much nearer (a car at 3 m), which the eyes read as
+        // "behind yet in front" -- the texts made Guillaume squint, in Virtua Racing and Virtua Cop. Same apparent
+        // size and the same angle above the gaze (m2.hudLift is metres at 10 m). The sky keeps its own distance.
+        const float hudDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 2.0f));
         const float hudK = hudDistance / distance;
-        const float hudLift = arcadexr::config::GetFloat("m2.hudLift", 1.8f);
+        const float hudLiftAt10 = arcadexr::config::GetFloat("m2.hudLift", 1.8f);
+        const float hudLift = hudLiftAt10 * hudDistance / 10.0f;
+        const float backDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.backDistance", 10.0f));
         const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudDistance + screen.up.x * hudLift,
                                             camera.y - screen.normal.y * hudDistance + screen.up.y * hudLift,
                                             camera.z - screen.normal.z * hudDistance + screen.up.z * hudLift};
@@ -715,15 +720,23 @@ public:
         // scrolls its sky INSTANTLY for the same camera move: the difference made it slide like wallpaper going
         // up and down (Guillaume, 23/09). Now level, and re-anchored every frame so that the image row of the
         // game's horizon (where the game has just scrolled it) sits exactly at eye level.
-        const bool skyAnchor = !m_flatMode && m_horizonGeo >= 0.0f &&
+        // A menu of the game (no main 3D view): its 2D back layer is part of the screen, not a sky -- same plane as the
+        // HUD, level, not repeated (the course select showed ten copies of a course, and the selection frame of the
+        // front layer did not sit on the course of the back one).
+        const bool menuScreen = !m_flatMode && !m_haveMainView;
+        m_backNoTile = menuScreen;
+        const bool skyAnchor = !menuScreen && !m_flatMode && m_horizonGeo >= 0.0f &&
             arcadexr::profiles::GetInt("immersive.skyAnchor", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;   // GOLD (Sega Rally) unchanged by default
-        const float backH = screen.height * hudK;
-        const float backLift = skyAnchor ? -(0.5f - m_horizonGeo / 384.0f) * backH : hudLift;
-        const arcadexr::gun::Vec3 bN = skyAnchor ? screen.normal : normalP, bU = skyAnchor ? screen.up : upP;
-        const arcadexr::gun::Vec3 backCenter{camera.x - bN.x * hudDistance + screen.up.x * backLift,
-                                             camera.y - bN.y * hudDistance + screen.up.y * backLift,
-                                             camera.z - bN.z * hudDistance + screen.up.z * backLift};
-        hudToWorldBack.m[0] = screen.right.x * screen.width * hudK; hudToWorldBack.m[1] = screen.right.y * screen.width * hudK; hudToWorldBack.m[2] = screen.right.z * screen.width * hudK;
+        const float backD = menuScreen ? hudDistance : backDistance;
+        const float backK = backD / distance;
+        const float backH = screen.height * backK;
+        const float backLift = menuScreen ? hudLift : (skyAnchor ? -(0.5f - m_horizonGeo / 384.0f) * backH : hudLiftAt10 * backD / 10.0f);
+        const bool level = skyAnchor || menuScreen;
+        const arcadexr::gun::Vec3 bN = level ? screen.normal : normalP, bU = level ? screen.up : upP;
+        const arcadexr::gun::Vec3 backCenter{camera.x - bN.x * backD + screen.up.x * backLift,
+                                             camera.y - bN.y * backD + screen.up.y * backLift,
+                                             camera.z - bN.z * backD + screen.up.z * backLift};
+        hudToWorldBack.m[0] = screen.right.x * screen.width * backK; hudToWorldBack.m[1] = screen.right.y * screen.width * backK; hudToWorldBack.m[2] = screen.right.z * screen.width * backK;
         hudToWorldBack.m[4] = bU.x * backH;                         hudToWorldBack.m[5] = bU.y * backH;                         hudToWorldBack.m[6] = bU.z * backH;
         hudToWorldBack.m[8] = bN.x; hudToWorldBack.m[9] = bN.y; hudToWorldBack.m[10] = bN.z;
         hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
@@ -853,6 +866,7 @@ public:
                 backPc.uKeyZero = 0;
                 backPc.uUvScaleX = m_layerUvScaleX[1];
                 backPc.uClipRow = clipRow;
+                backPc.uNoTile = m_backNoTile ? 1.0f : 0.0f;
     
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_planePipelineFar : m_planePipeline));
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[1], 0, nullptr);
@@ -2492,6 +2506,7 @@ private:
     uint32_t* m_layerStagingMappedF[kFrames][2] = {};
     bool m_haveLayer[2] = {false, false};
     bool m_frontFullscreen = false;
+    bool m_backNoTile = false;
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
     // Geometry unpack state

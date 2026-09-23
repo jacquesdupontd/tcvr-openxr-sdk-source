@@ -11,7 +11,7 @@ layout(push_constant) uniform PlanePushConstants {
     int uKeyZero;
     float uUvScaleX;   // 496/512: only the arcade's columns (the texture's last 16 are empty; they drew black bands, 23/09)
     float uClipRow;    // > 0: back layer cut below this board row, the ground colour shows there (gun games)
-    float pad2;
+    float uNoTile;     // 1: a menu page: inside the arcade frame only
 };
 
 void main_body() {
@@ -24,7 +24,7 @@ void main_body() {
     float u = (b1 * a22 - a12 * b2) / det, v = (a11 * b2 - a21 * b1) / det;
     if (u * c0.w + v * c1.w + c3.w <= 0.0) discard;
     bool inside = abs(u) <= 0.5 && abs(v) <= 0.5;
-    if (uKeyZero != 0 && !inside) discard;
+    if ((uKeyZero != 0 || uNoTile > 0.5) && !inside) discard;
     // Back layer beyond the arcade frame: repeated MIRRORED (identity inside the frame), so the edges meet
     // without a seam; a plain repeat put the image's left edge against its right one (a hard line in the sky).
     float t = u + 0.5, m = fract(t * 0.5) * 2.0;
