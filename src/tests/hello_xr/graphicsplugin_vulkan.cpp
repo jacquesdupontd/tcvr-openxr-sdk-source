@@ -1645,11 +1645,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const bool menuOpen = menu.IsOpen();
         auto guns = arcadexr::gun::GetGunPoses();
         const bool drawGuns = guns.count > 0 && !menuOpen && !arcadexr::profiles::IsDriving();
-        if (!menuOpen && !drawGuns) { m_menuFramePoseValid = false; return; }
+        const auto aim = arcadexr::gun::GetAimState();
+        const bool drawReticle = aim.show_crosshair && aim.have_world && !menuOpen && !arcadexr::profiles::IsDriving();
+        if (!menuOpen && !drawGuns && !drawReticle) { m_menuFramePoseValid = false; return; }
         if (!m_overlayInit) {
             m_overlay.Init(m_vkDevice, &m_memAllocator, VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt));
             m_overlayInit = true;
         }
+        if (drawReticle) m_overlay.EnsureReticle(cmd);   // once, outside the render pass
         const auto& pose = layerView.pose;
         XrMatrix4x4f proj, toView, view, vp;
         XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_VULKAN, layerView.fov, 0.05f, 100.0f);
@@ -1667,6 +1670,30 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 XrMatrix4x4f_Multiply(&mvp, &vp, &model);
                 const float eye[3] = {pose.position.x, pose.position.y, pose.position.z};
                 m_overlay.DrawGun(cmd, mvp.m, model.m, eye);
+            }
+        }
+        if (drawReticle) {
+            // At the aimed point, facing this eye, a constant angular size (~1.6 degrees) whatever the distance.
+            const XrVector3f P{aim.world[0], aim.world[1], aim.world[2]};
+            XrVector3f toP{P.x - pose.position.x, P.y - pose.position.y, P.z - pose.position.z};
+            float dist = std::sqrt(toP.x * toP.x + toP.y * toP.y + toP.z * toP.z);
+            if (dist > 1e-3f) {
+                const float useD = std::min(dist, 90.0f);   // inside the overlay's far plane
+                const XrVector3f Q{pose.position.x + toP.x / dist * useD, pose.position.y + toP.y / dist * useD, pose.position.z + toP.z / dist * useD};
+                const XrVector3f lr{1, 0, 0}, lu{0, 1, 0}, ln{0, 0, 1};
+                XrVector3f right, up, normal;
+                XrQuaternionf_RotateVector3f(&right, &pose.orientation, &lr);
+                XrQuaternionf_RotateVector3f(&up, &pose.orientation, &lu);
+                XrQuaternionf_RotateVector3f(&normal, &pose.orientation, &ln);
+                const float size = useD * 0.028f * std::max(0.3f, std::min(3.0f, arcadexr::config::GetFloat("crosshair.size", 1.0f)));
+                XrMatrix4x4f model{};
+                model.m[0] = right.x * size; model.m[1] = right.y * size; model.m[2] = right.z * size;
+                model.m[4] = up.x * size; model.m[5] = up.y * size; model.m[6] = up.z * size;
+                model.m[8] = normal.x; model.m[9] = normal.y; model.m[10] = normal.z;
+                model.m[12] = Q.x; model.m[13] = Q.y; model.m[14] = Q.z; model.m[15] = 1.0f;
+                XrMatrix4x4f mvp; XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+                const float tint[4] = {aim.calibrating ? 0.3f : 1.0f, aim.calibrating ? 1.0f : 0.25f, aim.calibrating ? 0.3f : 0.2f, 1.0f};
+                m_overlay.DrawReticle(cmd, mvp.m, tint);
             }
         }
         if (menuOpen) {

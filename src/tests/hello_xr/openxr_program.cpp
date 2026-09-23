@@ -1804,7 +1804,11 @@ struct OpenXrProgram : IOpenXrProgram {
                                                     (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating) ||
                                                     (m_crosshairMode == CrosshairMode::Auto &&
                                                      (m_calibrating || m_crosshairHeld || arcadexr::gun::SceneAimOnPlane())));
-            arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
+            {
+                arcadexr::gun::AimState as{onScreen, hit.normalized_x, hit.normalized_y, m_calibrating, showCrosshair};
+                if (haveAimWorld) { as.have_world = true; as.world[0] = aimWorld.x; as.world[1] = aimWorld.y; as.world[2] = aimWorld.z; }
+                arcadexr::gun::SetAimState(as);
+            }
             // Arcade Screen draws the reticle in its quad shader. Immersive
             // presentation has no quad, so put the same aiming truth on the
             // invisible game projection plane as a small world-space marker.

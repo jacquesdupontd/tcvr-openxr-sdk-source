@@ -95,6 +95,10 @@ public:
         if (m_sampler) vkDestroySampler(m_dev, m_sampler, nullptr);
         if (m_pass) vkDestroyRenderPass(m_dev, m_pass, nullptr);
         DestroyMenuImage();
+        if (m_retView) vkDestroyImageView(m_dev, m_retView, nullptr);
+        if (m_retImage) vkDestroyImage(m_dev, m_retImage, nullptr);
+        if (m_retMem) vkFreeMemory(m_dev, m_retMem, nullptr);
+        m_retView = VK_NULL_HANDLE; m_retImage = VK_NULL_HANDLE; m_retMem = VK_NULL_HANDLE; m_retReady = false; m_retStaging.Reset(m_dev);
         m_gunVbo.Reset(m_dev); m_gunIbo.Reset(m_dev); m_menuStaging.Reset(m_dev);
         m_dev = VK_NULL_HANDLE;
     }
@@ -151,6 +155,74 @@ public:
         m_menuLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     bool HaveMenuImage() const { return m_menuLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
+
+    // Reticle (23/09): in immersive the crosshair cubes of the legacy pass were never drawn. A procedural ring +
+    // centre dot (light with a dark rim, readable on any background), uploaded once, drawn as a quad facing the eye.
+    void EnsureReticle(VkCommandBuffer cmd) {
+        if (m_retReady || !m_dev) return;
+        const int N = 64;
+        std::vector<unsigned char> rgba(size_t(N) * N * 4, 0);
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const float dx = x + 0.5f - N * 0.5f, dy = y + 0.5f - N * 0.5f, r = std::sqrt(dx * dx + dy * dy);
+                auto band = [](float d, float a, float b) { return std::max(0.0f, std::min(1.0f, std::min(d - a, b - d) + 0.5f)); };
+                const float ring = band(r, 22.0f, 27.0f), dot = band(r, -1.0f, 3.0f);
+                const float rim = std::max(band(r, 20.0f, 29.0f), band(r, -1.0f, 5.0f));
+                const float light = std::max(ring, dot);
+                unsigned char* d = &rgba[(size_t(y) * N + x) * 4];
+                const float a = std::max(light, rim * 0.85f);
+                const float v = light > 0.0f ? 255.0f * light : 0.0f;
+                d[0] = d[1] = d[2] = (unsigned char)v; d[3] = (unsigned char)(255.0f * a);
+            }
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_SRGB; ii.extent = {uint32_t(N), uint32_t(N), 1};
+        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        XRC_CHECK_THROW_VKCMD(vkCreateImage(m_dev, &ii, nullptr, &m_retImage));
+        VkMemoryRequirements req{}; vkGetImageMemoryRequirements(m_dev, m_retImage, &req);
+        m_alloc->Allocate(req, &m_retMem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_dev, m_retImage, m_retMem, 0));
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = m_retImage; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_SRGB;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &vi, nullptr, &m_retView));
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = rgba.size(); bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        m_retStaging.Create(m_dev, *m_alloc, bi);
+        void* mapped = nullptr;
+        XRC_CHECK_THROW_VKCMD(vkMapMemory(m_dev, m_retStaging.mem, 0, bi.size, 0, &mapped));
+        std::memcpy(mapped, rgba.data(), rgba.size());
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = m_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &m_setLayout;
+        XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_dev, &ai, &m_retSet));
+        VkDescriptorImageInfo di{m_sampler, m_retView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet wd{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wd.dstSet = m_retSet; wd.dstBinding = 0; wd.descriptorCount = 1;
+        wd.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wd.pImageInfo = &di;
+        vkUpdateDescriptorSets(m_dev, 1, &wd, 0, nullptr);
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = m_retImage; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {uint32_t(N), uint32_t(N), 1};
+        vkCmdCopyBufferToImage(cmd, m_retStaging.buf, m_retImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        m_retReady = true;
+    }
+    void DrawReticle(VkCommandBuffer cmd, const float mvp[16], const float tint[4]) {
+        if (!m_retReady) return;
+        QuadPC pc{}; std::memcpy(pc.mvp, mvp, 64); std::memcpy(pc.tint, tint, 16);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_quadPipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &m_retSet, 0, nullptr);
+        vkCmdPushConstants(cmd, m_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
     float MenuAspect() const { return m_menuH > 0 ? float(m_menuW) / float(m_menuH) : 1.0f; }
 
     void Begin(VkCommandBuffer cmd, uint32_t eye, VkImage target, VkExtent2D ext, const VkRect2D& area) {
@@ -339,6 +411,8 @@ private:
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkDescriptorPool m_pool = VK_NULL_HANDLE;
     VkDescriptorSet m_menuSet = VK_NULL_HANDLE;
+    VkImage m_retImage = VK_NULL_HANDLE; VkDeviceMemory m_retMem = VK_NULL_HANDLE; VkImageView m_retView = VK_NULL_HANDLE;
+    VkDescriptorSet m_retSet = VK_NULL_HANDLE; BufferAndMemory m_retStaging; bool m_retReady = false;
     VkSampler m_sampler = VK_NULL_HANDLE;
     VkPipeline m_quadPipe = VK_NULL_HANDLE, m_gunPipe = VK_NULL_HANDLE;
     BufferAndMemory m_gunVbo, m_gunIbo, m_menuStaging;
