@@ -65,6 +65,7 @@ struct Prim {
     uint utex, utexminlod, utexx, utexy;
     int  center_x, center_y;
     uint zsort;
+    uint rgb;                 // tcvr_m2_prim::rgb: bit 24 = direct colour 0xRRGGBB (Model 1)
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Prims   { Prim prims[]; };
@@ -204,6 +205,8 @@ vec3 shade(Prim p, uint luma, uint palmask) {
 
 // Same as shade(), with the polygon's palette colour handed in flat by the vertex stage.
 vec3 shade_c(uint color, uint luma) {
+    if ((color & 0x1000000u) != 0u)   // Model 1 direct colour, already lit and in display space
+        return vec3(float((color >> 16) & 0xffu), float((color >> 8) & 0xffu), float(color & 0xffu)) / 255.0;
     uint r = colorxlat16((0x0000u / 2u) + (((color >>  0) & 0x1fu) << 8) + luma) & 0xffu;
     uint g = colorxlat16((0x4000u / 2u) + (((color >>  5) & 0x1fu) << 8) + luma) & 0xffu;
     uint b = colorxlat16((0x8000u / 2u) + (((color >> 10) & 0x1fu) << 8) + luma) & 0xffu;

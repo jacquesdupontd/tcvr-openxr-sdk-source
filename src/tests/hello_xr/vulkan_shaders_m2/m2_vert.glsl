@@ -54,6 +54,7 @@ struct Prim {
     uint utex, utexminlod, utexx, utexy;
     int  center_x, center_y;
     uint zsort;
+    uint rgb;                 // tcvr_m2_prim::rgb: bit 24 = direct colour 0xRRGGBB (Model 1)
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Prims { Prim prims[]; };
@@ -86,7 +87,9 @@ void main() {
         vSlot = q.first_vertex;   // the renderer stores the region slots in this otherwise unused field
         vLayer = q.vertex_count;  // ... and the texture-array layers in this one
         uint ci = q.colorbase + 0x1000u;
-        vColor = ((ci & 1u) == 0u) ? (palram[ci >> 1] & 0xffffu) : (palram[ci >> 1] >> 16);
+        // Model 1: the final lit colour is in the primitive (no palette is published for it).
+        vColor = ((q.rgb & 0x1000000u) != 0u) ? q.rgb
+               : (((ci & 1u) == 0u) ? (palram[ci >> 1] & 0xffffu) : (palram[ci >> 1] >> 16));
     }
     vSecondary = 0u;
     vBoard = aPos;
