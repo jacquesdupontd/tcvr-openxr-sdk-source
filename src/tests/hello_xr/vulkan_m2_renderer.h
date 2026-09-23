@@ -573,8 +573,16 @@ public:
                                          screen.center.y + screen.normal.y * distance,
                                          screen.center.z + screen.normal.z * distance};
 
-        const float focusY = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
-        const float focusX = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f;
+        // Telephoto cap (23/09, Virtua Cop): a gun game films with a focus of 1500-1800 (17 degrees across the
+        // arcade screen). At the headset's true angles its enemies were specks. Immersive uses at most focusMax
+        // (700 = 39 degrees) for the metric conversion, which magnifies the scene by focus/focusMax and keeps the
+        // game's own zooms; racing games (true angles) are not capped. Flat keeps the true focus.
+        const float focusCap = m_flatMode ? 0.0f
+            : arcadexr::profiles::GetFloat("immersive.focusMax", arcadexr::profiles::IsDriving() ? 0.0f : 700.0f);
+        auto capF = [focusCap](float f) { return (focusCap > 1.0f) ? std::min(f, focusCap) : f; };
+        const float focusY = capF((m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f);
+        const float focusX = capF((m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f);
+        if (!m_flatMode && viewIndex == 0) { m_aimFocus[0] = focusX; m_aimFocus[1] = focusY; }
 
         float pitchTarget = 0.0f;
         if (arcadexr::config::GetInt("m2.immersivePitch", 1) != 0 && m_haveMainView && m_horizonGeo >= 0.0f) {
@@ -823,7 +831,7 @@ public:
         const auto dotv = [](float x, float y, float z, const arcadexr::gun::Vec3& b) { return x * b.x + y * b.y + z * b.z; };
         const float o[3] = {dotv(rx, ry, rz, A.R) / A.s, dotv(rx, ry, rz, A.U) / A.s, -dotv(rx, ry, rz, A.N) / A.s};
         const float d[3] = {dotv(dir.x, dir.y, dir.z, A.R), dotv(dir.x, dir.y, dir.z, A.U), -dotv(dir.x, dir.y, dir.z, A.N)};
-        const float fx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, fy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const float fx = m_aimFocus[0], fy = m_aimFocus[1];   // the focus the immersive image was built with
         const float nearZ = A.nearM / A.s;
         const size_t end = std::min<size_t>(m_secIndexStart, m_rawIdx.size());
         std::uint32_t bestRank = 0xffffffffu;
@@ -879,7 +887,7 @@ public:
         if (arcadexr::config::GetInt("m2.aimTest", 0) == 0 || !m_aimXf.valid || !m_haveMainView) return;
         if ((++m_aimTestTick % 240u) != 0u) return;
         const auto& A = m_aimXf;
-        const float fx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, fy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const float fx = m_aimFocus[0], fy = m_aimFocus[1];
         const size_t end = std::min<size_t>(m_fastIndexCount, m_rawIdx.size());
         const size_t tris = end / 3;
         if (tris == 0) return;
@@ -2221,6 +2229,7 @@ private:
     struct AimTransform { bool valid; arcadexr::gun::Vec3 cam, R, U, N; float s, nearM; };
     AimTransform m_aimXf{false, {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1.0f, 0.25f};
     unsigned m_aimTestTick = 0;
+    float m_aimFocus[2] = {512.0f, 512.0f};
     bool m_flatMode = false;
     XrMatrix4x4f m_flatMvp{};
     struct FlatTarget { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE;
