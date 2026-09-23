@@ -18,7 +18,7 @@ struct M2UniformBufferObject {
     float uFocus[2];         // 8 bytes, offset 136
     float uCrtc[2];          // 8 bytes, offset 144
     int32_t uMenuFlat;       // 4 bytes, offset 152: 1 = a menu screen, every view drawn flat on the arcade plane
-    int32_t pad0;            // 4 bytes, offset 156
+    float uFogFar;           // 4 bytes, offset 156: > 0 = pop-in fade, the scene fades into the sky towards this depth
     int32_t uMainClip[4];    // 16 bytes, offset 160
     int32_t uMainCenter[2];  // 8 bytes, offset 176
     float uEyeOffset;        // 4 bytes, offset 184

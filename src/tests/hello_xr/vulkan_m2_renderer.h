@@ -331,6 +331,10 @@ public:
                     const float med = zs[zs.size() / 2];
                     const float zmax = *std::max_element(zs.begin(), zs.end());
                     farZ = (zmax > 3.0f * med) ? 0.4f * zmax : 1e30f;
+                    // Pop-in fade depth: where the bulk of the scenery ends (90th percentile), not the farthest mountain.
+                    std::nth_element(zs.begin(), zs.begin() + (zs.size() * 9) / 10, zs.end());
+                    const float z90 = zs[(zs.size() * 9) / 10];
+                    m_zMaxSmooth = (m_zMaxSmooth > 0.0f) ? m_zMaxSmooth + (z90 - m_zMaxSmooth) * 0.05f : z90;
                 } else {
                     farZ = 1e30f;
                 }
@@ -827,7 +831,11 @@ public:
             ubo.uPrepassClass = (m_lutValid && false) ? 1 : 0;  // colour table removed from the shader (slower on Adreno, see m2_frag.glsl)  // = uUseLut. OFF: measured SLOWER on the Adreno (3 texelFetch of a 64x32 table ~10 ms vs 7 SSBO loads ~5.8 ms, 22/09, interleaved A/B), even as a combined sampler
             ubo.uEdgeFade = 0.0f;
             ubo.uHorizonRow = m_horizonGeo;
-            ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
+            const bool popFade = m_directColour && !m_flatMode && !m_backNoTile && m_zMaxSmooth > 0.0f &&
+                                 arcadexr::profiles::GetInt("immersive.popInFade", 1) != 0;
+            ubo.uFogFar = popFade ? m_zMaxSmooth : 0.0f;
+            if (popFade) { ubo.uSky[0] = m_fogColour[0]; ubo.uSky[1] = m_fogColour[1]; ubo.uSky[2] = m_fogColour[2]; }
+            else { ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2]; }
             ubo.uGround[0] = groundCol[0]; ubo.uGround[1] = groundCol[1]; ubo.uGround[2] = groundCol[2];
             ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1)));
             ubo.uFilterMode = std::max(0, std::min(5, arcadexr::config::GetInt("m2.filter", 5)));
@@ -2358,6 +2366,18 @@ private:
             }
             const uint32_t copyW = std::min(uint32_t(w), 512u);
             const uint32_t copyH = std::min(uint32_t(h), 384u);
+            if (idx == 1) {
+                // Haze colour for the pop-in fade: the sky just above the game's horizon (middle half of the row).
+                const float hr = (m_horizonGeo >= 0.0f) ? m_horizonGeo : 100.0f;
+                const uint32_t row = uint32_t(std::max(0.0f, std::min(float(copyH - 1), hr - 6.0f)));
+                float acc[3] = {0, 0, 0}; int n = 0;
+                for (uint32_t x = copyW / 4; x < copyW * 3 / 4; x += 4) {
+                    const uint32_t px = pixels[row * stride + x];
+                    if (px == 0u) continue;
+                    acc[0] += float((px >> 16) & 0xffu); acc[1] += float((px >> 8) & 0xffu); acc[2] += float(px & 0xffu); ++n;
+                }
+                if (n > 0) for (int k = 0; k < 3; ++k) m_fogColour[k] += (acc[k] / (255.0f * float(n)) - m_fogColour[k]) * 0.2f;
+            }
             if (idx == 0) {
                 // A front layer that covers (nearly) the whole screen is a flash (the gun's white flash: the
                 // cabinet's optical gun needs the whole screen lit) or a full-screen page, not a HUD. On the arcade
@@ -2556,6 +2576,8 @@ private:
     bool m_frontFullscreen = false;
     bool m_backNoTile = false;
     bool m_directColour = false;
+    float m_zMaxSmooth = 0.0f;
+    float m_fogColour[3] = {0.6f, 0.75f, 0.9f};
     unsigned m_pitchLogTick = 0;
     int m_menuFrames = 0;
     bool m_isMenuM1 = false;

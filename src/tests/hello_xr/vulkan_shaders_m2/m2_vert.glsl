@@ -12,6 +12,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     vec2 uFocus;
     vec2 uCrtc;
     int uMenuFlat;           // 1: menu screen, all views flat on the arcade plane
+    float uFogFar;           // > 0: pop-in fade towards this depth (Model 1)
     ivec4 uMainClip;
     ivec2 uMainCenter;
     float uEyeOffset;

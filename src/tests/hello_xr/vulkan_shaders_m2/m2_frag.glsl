@@ -23,6 +23,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     vec2 uFocus;
     vec2 uCrtc;
     int uMenuFlat;           // 1: menu screen, all views flat on the arcade plane
+    float uFogFar;           // > 0: pop-in fade towards this depth (Model 1)
     ivec4 uMainClip;
     ivec2 uMainCenter;
     float uEyeOffset;
@@ -751,6 +752,12 @@ void main_body() {
 // the costly MUTABLE_FORMAT raw views (they disable framebuffer compression: -3 ms on Sega Rally, 23/09).
 void main() {
     main_body();
+    // Pop-in fade (24/09, like Wanszai's PC port of Virtua Racing): the scenery the game only sends within its
+    // draw distance fades in from the sky's haze instead of popping up. uSky = the sky just above the horizon.
+    if (uFogFar > 0.0 && uImmersive != 0 && vSecondary == 0u) {
+        float f = smoothstep(0.7 * uFogFar, uFogFar, vParam.z);
+        oColor.rgb = mix(oColor.rgb, uSky, f);
+    }
     vec3 d = clamp(oColor.rgb, 0.0, 1.0);
     oColorOut = vec4(d * (d * (d * (d * -0.23012586 + 0.73328061) + 0.44219034) + 0.05115943), oColor.a);   // sRGB->linear, 4 FMA, <= 1.2/255 after re-encoding (fitted 23/09)
 }
