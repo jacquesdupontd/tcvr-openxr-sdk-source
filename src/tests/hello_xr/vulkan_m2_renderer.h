@@ -884,6 +884,14 @@ public:
         if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0 && !(skip & 32)) {
             PlanePushConstants frontPc{};
             memcpy(frontPc.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
+            if (m_frontFullscreen && !m_flatMode) {
+                // full-screen front layer (flash): the arcade plane enlarged over the whole view
+                XrMatrix4x4f big = hudToWorld;
+                const float k = std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 3.0f));
+                for (int c = 0; c < 3; ++c) { big.m[c] *= k; big.m[4 + c] *= k; }
+                XrMatrix4x4f bigMvp; XrMatrix4x4f_Multiply(&bigMvp, &viewProjection, &big);
+                memcpy(frontPc.uHudMvp, bigMvp.m, sizeof(bigMvp.m));
+            }
             frontPc.uOutSize[0] = outW; frontPc.uOutSize[1] = outH;
             frontPc.uKeyZero = 1;
             frontPc.uUvScaleX = m_layerUvScaleX[0];
@@ -2286,6 +2294,25 @@ private:
             }
             const uint32_t copyW = std::min(uint32_t(w), 512u);
             const uint32_t copyH = std::min(uint32_t(h), 384u);
+            if (idx == 0) {
+                // A front layer that covers (nearly) the whole screen is a flash (the gun's white flash: the
+                // cabinet's optical gun needs the whole screen lit) or a full-screen page, not a HUD. On the arcade
+                // plane it showed as a white square in front of the player (Guillaume, 23/09): flag it, the front
+                // pass then enlarges it over the whole view.
+                uint32_t opaque = 0, white = 0, total = 0;
+                for (uint32_t y = 0; y < copyH; y += 8)
+                    for (uint32_t x = 0; x < copyW; x += 8, ++total) {
+                        const uint32_t px = pixels[y * stride + x];
+                        if (px == 0u) continue;
+                        ++opaque;
+                        if (((px >> 16) & 0xffu) > 200u && ((px >> 8) & 0xffu) > 200u && (px & 0xffu) > 200u) ++white;
+                    }
+                // the flash only: nearly all of the screen, nearly all white (a title page on black is not enlarged)
+                m_frontFullscreen = total > 0 && opaque * 10u >= total * 8u && white * 10u >= total * 8u;
+                static unsigned s_ffLog = 0;
+                if (m_frontFullscreen && (s_ffLog++ % 30u) == 0u)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M2VK front layer full-screen (%u/%u opaque): drawn over the whole view", opaque, total));
+            }
             for (uint32_t y = 0; y < copyH; ++y) {
                 memcpy(&m_layerStagingMappedF[m_fs][idx][y * 512], &pixels[y * stride], copyW * sizeof(uint32_t));
             }
@@ -2462,6 +2489,7 @@ private:
     BufferAndMemory m_layerStagingBufferF[kFrames][2];
     uint32_t* m_layerStagingMappedF[kFrames][2] = {};
     bool m_haveLayer[2] = {false, false};
+    bool m_frontFullscreen = false;
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
     // Geometry unpack state
