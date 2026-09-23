@@ -586,7 +586,7 @@ public:
         if (!m_flatMode && viewIndex == 0) { m_aimFocus[0] = focusX; m_aimFocus[1] = focusY; }
         // Ground fill (gun games): below the game's horizon, the colour of the floor the arcade shows, not its 2D layer.
         const bool groundFill = !m_flatMode && m_groundProbed &&
-            arcadexr::profiles::GetInt("immersive.groundFill", 0) != 0;   // OFF until the CPU colour chain matches the shader (23/09: blue-grey instead of brown dirt)
+            arcadexr::profiles::GetInt("immersive.groundFill", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
         const float* groundCol = groundFill ? m_groundProbe : m_groundColor;
         const float clipRow = (groundFill && m_horizonGeo >= 0.0f) ? m_horizonGeo + 2.0f : 0.0f;
 
@@ -1073,40 +1073,61 @@ public:
         const float px = 248.0f, py = float(std::max(0, mainB - 12));
         const size_t end = std::min<size_t>(m_secIndexStart, m_rawIdx.size());
         uint32_t best = 0xffffffffu;
+        const bool diag = arcadexr::config::GetInt("m2.groundDiag", 0) != 0 && (m_groundLogTick % 120u) == 119u;
+        // A ray from the board camera through that pixel (metric camera space: X = x/focus), tested exactly
+        // against the drawn triangles: polygons that pass behind the camera -- the nearest floor always does --
+        // are handled, where a projected 2D test had to skip them and found a far slab under the real floor.
+        const float ffx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, ffy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const float d[3] = {(px - fx) / ffx, (fy - py) / ffy, 1.0f};
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-            if (rank >= best) continue;
-            float sx[3], sy[3]; bool ok = true;
-            for (int k = 0; k < 3; ++k) {
-                const float* v = &m_rawVerts[size_t(m_rawIdx[i + k]) * 5];
-                if (v[2] <= 1e-3f) { ok = false; break; }
-                sx[k] = fx + v[0] / v[2]; sy[k] = fy - v[1] / v[2];
+            if (rank >= best && !diag) continue;
+            const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
+            const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
+            const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
+            const float A[3] = {a[0] / ffx, a[1] / ffy, a[2]};
+            const float e1[3] = {b[0] / ffx - A[0], b[1] / ffy - A[1], b[2] - A[2]};
+            const float e2[3] = {c[0] / ffx - A[0], c[1] / ffy - A[1], c[2] - A[2]};
+            // floor only: nearly horizontal
+            const float nx = e1[1] * e2[2] - e1[2] * e2[1], ny = e1[2] * e2[0] - e1[0] * e2[2], nz = e1[0] * e2[1] - e1[1] * e2[0];
+            const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (len < 1e-12f || std::fabs(ny) < 0.8f * len) continue;
+            const float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+            const float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if (std::fabs(det) < 1e-12f) continue;
+            const float inv = 1.0f / det;
+            const float tv[3] = {-A[0], -A[1], -A[2]};
+            const float u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+            if (u < 0.0f || u > 1.0f) continue;
+            const float qv[3] = {tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+            const float v = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+            if (v < 0.0f || u + v > 1.0f) continue;
+            const float t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+            if (t <= 0.0f) continue;
+            if (diag && rank < m_rawPrims.size()) {
+                float cc[3]; const int nn = GroundColourOf(frame, m_rawPrims[rank], cc);
+                const tcvr_m2_prim& q = m_rawPrims[rank];
+                Log::Write(Log::Level::Info, Fmt("TCVR_GROUNDDIAG rank=%u z=%.1f tex=%u xy=%u,%u wh=%ux%u cb=%u n=%d -> %.2f %.2f %.2f",
+                    rank, t, q.textured, q.texx, q.texy, q.texwidth, q.texheight, q.colorbase, nn, cc[0], cc[1], cc[2]));
             }
-            if (!ok) continue;
-            // Floor only: a nearly horizontal surface in camera space (billboards, effects and walls in front of
-            // the camera cover that pixel too, and were picked first).
-            {
-                const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
-                const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
-                const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
-                const float ffx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, ffy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
-                const float e1[3] = {(b[0] - a[0]) / ffx, (b[1] - a[1]) / ffy, b[2] - a[2]};
-                const float e2[3] = {(c[0] - a[0]) / ffx, (c[1] - a[1]) / ffy, c[2] - a[2]};
-                const float nx = e1[1] * e2[2] - e1[2] * e2[1], ny = e1[2] * e2[0] - e1[0] * e2[2], nz = e1[0] * e2[1] - e1[1] * e2[0];
-                const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-                if (len < 1e-9f || std::fabs(ny) < 0.8f * len) continue;
-            }
-            // Degenerate (a quad with a repeated vertex): zero area passes every sign test, skip it.
-            const float area2 = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-            if (std::fabs(area2) < 0.5f) continue;
-            const float d1 = (px - sx[1]) * (sy[0] - sy[1]) - (sx[0] - sx[1]) * (py - sy[1]);
-            const float d2 = (px - sx[2]) * (sy[1] - sy[2]) - (sx[1] - sx[2]) * (py - sy[2]);
-            const float d3 = (px - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (py - sy[0]);
-            const bool neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
-            if (!(neg && pos)) best = rank;
+            if (rank < best) best = rank;
         }
         if (best == 0xffffffffu || best >= m_rawPrims.size()) return;
         const tcvr_m2_prim& p = m_rawPrims[best];
+        float acc[3] = {0, 0, 0};
+        const int n = GroundColourOf(frame, p, acc);
+        if (n == 0) return;
+        const float a = m_groundProbed ? 0.15f : 1.0f;   // settle quickly, then follow the stage smoothly
+        for (int k = 0; k < 3; ++k) m_groundProbe[k] += (acc[k] - m_groundProbe[k]) * a;
+        m_groundProbed = true;
+        if ((++m_groundLogTick % 120u) == 0u)
+            Log::Write(Log::Level::Info, Fmt("TCVR_GROUND rank=%u/%zu tex=%u trans=%u sheet=%u xy=%u,%u wh=%ux%u cb=%u lb=%u luma=%u n=%d -> %.2f %.2f %.2f",
+                best, m_rawPrims.size(), p.textured, p.translucent, p.texsheet, p.texx, p.texy, p.texwidth, p.texheight, p.colorbase, p.lumabase, p.luma, n,
+                m_groundProbe[0], m_groundProbe[1], m_groundProbe[2]));
+    }
+    unsigned m_groundLogTick = 0;
+    // Average display colour of a polygon through the Model 2 colour chain (CPU), 0 if it cannot be computed.
+    int GroundColourOf(const tcvr_m2_frame& frame, const tcvr_m2_prim& p, float acc[3]) {
         auto u16 = [](const uint16_t* t, uint32_t n, uint32_t i) -> uint32_t { return i < n ? t[i] : 0u; };
         auto shadeCpu = [&](uint32_t luma, float out[3]) {
             const uint32_t color = u16(frame.palram, frame.palram_entries, p.colorbase + 0x1000u) & 0x7fffu;
@@ -1117,14 +1138,14 @@ public:
                 out[k] = float(x < frame.gamma_entries ? frame.gamma[x] : x) / 255.0f;
             }
         };
-        float acc[3] = {0, 0, 0}; int n = 0;
+        acc[0] = acc[1] = acc[2] = 0.0f; int n = 0;
         if ((p.rgb & 0x1000000u) != 0u) {
             acc[0] = float((p.rgb >> 16) & 0xffu) / 255.0f; acc[1] = float((p.rgb >> 8) & 0xffu) / 255.0f; acc[2] = float(p.rgb & 0xffu) / 255.0f; n = 1;
         } else if (p.textured == 0u) {
             shadeCpu(std::min(p.luma >> 2, 0x3fu), acc); n = 1;
         } else {
             const uint32_t sh = p.texsheet & 1u, w = p.texwidth, h = p.texheight;
-            if (m_sheetCpu[sh].empty() || w == 0 || h == 0 || w > 2048 || h > 1024) return;
+            if (m_sheetCpu[sh].empty() || w == 0 || h == 0 || w > 2048 || h > 1024) return 0;
             const uint32_t ox = (p.texx - 2048u) & 2047u, oy = (p.texy - 1024u) & 1023u;
             const std::vector<uint8_t>& cpu = m_sheetCpu[sh];
             for (uint32_t gy = 0; gy < 16; ++gy)
@@ -1142,16 +1163,24 @@ public:
                     acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2]; ++n;
                 }
         }
-        if (n == 0) return;
-        const float a = m_groundProbed ? 0.15f : 1.0f;   // settle quickly, then follow the stage smoothly
-        for (int k = 0; k < 3; ++k) m_groundProbe[k] += (acc[k] / float(n) - m_groundProbe[k]) * a;
-        m_groundProbed = true;
-        if ((++m_groundLogTick % 120u) == 0u)
-            Log::Write(Log::Level::Info, Fmt("TCVR_GROUND rank=%u/%zu tex=%u trans=%u sheet=%u xy=%u,%u wh=%ux%u cb=%u lb=%u luma=%u n=%d -> %.2f %.2f %.2f",
-                best, m_rawPrims.size(), p.textured, p.translucent, p.texsheet, p.texx, p.texy, p.texwidth, p.texheight, p.colorbase, p.lumabase, p.luma, n,
-                m_groundProbe[0], m_groundProbe[1], m_groundProbe[2]));
+        if (n > 1) for (int k = 0; k < 3; ++k) acc[k] /= float(n);
+        if (arcadexr::config::GetInt("m2.groundDiag", 0) != 0 && p.textured != 0u && (m_groundLogTick % 120u) == 119u) {
+            std::string line; int hist[16] = {};
+            const uint32_t sh = p.texsheet & 1u, ox = (p.texx - 2048u) & 2047u, oy = (p.texy - 1024u) & 1023u;
+            for (uint32_t y = 0; y < p.texheight; ++y) for (uint32_t x = 0; x < p.texwidth; ++x) {
+                int x2 = int(ox + x), y2 = int(oy + y); if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
+                const size_t at = size_t(y2) * 1024 + size_t(x2); if (at < m_sheetCpu[sh].size()) hist[m_sheetCpu[sh][at] & 15]++;
+            }
+            for (uint32_t t = 0; t < 16; ++t) {
+                const uint32_t li = p.lumabase + ((t << 4) >> 1);
+                const uint32_t lr = li < frame.lumaram_entries ? frame.lumaram[li] : 0u;
+                float c[3]; shadeCpu(std::min((lr * p.luma) / 256u, 0x3fu), c);
+                line += Fmt(" %u:%d(%02x%02x%02x)", t, hist[t], int(c[0] * 255), int(c[1] * 255), int(c[2] * 255));
+            }
+            Log::Write(Log::Level::Info, "TCVR_GROUNDTEX" + line);
+        }
+        return n;
     }
-    unsigned m_groundLogTick = 0;
     float m_groundProbe[3] = {0.18f, 0.16f, 0.14f};
     bool m_groundProbed = false;
 
