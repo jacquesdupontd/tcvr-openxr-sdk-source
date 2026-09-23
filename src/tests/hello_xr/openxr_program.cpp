@@ -1504,9 +1504,13 @@ struct OpenXrProgram : IOpenXrProgram {
             Log::Write(Log::Level::Info, "TCVR_M9 arcade screen re-anchor requested by the player");
         }
 
-        // Left stick: HOLD to show the crosshair in play ("auto" mode). It used to cycle the mode on each click;
-        // the mode is chosen in the headset menu now.
-        m_crosshairHeld = !driving && leftStickClick;
+        // Left stick CLICK toggles the crosshair in play ("auto" mode, like Time Crisis; Guillaume 23/09). It used
+        // to cycle the mode; the mode is chosen in the headset menu now. In the game's menus it always shows.
+        if (!driving && pressedOnce(m_input.crosshairAction)) {
+            m_crosshairHeld = !m_crosshairHeld;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M10 crosshair in play %s", m_crosshairHeld ? "ON" : "OFF"));
+        }
+        (void)leftStickClick;
     }
 
     void RenderFrame() override {

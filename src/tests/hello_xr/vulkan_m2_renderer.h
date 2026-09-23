@@ -627,7 +627,14 @@ public:
 
         const float distance = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
         const float depthUnits = std::max(0.5f, arcadexr::config::GetFloat("m2.immersiveDepth", 9.4f));
-        const float worldScale = distance / depthUnits;
+        // World scale (23/09, Guillaume: "everything looks small and so do I"). The base was Sega Rally's
+        // (distance / m2.immersiveDepth); gun games now put the player's eyes immersive.eyeHeight (1.65 m) above the
+        // game's floor, measured every frame. The menu multiplier (immersive.worldScaleMul) applies to every game.
+        const bool autoScale = arcadexr::profiles::GetInt("immersive.autoScale", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
+        const float eyeHeight = arcadexr::profiles::GetFloat("immersive.eyeHeight", 1.65f);
+        float baseScale = distance / depthUnits;
+        if (autoScale && m_camHeightUnits > 1e-3f) baseScale = std::max(0.005f, std::min(5.0f, eyeHeight / m_camHeightUnits));
+        const float worldScale = baseScale * std::max(0.1f, std::min(10.0f, arcadexr::profiles::GetFloat("immersive.worldScaleMul", 1.0f)));
         const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance,
                                          screen.center.y + screen.normal.y * distance,
                                          screen.center.z + screen.normal.z * distance};
@@ -704,12 +711,21 @@ public:
         }
 
         XrMatrix4x4f hudToWorldBack{};
-        const arcadexr::gun::Vec3 backCenter{camera.x - normalP.x * hudDistance + screen.up.x * hudLift,
-                                             camera.y - normalP.y * hudDistance + screen.up.y * hudLift,
-                                             camera.z - normalP.z * hudDistance + screen.up.z * hudLift};
+        // Back layer (the game's 2D sky). It used to be tilted with the SMOOTHED pitch estimate while the game
+        // scrolls its sky INSTANTLY for the same camera move: the difference made it slide like wallpaper going
+        // up and down (Guillaume, 23/09). Now level, and re-anchored every frame so that the image row of the
+        // game's horizon (where the game has just scrolled it) sits exactly at eye level.
+        const bool skyAnchor = !m_flatMode && m_horizonGeo >= 0.0f &&
+            arcadexr::profiles::GetInt("immersive.skyAnchor", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;   // GOLD (Sega Rally) unchanged by default
+        const float backH = screen.height * hudK;
+        const float backLift = skyAnchor ? -(0.5f - m_horizonGeo / 384.0f) * backH : hudLift;
+        const arcadexr::gun::Vec3 bN = skyAnchor ? screen.normal : normalP, bU = skyAnchor ? screen.up : upP;
+        const arcadexr::gun::Vec3 backCenter{camera.x - bN.x * hudDistance + screen.up.x * backLift,
+                                             camera.y - bN.y * hudDistance + screen.up.y * backLift,
+                                             camera.z - bN.z * hudDistance + screen.up.z * backLift};
         hudToWorldBack.m[0] = screen.right.x * screen.width * hudK; hudToWorldBack.m[1] = screen.right.y * screen.width * hudK; hudToWorldBack.m[2] = screen.right.z * screen.width * hudK;
-        hudToWorldBack.m[4] = upP.x * screen.height * hudK;         hudToWorldBack.m[5] = upP.y * screen.height * hudK;         hudToWorldBack.m[6] = upP.z * screen.height * hudK;
-        hudToWorldBack.m[8] = normalP.x; hudToWorldBack.m[9] = normalP.y; hudToWorldBack.m[10] = normalP.z;
+        hudToWorldBack.m[4] = bU.x * backH;                         hudToWorldBack.m[5] = bU.y * backH;                         hudToWorldBack.m[6] = bU.z * backH;
+        hudToWorldBack.m[8] = bN.x; hudToWorldBack.m[9] = bN.y; hudToWorldBack.m[10] = bN.z;
         hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
         XrMatrix4x4f hudMvpBack;
         XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
@@ -1197,6 +1213,27 @@ public:
             if (rank < best) best = rank;
         }
         if (best == 0xffffffffu || best >= m_rawPrims.size()) return;
+        {   // Camera height above that floor (world scale, 23/09): distance from the camera to the floor's PLANE,
+            // in the metric space the immersive image is built in (capped focus) -- independent of the pitch.
+            const float fe0 = m_aimFocus[0] > 1.0f ? m_aimFocus[0] : ffx, fe1 = m_aimFocus[1] > 1.0f ? m_aimFocus[1] : ffy;
+            for (size_t i = 0; i + 2 < end; i += 3) {
+                if (m_rawPrimOfVertex[m_rawIdx[i]] != best) continue;
+                const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
+                const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
+                const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
+                const float A[3] = {a[0] / fe0, a[1] / fe1, a[2]};
+                const float e1[3] = {b[0] / fe0 - A[0], b[1] / fe1 - A[1], b[2] - A[2]};
+                const float e2[3] = {c[0] / fe0 - A[0], c[1] / fe1 - A[1], c[2] - A[2]};
+                const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (len < 1e-12f) continue;
+                const float h = std::fabs(n[0] * A[0] + n[1] * A[1] + n[2] * A[2]) / len;
+                if (h > 1e-3f) {
+                    m_camHeightUnits = (m_camHeightUnits > 0.0f) ? m_camHeightUnits + (h - m_camHeightUnits) * 0.05f : h;
+                }
+                break;
+            }
+        }
         const tcvr_m2_prim& p = m_rawPrims[best];
         float acc[3] = {0, 0, 0};
         const int n = GroundColourOf(frame, p, acc);
@@ -1268,6 +1305,7 @@ public:
         return n;
     }
     float m_groundProbe[3] = {0.18f, 0.16f, 0.14f};
+    float m_camHeightUnits = 0.0f;   // game camera height above its floor, in immersive metric units (smoothed)
     bool m_groundProbed = false;
 
     bool HasGeometry() const { return m_initialized && m_opaqueIndexCount > 0; }
