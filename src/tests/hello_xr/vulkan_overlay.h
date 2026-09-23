@@ -260,13 +260,14 @@ private:
         // Gun: opaque, depth tested and written (its own transient depth).
         {
             VkVertexInputBindingDescription bd{0, sizeof(arcadexr::gun::MeshVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-            VkVertexInputAttributeDescription ad[3] = {
+            VkVertexInputAttributeDescription ad[4] = {
                 {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(arcadexr::gun::MeshVertex, position)},
                 {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(arcadexr::gun::MeshVertex, normal)},
-                {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(arcadexr::gun::MeshVertex, color)}};
+                {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(arcadexr::gun::MeshVertex, color)},
+                {3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(arcadexr::gun::MeshVertex, material)}};
             VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
             vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bd;
-            vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = ad;
+            vi.vertexAttributeDescriptionCount = 4; vi.pVertexAttributeDescriptions = ad;
             VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
             dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = VK_TRUE; dss.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xf;

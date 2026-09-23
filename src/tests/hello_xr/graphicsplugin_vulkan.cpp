@@ -1633,7 +1633,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (drawGuns) {
             for (int g = 0; g < guns.count; ++g) {
                 XrMatrix4x4f model, mvp;
-                const XrVector3f unit{1, 1, 1};
+                const float gs = std::max(0.5f, std::min(2.0f, arcadexr::config::GetFloat("gun.scale", 1.0f)));   // live size tuning
+                const XrVector3f unit{gs, gs, gs};
                 XrMatrix4x4f_CreateTranslationRotationScale(&model, &guns.pose[g].position, &guns.pose[g].orientation, &unit);
                 XrMatrix4x4f_Multiply(&mvp, &vp, &model);
                 const float eye[3] = {pose.position.x, pose.position.y, pose.position.z};
