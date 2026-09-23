@@ -1544,6 +1544,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // pass really drew a centred main view (a race); menus/intro keep mode 1 so the flat
         // fallback always has a fresh picture.
         if (viewIndex == 0) m_lastM2Drawn = m2ImmersiveDrawn;
+        if (viewIndex == 0) {
+            // Model 2 immersive lightgun: the aim follows the scene only while that scene is what the player sees.
+            m_m2AimLive = m2ImmersiveDrawn && !s22Drawn && m_m2Renderer.HaveMainView();
+            if (m_m2AimLive) {
+                if (s_s22Self != this) { s_s22Self = this; arcadexr::gun::SetSceneAim(&S22AimTrampoline); }
+                m_m2Renderer.AimSelfTest();
+            }
+        }
         if (viewIndex == 0 && m_m2SceneRequested) {
             const bool allowSkip = arcadexr::config::GetInt("m2.skipCpuRaster", 1) != 0;
             SetM2SceneMode((((m2ImmersiveDrawn && m_m2Renderer.HaveMainView()) || m_flatDrawn) && allowSkip) ? 2 : 1);
@@ -1701,7 +1709,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (!m_s22.Ready()) {
             const int msaa = std::max(1, std::min(4, arcadexr::config::GetInt("immersive.msaa", 4)));
             m_s22.Init(m_vkDevice, &m_memAllocator, VkFormat(swapchainData->GetSlices()[0].m_rp.colorFmt), msaa);
-            arcadexr::gun::SetSceneAim(&S22AimTrampoline);
+            arcadexr::gun::SetSceneAim(&S22AimTrampoline);   // board-agnostic: S22, then Model 2
             s_s22Self = this;
         }
         const std::string game = arcadexr::profiles::CurrentGame();
@@ -1863,8 +1871,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     unsigned m_aimTestTick = 0;
 
     static bool S22AimTrampoline(const XrVector3f& o, const XrVector3f& d, float& nx, float& ny, XrVector3f& hit) {
-        return s_s22Self && s_s22Self->S22Aim(o, d, nx, ny, hit);
+        if (!s_s22Self) return false;
+        if (s_s22Self->S22Aim(o, d, nx, ny, hit)) return true;
+        return s_s22Self->m_m2AimLive && s_s22Self->m_m2Renderer.Aim(o, d, nx, ny, hit);
     }
+    bool m_m2AimLive = false;
 
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
         if (m_m2RendererInitialized) return;

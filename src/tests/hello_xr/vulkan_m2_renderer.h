@@ -588,6 +588,11 @@ public:
         const arcadexr::gun::Vec3 upP{cp * screen.up.x - sp * screen.normal.x, cp * screen.up.y - sp * screen.normal.y, cp * screen.up.z - sp * screen.normal.z};
         const arcadexr::gun::Vec3 normalP{cp * screen.normal.x + sp * screen.up.x, cp * screen.normal.y + sp * screen.up.y, cp * screen.normal.z + sp * screen.up.z};
 
+        if (!m_flatMode && viewIndex == 0) {
+            // Lightgun (Aim): the arcade-to-world transform of the image the player sees.
+            m_aimXf = {true, camera, screen.right, upP, normalP, worldScale,
+                       std::max(0.002f, std::min(1.0f, arcadexr::config::GetFloat("m2.immersiveNear", 0.25f)))};
+        }
         XrMatrix4x4f arcadeToWorld{};
         arcadeToWorld.m[0] = screen.right.x * worldScale;  arcadeToWorld.m[1] = screen.right.y * worldScale;  arcadeToWorld.m[2] = screen.right.z * worldScale;
         arcadeToWorld.m[4] = upP.x * worldScale;          arcadeToWorld.m[5] = upP.y * worldScale;          arcadeToWorld.m[6] = upP.z * worldScale;
@@ -802,6 +807,117 @@ public:
         }
 
         return true;
+    }
+
+    // Immersive lightgun (23/09, Virtua Cop): where does a controller ray meet the scene the player SEES, and
+    // which board pixel is that? Exact ray/triangle test on the drawn main-view triangles (opaque + cut-outs;
+    // mirrors and glass excluded), visible surface = lowest near-to-far rank like the renderer (depth = rank),
+    // ray length only breaks ties. No hit (sky, void): the direction is projected at infinity, so pointing off
+    // the scene lands off the screen and the game reloads, as on the cabinet. Same thread as BuildFrame.
+    bool Aim(const XrVector3f& origin, const XrVector3f& dir, float& nx, float& ny, XrVector3f& hitWorld) const {
+        if (!m_aimXf.valid || !m_haveMainView || m_rawIdx.empty()) return false;
+        const auto& A = m_aimXf;
+        const float rx = origin.x - A.cam.x, ry = origin.y - A.cam.y, rz = origin.z - A.cam.z;
+        const auto dotv = [](float x, float y, float z, const arcadexr::gun::Vec3& b) { return x * b.x + y * b.y + z * b.z; };
+        const float o[3] = {dotv(rx, ry, rz, A.R) / A.s, dotv(rx, ry, rz, A.U) / A.s, -dotv(rx, ry, rz, A.N) / A.s};
+        const float d[3] = {dotv(dir.x, dir.y, dir.z, A.R), dotv(dir.x, dir.y, dir.z, A.U), -dotv(dir.x, dir.y, dir.z, A.N)};
+        const float fx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, fy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const float nearZ = A.nearM / A.s;
+        const size_t end = std::min<size_t>(m_secIndexStart, m_rawIdx.size());
+        std::uint32_t bestRank = 0xffffffffu;
+        float bestT = 0.0f;
+        for (size_t i = 0; i + 2 < end; i += 3) {
+            const std::uint32_t i0 = m_rawIdx[i], i1 = m_rawIdx[i + 1], i2 = m_rawIdx[i + 2];
+            const std::uint32_t rank = m_rawPrimOfVertex[i0];
+            if (rank > bestRank) continue;
+            const float* a = &m_rawVerts[size_t(i0) * 5];
+            const float* b = &m_rawVerts[size_t(i1) * 5];
+            const float* c = &m_rawVerts[size_t(i2) * 5];
+            const float A0[3] = {a[0] / fx, a[1] / fy, a[2]}, B0[3] = {b[0] / fx, b[1] / fy, b[2]}, C0[3] = {c[0] / fx, c[1] / fy, c[2]};
+            const float e1[3] = {B0[0] - A0[0], B0[1] - A0[1], B0[2] - A0[2]}, e2[3] = {C0[0] - A0[0], C0[1] - A0[1], C0[2] - A0[2]};
+            const float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+            const float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if (std::fabs(det) < 1e-12f) continue;
+            const float inv = 1.0f / det;
+            const float tv[3] = {o[0] - A0[0], o[1] - A0[1], o[2] - A0[2]};
+            const float u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+            if (u < 0.0f || u > 1.0f) continue;
+            const float qv[3] = {tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+            const float v = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+            if (v < 0.0f || u + v > 1.0f) continue;
+            const float t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+            if (t <= 0.0f || o[2] + t * d[2] < nearZ) continue;
+            if (rank < bestRank || t < bestT) { bestRank = rank; bestT = t; }
+        }
+        float P[3];
+        if (bestRank != 0xffffffffu) {
+            P[0] = o[0] + bestT * d[0]; P[1] = o[1] + bestT * d[1]; P[2] = o[2] + bestT * d[2];
+        } else {
+            if (d[2] <= 1e-4f) return false;   // pointing behind the board camera: not on this screen
+            const float far = 1.0e5f;           // "at infinity": only the direction matters for the pixel
+            P[0] = o[0] + far * d[0]; P[1] = o[1] + far * d[1]; P[2] = o[2] + far * d[2];
+        }
+        const float sx = m_crtc[0] + float(m_mainCenter[0]) + fx * P[0] / P[2];
+        const float sy = (384.0f - float(m_mainCenter[1])) + m_crtc[1] - fy * P[1] / P[2];
+        nx = sx / 496.0f;
+        ny = sy / 384.0f;
+        const float hs = (bestRank != 0xffffffffu) ? A.s : 0.0f;
+        hitWorld = (bestRank != 0xffffffffu)
+            ? XrVector3f{A.cam.x + (A.R.x * P[0] + A.U.x * P[1] - A.N.x * P[2]) * hs,
+                         A.cam.y + (A.R.y * P[0] + A.U.y * P[1] - A.N.y * P[2]) * hs,
+                         A.cam.z + (A.R.z * P[0] + A.U.z * P[1] - A.N.z * P[2]) * hs}
+            : XrVector3f{origin.x + dir.x * 50.0f, origin.y + dir.y * 50.0f, origin.z + dir.z * 50.0f};
+        return true;
+    }
+
+    // Self-test (m2.aimTest=1, TCVR_AIMTEST m2 every ~2 s): the centroid of drawn triangles is placed in the room
+    // as the renderer places it, a ray is cast at it, and Aim must return the pixel the board draws it at.
+    // From the eye this checks the mapping; from a hand-like origin a nearer surface on the ray is not an error.
+    void AimSelfTest() {
+        if (arcadexr::config::GetInt("m2.aimTest", 0) == 0 || !m_aimXf.valid || !m_haveMainView) return;
+        if ((++m_aimTestTick % 240u) != 0u) return;
+        const auto& A = m_aimXf;
+        const float fx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, fy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const size_t end = std::min<size_t>(m_fastIndexCount, m_rawIdx.size());
+        const size_t tris = end / 3;
+        if (tris == 0) return;
+        struct Org { const char* name; XrVector3f o; };
+        const Org orgs[2] = {{"oeil", {A.cam.x, A.cam.y, A.cam.z}},
+                             {"main", {A.cam.x + A.R.x * 0.15f - A.U.x * 0.35f - A.N.x * 0.30f, A.cam.y + A.R.y * 0.15f - A.U.y * 0.35f - A.N.y * 0.30f,
+                                       A.cam.z + A.R.z * 0.15f - A.U.z * 0.35f - A.N.z * 0.30f}}};
+        for (const Org& org : orgs) {
+            std::vector<float> errs;
+            int misses = 0, occluded = 0;
+            const size_t step = std::max<size_t>(1, tris / 100);
+            for (size_t tri = 0; tri < tris; tri += step) {
+                float P[3] = {0, 0, 0};
+                for (int k = 0; k < 3; ++k) {
+                    const float* v = &m_rawVerts[size_t(m_rawIdx[tri * 3 + k]) * 5];
+                    P[0] += v[0] / fx / 3.0f; P[1] += v[1] / fy / 3.0f; P[2] += v[2] / 3.0f;
+                }
+                if (P[2] < A.nearM / A.s) continue;
+                const float ex = m_crtc[0] + float(m_mainCenter[0]) + fx * P[0] / P[2];
+                const float ey = (384.0f - float(m_mainCenter[1])) + m_crtc[1] - fy * P[1] / P[2];
+                if (ex < 0 || ex > 496 || ey < 0 || ey > 384) continue;
+                const XrVector3f W{A.cam.x + (A.R.x * P[0] + A.U.x * P[1] - A.N.x * P[2]) * A.s,
+                                   A.cam.y + (A.R.y * P[0] + A.U.y * P[1] - A.N.y * P[2]) * A.s,
+                                   A.cam.z + (A.R.z * P[0] + A.U.z * P[1] - A.N.z * P[2]) * A.s};
+                XrVector3f dir{W.x - org.o.x, W.y - org.o.y, W.z - org.o.z};
+                const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+                if (len < 1e-6f) continue;
+                dir = {dir.x / len, dir.y / len, dir.z / len};
+                float nx = 0, ny = 0; XrVector3f hw{};
+                if (!Aim(org.o, dir, nx, ny, hw)) { ++misses; continue; }
+                const float e = std::hypot(nx * 496.0f - ex, ny * 384.0f - ey);
+                const float hd = std::sqrt((hw.x - org.o.x) * (hw.x - org.o.x) + (hw.y - org.o.y) * (hw.y - org.o.y) + (hw.z - org.o.z) * (hw.z - org.o.z));
+                if (e > 1.5f && hd < 0.97f * len) { ++occluded; continue; }
+                errs.push_back(e);
+            }
+            std::sort(errs.begin(), errs.end());
+            auto q = [&](float f) { return errs.empty() ? -1.0f : errs[std::min(errs.size() - 1, size_t(f * float(errs.size())))]; };
+            __android_log_print(ANDROID_LOG_INFO, "hello_xr", "TCVR_AIMTEST m2 %s: %zu points, erreur px mediane %.2f p90 %.2f max %.2f | masques par plus pres %d, rates %d",
+                                org.name, errs.size(), q(0.5f), q(0.9f), errs.empty() ? -1.0f : errs.back(), occluded, misses);
+        }
     }
 
     bool HaveMainView() const { return m_haveMainView; }
@@ -2098,6 +2214,9 @@ private:
     bool m_haveMainView = false;
     float m_horizonGeo = -1.0f;
     float m_crtc[2] = {0.0f, 0.0f};
+    struct AimTransform { bool valid; arcadexr::gun::Vec3 cam, R, U, N; float s, nearM; };
+    AimTransform m_aimXf{false, {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1.0f, 0.25f};
+    unsigned m_aimTestTick = 0;
     bool m_flatMode = false;
     XrMatrix4x4f m_flatMvp{};
     struct FlatTarget { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE;
