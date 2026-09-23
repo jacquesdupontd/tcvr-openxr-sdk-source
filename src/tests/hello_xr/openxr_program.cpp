@@ -1662,6 +1662,18 @@ struct OpenXrProgram : IOpenXrProgram {
                 }
             }
         }
+        {
+            // Overscan (23/09): at the 120 Hz arcade cadence every other frame is the runtime reprojecting the
+            // previous one; a head turn then uncovered its border -- thin black edges all around the view
+            // (Guillaume). Render and submit a slightly wider field (xr.overscan radians per side) so the
+            // reprojection has margin. The submitted fov says so, the compositor maps it exactly.
+            const float m = std::max(0.0f, std::min(0.2f, arcadexr::config::GetFloat("xr.overscan", 0.05f)));
+            if (m > 0.0f)
+                for (uint32_t i = 0; i < viewCountOutput; ++i) {
+                    m_views[i].fov.angleLeft -= m; m_views[i].fov.angleRight += m;
+                    m_views[i].fov.angleDown -= m; m_views[i].fov.angleUp += m;
+                }
+        }
         XrPosef head = m_views[0].pose;
         head.position = {};
         for (const auto& view : m_views) {
