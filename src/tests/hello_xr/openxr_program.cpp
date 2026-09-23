@@ -1504,12 +1504,9 @@ struct OpenXrProgram : IOpenXrProgram {
             Log::Write(Log::Level::Info, "TCVR_M9 arcade screen re-anchor requested by the player");
         }
 
-        if (!driving && pressedOnce(m_input.crosshairAction)) {
-            const std::string current = arcadexr::profiles::GetString("crosshair", "visible");
-            const char* next = (current == "visible") ? "calibration" : (current == "calibration" ? "hidden" : "visible");
-            arcadexr::profiles::Set("crosshair", next);
-            Log::Write(Log::Level::Info, Fmt("TCVR_M10 crosshair mode %s -> %s", current.c_str(), next));
-        }
+        // Left stick: HOLD to show the crosshair in play ("auto" mode). It used to cycle the mode on each click;
+        // the mode is chosen in the headset menu now.
+        m_crosshairHeld = !driving && leftStickClick;
     }
 
     void RenderFrame() override {
@@ -1582,10 +1579,13 @@ struct OpenXrProgram : IOpenXrProgram {
         arcadexr::audio::LogStatsPeriodically();
         arcadexr::config::Poll();
         {
-            const std::string mode = arcadexr::profiles::GetString("crosshair", "visible");
+            // "auto" (23/09, Guillaume): shown in the game's menus (the aim met no 3D and landed on the arcade
+            // plane: stage select...) and while the left stick is HELD in play, as in Time Crisis.
+            const std::string mode = arcadexr::profiles::GetString("crosshair", "auto");
             m_crosshairMode = (mode == "hidden")        ? CrosshairMode::Hidden
                               : (mode == "calibration") ? CrosshairMode::CalibrationOnly
-                                                        : CrosshairMode::Visible;
+                              : (mode == "visible")     ? CrosshairMode::Visible
+                                                        : CrosshairMode::Auto;
             m_gunLaser = arcadexr::config::GetInt("gun.laser", 0) != 0;
             m_gunBothHands = arcadexr::config::GetString("gun.hands", "right") == "both";
             // debug.tcvr.recenter=<n>: re-place the screen whenever the number changes,
@@ -1797,7 +1797,9 @@ struct OpenXrProgram : IOpenXrProgram {
             // above has already been computed and sent to the game, so Hidden
             // mode stays exactly as playable as Visible.
             const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
-                                                    (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating));
+                                                    (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating) ||
+                                                    (m_crosshairMode == CrosshairMode::Auto &&
+                                                     (m_calibrating || m_crosshairHeld || arcadexr::gun::SceneAimOnPlane())));
             arcadexr::gun::SetAimState({onScreen,hit.normalized_x,hit.normalized_y,m_calibrating,showCrosshair});
             // Arcade Screen draws the reticle in its quad shader. Immersive
             // presentation has no quad, so put the same aiming truth on the
@@ -2084,8 +2086,9 @@ struct OpenXrProgram : IOpenXrProgram {
     uint32_t m_spaceWarpHeight{0};
     bool m_loggedFirstEndFrame{false};
     bool m_virtualScreenInitialized{false};
-    enum class CrosshairMode { Visible, CalibrationOnly, Hidden };
-    CrosshairMode m_crosshairMode{CrosshairMode::Visible};
+    enum class CrosshairMode { Auto, Visible, CalibrationOnly, Hidden };
+    CrosshairMode m_crosshairMode{CrosshairMode::Auto};
+    bool m_crosshairHeld = false;
     bool m_gunLaser{false};
     bool m_gunBothHands{false};
     XrTime m_recenterTime{0};

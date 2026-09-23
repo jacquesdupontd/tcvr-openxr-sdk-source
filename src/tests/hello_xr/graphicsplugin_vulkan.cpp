@@ -1892,8 +1892,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     static bool S22AimTrampoline(const XrVector3f& o, const XrVector3f& d, float& nx, float& ny, XrVector3f& hit) {
         if (!s_s22Self) return false;
+        arcadexr::gun::SetSceneAimOnPlane(false);
         if (s_s22Self->S22Aim(o, d, nx, ny, hit)) return true;
-        return s_s22Self->m_m2AimLive && s_s22Self->m_m2Renderer.Aim(o, d, nx, ny, hit);
+        const bool ok = s_s22Self->m_m2AimLive && s_s22Self->m_m2Renderer.Aim(o, d, nx, ny, hit);
+        if (ok) arcadexr::gun::SetSceneAimOnPlane(s_s22Self->m_m2Renderer.AimOnPlane());
+        return ok;
     }
     bool m_m2AimLive = false;
     bool m_m2CadenceRequested = false, m_m2CadenceActive = false;

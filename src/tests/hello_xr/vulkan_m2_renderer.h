@@ -699,6 +699,9 @@ public:
         hudToWorld.m[12] = hudCenter.x; hudToWorld.m[13] = hudCenter.y; hudToWorld.m[14] = hudCenter.z; hudToWorld.m[15] = 1.0f;
         XrMatrix4x4f hudMvp;
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
+        if (!m_flatMode && viewIndex == 0) {
+            m_aimHud = {true, hudCenter, screen.right, screen.up, screen.normal, screen.width * hudK, screen.height * hudK};
+        }
 
         XrMatrix4x4f hudToWorldBack{};
         const arcadexr::gun::Vec3 backCenter{camera.x - normalP.x * hudDistance + screen.up.x * hudLift,
@@ -927,6 +930,26 @@ public:
             if (rank < bestRank || t < bestT) { bestRank = rank; bestT = t; }
         }
         float P[3];
+        m_aimOnPlane = false;
+        if (bestRank == 0xffffffffu && m_aimHud.valid) {
+            // No 3D of the game under the ray (menus, stage select: the panels are secondary views and overlays
+            // on the arcade screen plane): aim on that plane, where they are drawn.
+            const auto& H = m_aimHud;
+            const float dn = dir.x * H.N.x + dir.y * H.N.y + dir.z * H.N.z;
+            if (std::fabs(dn) > 1e-6f) {
+                const float t = ((H.C.x - origin.x) * H.N.x + (H.C.y - origin.y) * H.N.y + (H.C.z - origin.z) * H.N.z) / dn;
+                if (t > 0.0f) {
+                    const XrVector3f Q{origin.x + dir.x * t, origin.y + dir.y * t, origin.z + dir.z * t};
+                    const float u = ((Q.x - H.C.x) * H.R.x + (Q.y - H.C.y) * H.R.y + (Q.z - H.C.z) * H.R.z) / H.w;
+                    const float v = ((Q.x - H.C.x) * H.U.x + (Q.y - H.C.y) * H.U.y + (Q.z - H.C.z) * H.U.z) / H.h;
+                    nx = u + 0.5f;
+                    ny = 0.5f - v;
+                    hitWorld = Q;
+                    m_aimOnPlane = true;
+                    return true;
+                }
+            }
+        }
         if (bestRank != 0xffffffffu) {
             P[0] = o[0] + bestT * d[0]; P[1] = o[1] + bestT * d[1]; P[2] = o[2] + bestT * d[2];
         } else {
@@ -2422,6 +2445,12 @@ private:
     AimTransform m_aimXf{false, {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1.0f, 0.25f};
     unsigned m_aimTestTick = 0;
     float m_aimFocus[2] = {512.0f, 512.0f};
+    struct AimHud { bool valid; arcadexr::gun::Vec3 C, R, U, N; float w, h; };
+    AimHud m_aimHud{false, {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1.0f, 1.0f};
+    mutable bool m_aimOnPlane = false;
+public:
+    bool AimOnPlane() const { return m_aimOnPlane; }
+private:
     bool m_flatMode = false;
     XrMatrix4x4f m_flatMvp{};
     struct FlatTarget { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE;
