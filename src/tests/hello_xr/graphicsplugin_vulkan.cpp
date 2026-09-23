@@ -1733,6 +1733,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (!want) return;   // flat: drawn after the Model 2 flat block (RenderSystem22Flat)
         if ((arcadexr::config::GetInt("s22.skip", 0) & 8) == 0) m_s22.RenderDepthMap(cmd);
         m_s22Active = true;
+        AimSelfTest();
         // Immersive System 22 renders its scene at immersive.scale: into a sub-rectangle of the swapchain
         // (applied from the next frame), so the composite also runs at that size and the compositor scales.
         m_lastRenderedSeq = m_s22Frame->sequence;
@@ -1814,6 +1815,52 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         return true;
     }
     static inline VulkanGraphicsPlugin* s_s22Self = nullptr;
+    // Aim self-test (s22.aimTest=1, logged every ~2 s as TCVR_AIMTEST): board pixels with a known depth are placed
+    // in the room exactly as the renderer places them, a ray is cast at each from an origin, and the aim must
+    // return the same pixel. From the eye (camera anchor) this checks the mapping; from a hand-like origin it also
+    // shows occlusion (another surface nearer along that ray: then the game is RIGHT to get another pixel).
+    void AimSelfTest() {
+        if (!m_s22Active || !m_s22AnchorValid || !m_s22Frame || arcadexr::config::GetInt("s22.aimTest", 0) == 0) return;
+        if ((++m_aimTestTick % 240u) != 0u) return;
+        const int W = m_s22Frame->width, H = m_s22Frame->height;
+        const float zoom = m_s22.Zoom(), sc = m_s22AnchorScale;
+        const auto C = m_s22AnchorCamera, R = m_s22AnchorRight, U = m_s22AnchorUp, N = m_s22AnchorNormal;
+        struct Origin { const char* name; XrVector3f o; };
+        const Origin origins[2] = {
+            {"oeil", {C.x, C.y, C.z}},
+            {"main", {C.x + R.x * 0.15f - U.x * 0.35f - N.x * 0.30f, C.y + R.y * 0.15f - U.y * 0.35f - N.y * 0.30f,
+                      C.z + R.z * 0.15f - U.z * 0.35f - N.z * 0.30f}}};
+        for (const Origin& org : origins) {
+            std::vector<float> errs;
+            int misses = 0, occluded = 0;
+            for (int gj = 0; gj < 9; ++gj)
+                for (int gi = 0; gi < 12; ++gi) {
+                    const float sx = (gi + 0.5f) / 12.0f * W, sy = (gj + 0.5f) / 9.0f * H;
+                    const float d = m_s22.DepthAt(sx, sy, W, H);
+                    if (d <= 0.0f) continue;
+                    const float cx = (sx - W * 0.5f) * d / zoom, cy = (H * 0.5f - sy) * d / zoom, cz = d;
+                    const XrVector3f P{C.x + (R.x * cx + U.x * cy - N.x * cz) * sc, C.y + (R.y * cx + U.y * cy - N.y * cz) * sc,
+                                       C.z + (R.z * cx + U.z * cy - N.z * cz) * sc};
+                    XrVector3f dir{P.x - org.o.x, P.y - org.o.y, P.z - org.o.z};
+                    const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+                    if (len < 1e-6f) continue;
+                    dir = {dir.x / len, dir.y / len, dir.z / len};
+                    float nx = 0, ny = 0; XrVector3f hw{};
+                    if (!S22Aim(org.o, dir, nx, ny, hw)) { ++misses; continue; }
+                    const float e = std::hypot(nx * W - sx, ny * H - sy);
+                    const float hd = std::sqrt((hw.x - org.o.x) * (hw.x - org.o.x) + (hw.y - org.o.y) * (hw.y - org.o.y) + (hw.z - org.o.z) * (hw.z - org.o.z));
+                    // Something nearer along this very ray: the game is RIGHT to get another pixel (not an error).
+                    if (e > 1.5f && hd < 0.97f * len) { ++occluded; continue; }
+                    errs.push_back(e);
+                }
+            std::sort(errs.begin(), errs.end());
+            auto q = [&](float f) { return errs.empty() ? -1.0f : errs[std::min(errs.size() - 1, size_t(f * float(errs.size())))]; };
+            Log::Write(Log::Level::Info, Fmt("TCVR_AIMTEST %s: %zu points, erreur px mediane %.2f p90 %.2f max %.2f | masques par plus pres %d, rates %d",
+                                             org.name, errs.size(), q(0.5f), q(0.9f), errs.empty() ? -1.0f : errs.back(), occluded, misses));
+        }
+    }
+    unsigned m_aimTestTick = 0;
+
     static bool S22AimTrampoline(const XrVector3f& o, const XrVector3f& d, float& nx, float& ny, XrVector3f& hit) {
         return s_s22Self && s_s22Self->S22Aim(o, d, nx, ny, hit);
     }
@@ -1946,9 +1993,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void SetM2SceneMode(int mode) {
-        // Both boards drive ONE recording switch on the MAME side (tcvr_mame_scene_enable). A System 22 game
-        // is the System 22 module's business: the Model 2 path setting "1" there made MAME rasterise Time
-        // Crisis again (30+ ms per frame, lag and audio underruns, 23/09).
+        // A System 22 game is the System 22 module's business (separate MAME switch, tcvr_mame_scene_enable);
+        // the Model 2 path has nothing to record then.
         if (arcadexr::profiles::IsSystem22()) return;
         if (mode == m_m2SceneMode) return;
         m_m2SceneMode = mode;
@@ -2246,6 +2292,20 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             }
         }
 
+        // A driver hint repeated on every render pass (Adreno VKDBGUTILWARN003: 120 lines a second) drowned every
+        // other log line. Each distinct message is written once, then its repetition count every 10 000.
+        {
+            static std::unordered_map<std::string, uint64_t> seen;
+            static std::mutex seenMutex;
+            std::lock_guard<std::mutex> lock(seenMutex);
+            const std::string key = std::string(pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "") + "|" +
+                                    std::string(pCallbackData->pMessage ? pCallbackData->pMessage : "").substr(0, 160);
+            const uint64_t n = ++seen[key];
+            if (n > 1) {
+                if (n % 10000 == 0) Log::Write(level, Fmt("%s (x%llu so far) %s", flagNames.c_str(), (unsigned long long)n, key.c_str()));
+                return VK_FALSE;
+            }
+        }
         Log::Write(level, Fmt("%s (%s 0x%llx) %s", flagNames.c_str(), objName.c_str(), object, pCallbackData->pMessage));
 
         return VK_FALSE;

@@ -904,23 +904,60 @@ public:
     uint32_t FlatWidth() const { return m_eye[2].w; }
     uint32_t FlatHeight() const { return m_eye[2].h; }
 
+    // Depth-map depth at a board pixel (0 = nothing drawn there), for the aim self-test.
+    float DepthAt(float sx, float sy, int screenW, int screenH) const {
+        if (m_depthCpu.empty() || m_depthCpuW == 0 || sx < 0 || sy < 0 || sx >= screenW || sy >= screenH) return 0.0f;
+        const float kx = float(m_depthCpuW) / float(screenW), ky = float(m_depthCpuH) / float(screenH);
+        return m_depthCpu[size_t(int(sy * ky)) * m_depthCpuW + size_t(int(sx * kx))];
+    }
+    float Zoom() const { return m_lastZoom > 0.0f ? m_lastZoom : 1.0f; }
+
     // Immersive aim (port of SceneRenderer::RayCast): march the ray in board camera space until it meets
     // the depth map. False when it leaves the screen or meets nothing.
     bool RayCast(const float o[3], const float d[3], int screenW, int screenH, float& sx, float& sy, float hit[3]) const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || d[2] <= 1e-6f) return false;
         const float zoom = m_lastZoom > 0.0f ? m_lastZoom : 1.0f;
         const float kx = float(m_depthCpuW) / float(screenW), ky = float(m_depthCpuH) / float(screenH);
+        // State at parameter t: 1 = behind the depth-map surface, 0 = in front, -1 = off the board image.
+        auto probe = [&](float tt, float& x, float& y, float p[3]) -> int {
+            p[0] = o[0] + tt * d[0]; p[1] = o[1] + tt * d[1]; p[2] = o[2] + tt * d[2];
+            if (p[2] <= 1.0f) return 0;
+            x = screenW * 0.5f + zoom * p[0] / p[2]; y = screenH * 0.5f - zoom * p[1] / p[2];
+            if (x < 0.0f || y < 0.0f || x >= screenW || y >= screenH) return -1;
+            const float depth = m_depthCpu[size_t(int(y * ky)) * m_depthCpuW + size_t(int(x * kx))];
+            return (depth > 0.0f && p[2] >= depth) ? 1 : 0;
+        };
         float t = (100.0f - o[2]) / d[2];
         if (t < 0.0f) t = 0.0f;
+        float tPrev = t;
+        bool entered = false;   // the ray from a hand starts BELOW the board camera's view: march until it enters
         for (int i = 0; i < 600; ++i) {
-            const float px = o[0] + t * d[0], py = o[1] + t * d[1], pz = o[2] + t * d[2];
-            if (pz > 1.0f) {
-                const float x = screenW * 0.5f + zoom * px / pz, y = screenH * 0.5f - zoom * py / pz;
-                if (x < 0.0f || y < 0.0f || x >= screenW || y >= screenH) return false;
-                const float depth = m_depthCpu[size_t(int(y * ky)) * m_depthCpuW + size_t(int(x * kx))];
-                if (depth > 0.0f && pz >= depth) { sx = x; sy = y; hit[0] = px; hit[1] = py; hit[2] = pz; return true; }
-                if (pz > 3.0e6f) return false;
+            float x, y, p[3];
+            const int st = probe(t, x, y, p);
+            if (st < 0) {
+                if (entered) return false;   // left the image after being in it: a miss
+                if (p[2] > 3.0e6f) return false;
+                tPrev = t;
+                t = std::max(t * 1.02f, t + 20.0f);
+                continue;
             }
+            entered = true;
+            if (st == 1) {
+                // March steps grow with distance (2 %): refine the crossing between the last point in front and
+                // this one, otherwise the reported pixel slides along the ray (a lateral error from a controller
+                // that is not at the eye; measured with s22.aimTest).
+                float lo = tPrev, hi = t;
+                for (int k = 0; k < 14; ++k) {
+                    const float mid = 0.5f * (lo + hi);
+                    float mx, my, mp[3];
+                    if (probe(mid, mx, my, mp) == 1) hi = mid; else lo = mid;
+                }
+                if (probe(hi, x, y, p) != 1) return false;
+                sx = x; sy = y; hit[0] = p[0]; hit[1] = p[1]; hit[2] = p[2];
+                return true;
+            }
+            if (p[2] > 3.0e6f) return false;
+            tPrev = t;
             t = std::max(t * 1.02f, t + 20.0f);
         }
         return false;

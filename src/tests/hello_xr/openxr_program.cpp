@@ -1758,10 +1758,14 @@ struct OpenXrProgram : IOpenXrProgram {
             // Immersive presentation: the scene is not on the plane, so the plane
             // hit is not what the player points at. Ask the renderer where the
             // ray meets the rendered scene and give the game that position.
+            bool haveAimWorld = false;
+            XrVector3f aimWorld{};
             if (auto sceneAim = arcadexr::gun::GetSceneAim()) {
                 float nx = 0.5f, ny = 0.5f;
                 XrVector3f hitWorld{};
                 if (sceneAim({muzzle.x, muzzle.y, muzzle.z}, direction, nx, ny, hitWorld)) {
+                    haveAimWorld = true;
+                    aimWorld = hitWorld;
                     hit.intersects = true;
                     hit.on_screen = nx >= 0.0f && nx <= 1.0f && ny >= 0.0f && ny <= 1.0f;
                     hit.normalized_x = nx;
@@ -1787,7 +1791,9 @@ struct OpenXrProgram : IOpenXrProgram {
                     screen.center.x + screen.right.x*(hit.normalized_x-.5f)*screen.width + screen.up.x*(.5f-hit.normalized_y)*screen.height,
                     screen.center.y + screen.right.y*(hit.normalized_x-.5f)*screen.width + screen.up.y*(.5f-hit.normalized_y)*screen.height,
                     screen.center.z + screen.right.z*(hit.normalized_x-.5f)*screen.width + screen.up.z*(.5f-hit.normalized_y)*screen.height};
-                const XrPosef marker{{0,0,0,1}, point};
+                // Immersive: the marker goes where the ray actually meets the 3D scene (it used to sit on the
+                // invisible arcade plane, in front of or behind the target: parallax that read as a bad aim).
+                const XrPosef marker{{0,0,0,1}, haveAimWorld ? aimWorld : point};
                 cubes.push_back(Cube{marker, {0.012f,0.012f,0.012f}, m_calibrating ? XrVector3f{0.2f,1.0f,0.2f}
                                                                                   : XrVector3f{1.0f,0.15f,0.08f}});
             }
