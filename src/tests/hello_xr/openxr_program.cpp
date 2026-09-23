@@ -1667,7 +1667,7 @@ struct OpenXrProgram : IOpenXrProgram {
             // previous one; a head turn then uncovered its border -- thin black edges all around the view
             // (Guillaume). Render and submit a slightly wider field (xr.overscan radians per side) so the
             // reprojection has margin. The submitted fov says so, the compositor maps it exactly.
-            const float m = std::max(0.0f, std::min(0.2f, arcadexr::config::GetFloat("xr.overscan", 0.05f)));
+            const float m = std::max(0.0f, std::min(0.2f, arcadexr::config::GetFloat("xr.overscan", 0.0f)));
             if (m > 0.0f)
                 for (uint32_t i = 0; i < viewCountOutput; ++i) {
                     m_views[i].fov.angleLeft -= m; m_views[i].fov.angleRight += m;
@@ -1812,10 +1812,14 @@ struct OpenXrProgram : IOpenXrProgram {
             // Hiding the reticle is a presentation choice only: the raycast
             // above has already been computed and sent to the game, so Hidden
             // mode stays exactly as playable as Visible.
+            // "In a menu" only when the aim has stayed on the arcade plane for a quarter of a second: a single frame
+            // without 3D under the ray (sky, gap, transition) flashed the reticle in play (Guillaume, 23/09).
+            m_onPlaneFrames = arcadexr::gun::SceneAimOnPlane() ? std::min(m_onPlaneFrames + 1, 1000) : 0;
+            const bool inMenu = m_onPlaneFrames >= 30;
             const bool showCrosshair = onScreen && (m_crosshairMode == CrosshairMode::Visible ||
                                                     (m_crosshairMode == CrosshairMode::CalibrationOnly && m_calibrating) ||
                                                     (m_crosshairMode == CrosshairMode::Auto &&
-                                                     (m_calibrating || m_crosshairHeld || arcadexr::gun::SceneAimOnPlane())));
+                                                     (m_calibrating || m_crosshairHeld || inMenu)));
             {
                 arcadexr::gun::AimState as{onScreen, hit.normalized_x, hit.normalized_y, m_calibrating, showCrosshair};
                 if (haveAimWorld) { as.have_world = true; as.world[0] = aimWorld.x; as.world[1] = aimWorld.y; as.world[2] = aimWorld.z; }
@@ -2109,6 +2113,7 @@ struct OpenXrProgram : IOpenXrProgram {
     enum class CrosshairMode { Auto, Visible, CalibrationOnly, Hidden };
     CrosshairMode m_crosshairMode{CrosshairMode::Auto};
     bool m_crosshairHeld = false;
+    int m_onPlaneFrames = 0;
     bool m_gunLaser{false};
     bool m_gunBothHands{false};
     XrTime m_recenterTime{0};

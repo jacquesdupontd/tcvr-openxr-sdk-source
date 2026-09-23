@@ -777,7 +777,7 @@ public:
             ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.0f);
             ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", 0.0f);
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
-            ubo.uOverlayK = m_flatMode ? 1.0f : std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 3.0f));
+            ubo.uOverlayK = m_flatMode ? 1.0f : std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 8.0f));
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
             ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
             ubo.padEnd[0] = arcadexr::config::GetInt("m2.hwAnisoOn", 1) != 0 ? 0 : 4;   // = uSmpBase (live A/B)
@@ -889,7 +889,7 @@ public:
             if (m_frontFullscreen && !m_flatMode) {
                 // full-screen front layer (flash): the arcade plane enlarged over the whole view
                 XrMatrix4x4f big = hudToWorld;
-                const float k = std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 3.0f));
+                const float k = std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 8.0f));
                 for (int c = 0; c < 3; ++c) { big.m[c] *= k; big.m[4 + c] *= k; }
                 XrMatrix4x4f bigMvp; XrMatrix4x4f_Multiply(&bigMvp, &viewProjection, &big);
                 memcpy(frontPc.uHudMvp, bigMvp.m, sizeof(bigMvp.m));
