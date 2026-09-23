@@ -105,9 +105,12 @@ void main() {
             // Screen overlay (fade, hit flash): straight to the screen like the cabinet, enlarged over the view. A
             // letterbox band (bit 26) is the edge of a screen the headset does not have: not drawn in immersive.
             if ((p.rgb & 0x4000000u) != 0u && uOverlayK > 1.0) { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); vParam = vec3(0.0); return; }
-            vec2 ndc = vec2(xs.x / uViewport.x * 2.0 - 1.0, xs.y / uViewport.y * 2.0 - 1.0) * uOverlayK;
-            gl_Position = vec4(ndc, 0.0, 1.0);
-            if (uDepthOrder != 0) gl_Position.z = (float(aPrim) + 0.5) / max(uPrimCount, 1.0);
+            // On the arcade screen plane (the HUD's), enlarged uOverlayK times: each eye sees it through its own
+            // projection. Straight screen coordinates were the same NDC in both eyes, which the Quest's asymmetric
+            // eye frusta turn into a false disparity -- texts that made the player squint (Guillaume, 23/09).
+            vec2 plane = vec2(xs.x / uViewport.x - 0.5, 0.5 - xs.y / uViewport.y) * uOverlayK;
+            gl_Position = uHudMvp * vec4(plane, 0.0, 1.0);
+            if (uDepthOrder != 0) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
             vParam = (uRaw != 0) ? vec3(aParam.y / 8.0, aParam.z / 8.0, zr) : aParam;
             return;
         }

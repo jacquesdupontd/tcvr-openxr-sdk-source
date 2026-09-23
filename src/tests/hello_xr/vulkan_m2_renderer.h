@@ -747,7 +747,9 @@ public:
             memcpy(ubo.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
             ubo.uViewport[0] = 496.0f; ubo.uViewport[1] = 384.0f;
             ubo.uFocus[0] = focusX; ubo.uFocus[1] = focusY;
-            ubo.uCrtc[0] = 0.0f; ubo.uCrtc[1] = 0.0f;
+            // The board's screen offsets (0 on Sega Rally, not on Virtua Cop): everything placed in board pixels (secondary
+            // views, screen overlays) was about 128 rows off with zeros here (23/09).
+            ubo.uCrtc[0] = m_crtc[0]; ubo.uCrtc[1] = m_crtc[1];
             ubo.uMainClip[0] = m_mainClip[0]; ubo.uMainClip[1] = m_mainClip[1];
             ubo.uMainClip[2] = m_mainClip[2]; ubo.uMainClip[3] = m_mainClip[3];
             ubo.uMainCenter[0] = m_mainCenter[0]; ubo.uMainCenter[1] = m_mainCenter[1];
