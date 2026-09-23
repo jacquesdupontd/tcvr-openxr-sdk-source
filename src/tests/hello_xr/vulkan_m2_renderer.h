@@ -1596,7 +1596,7 @@ private:
         }
 
         // 2. SSBOs
-        m_primsSize = 4096 * sizeof(tcvr_m2_prim);
+        m_primsSize = 16384 * sizeof(tcvr_m2_prim);   // = the recorder cap (k_m2_max_prims): Virtua Racing sends ~3 200 quads
         createMappedBuffer(m_primsBufferF[m_fs], m_primsSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                            reinterpret_cast<void**>(&m_primsMappedF[m_fs]));
 
