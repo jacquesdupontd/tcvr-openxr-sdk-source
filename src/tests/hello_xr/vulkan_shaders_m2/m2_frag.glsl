@@ -13,7 +13,8 @@ layout(location = 6) flat in ivec4 vPC;
 layout(location = 7) flat in uint vSlot;
 layout(location = 8) flat in uint vColor;
 layout(location = 9) flat in uint vLayer;
-layout(location = 0) out vec4 oColor;
+layout(location = 0) out vec4 oColorOut;
+vec4 oColor;
 
 layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     mat4 uMvp;
@@ -469,7 +470,7 @@ layout(early_fragment_tests) in;
 #ifdef LEAN
 // LEAN opaque pass: only what the discard-free polygons of the main view need, nothing else, so the
 // compiler allocates few registers and many pixel groups run in parallel (texture latency hidden).
-void main() {
+void main_body() {
     uint fl = vPA.w;
     float acov = 1.0;
     float zb = max(vParam.z, 1e-6);
@@ -522,7 +523,7 @@ void main() {
 #endif
 }
 #else
-void main() {
+void main_body() {
     Prim p = flatPrim();
 #ifdef CUT_DEPTH
     // Depth pre-pass of the cut-outs: the cheapest possible shader -- the clip window of the
@@ -739,3 +740,12 @@ void main() {
 #endif
 }
 #endif  // LEAN
+
+// Arcade colours are display values (CRT-referred). The eye image is an _SRGB attachment that encodes what we
+// write: decode first, so the stored byte is the arcade's (true colours, as the GL build and MAME show) without
+// the costly MUTABLE_FORMAT raw views (they disable framebuffer compression: -3 ms on Sega Rally, 23/09).
+void main() {
+    main_body();
+    vec3 d = clamp(oColor.rgb, 0.0, 1.0);
+    oColorOut = vec4(d * (d * (d * (d * -0.23012586 + 0.73328061) + 0.44219034) + 0.05115943), oColor.a);   // sRGB->linear, 4 FMA, <= 1.2/255 after re-encoding (fitted 23/09)
+}

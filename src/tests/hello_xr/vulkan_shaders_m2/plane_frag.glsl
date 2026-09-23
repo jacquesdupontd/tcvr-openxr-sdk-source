@@ -1,6 +1,7 @@
 #version 450
 layout(location = 0) in vec2 vUv;
-layout(location = 0) out vec4 oColor;
+layout(location = 0) out vec4 oColorOut;
+vec4 oColor;
 
 layout(set = 0, binding = 0) uniform sampler2D uLayer;
 
@@ -10,7 +11,7 @@ layout(push_constant) uniform PlanePushConstants {
     int uKeyZero;
 };
 
-void main() {
+void main_body() {
     vec2 ndc = gl_FragCoord.xy / uOutSize * 2.0 - 1.0;
     vec4 c0 = uHudMvp[0], c1 = uHudMvp[1], c3 = uHudMvp[3];
     float a11 = c0.x - ndc.x * c0.w, a12 = c1.x - ndc.x * c1.w, b1 = ndc.x * c3.w - c3.x;
@@ -30,4 +31,13 @@ void main() {
         return;
     }
     oColor = vec4(c.rgb, 1.0);
+}
+
+// Arcade colours are display values (CRT-referred). The eye image is an _SRGB attachment that encodes what we
+// write: decode first, so the stored byte is the arcade's (true colours, as the GL build and MAME show) without
+// the costly MUTABLE_FORMAT raw views (they disable framebuffer compression: -3 ms on Sega Rally, 23/09).
+void main() {
+    main_body();
+    vec3 d = clamp(oColor.rgb, 0.0, 1.0);
+    oColorOut = vec4(d * (d * (d * (d * -0.23012586 + 0.73328061) + 0.44219034) + 0.05115943), oColor.a);   // sRGB->linear, 4 FMA, <= 1.2/255 after re-encoding (fitted 23/09)
 }

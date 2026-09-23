@@ -960,7 +960,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // it is the _UNORM twin, so what the shaders write is the byte the compositor reads. xr.rawColor=0 = old.
     static XrSwapchainCreateInfo RawColorCreateInfo(const XrSwapchainCreateInfo& in) {
         XrSwapchainCreateInfo out = in;
-        if (arcadexr::config::GetInt("xr.rawColor", 1) == 0) return out;
+        if (arcadexr::config::GetInt("xr.rawColor", 0) == 0) return out;   // off: shaders decode instead (no compression loss)
         if (in.format == VK_FORMAT_R8G8B8A8_SRGB) out.format = VK_FORMAT_R8G8B8A8_UNORM;
         else if (in.format == VK_FORMAT_B8G8R8A8_SRGB) out.format = VK_FORMAT_B8G8R8A8_UNORM;
         if (out.format != in.format) Log::Write(Log::Level::Info, Fmt("TCVR_VK raw colour views: swapchain %d viewed as %d", int(in.format), int(out.format)));
@@ -1099,7 +1099,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         imageInfo.extent.depth = 1;
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
-        imageInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        imageInfo.format = VK_FORMAT_B8G8R8A8_SRGB;   // MAME's display bytes: decoded on sampling, re-encoded on write = true colours
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -1115,7 +1115,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = m_screenImage;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        viewInfo.format = VK_FORMAT_B8G8R8A8_SRGB;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -1674,14 +1674,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_viewportScale = 1.0f;
         m_s22Prepared = false;
         const bool isS22 = arcadexr::profiles::IsSystem22() && s22::HaveSceneSource();
-        const bool want = isS22 && arcadexr::profiles::GetString("render", "cpu") == "gpu" &&
-                          arcadexr::profiles::GetString("presentation", "screen") == "immersive" &&
+        // Vulkan: System 22 is ALWAYS drawn by the GPU module, flat or immersive. The stored "render=cpu /
+        // scene.cpuRaster=1" choice is a GL-era menu option (MAME rasterising the flat screen): in Vulkan it made
+        // Time Crisis lag (30+ ms of CPU raster per frame, audio underruns, 23/09). s22.cpuRaster=1 (debug,
+        // the oracle) is the only way to have MAME rasterise alongside.
+        const bool want = isS22 && arcadexr::profiles::GetString("presentation", "screen") == "immersive" &&
                           arcadexr::config::GetInt("s22.vk", 1) != 0;
         // SCREEN presentation drawn by the GPU too (s22.vkFlat=0 returns to MAME's CPU framebuffer).
         const bool wantFlat = isS22 && !want && arcadexr::profiles::GetString("presentation", "screen") != "immersive" &&
                               arcadexr::config::GetInt("s22.vkFlat", 1) != 0;
         m_s22FlatWanted = wantFlat;
-        const int mode = (want || wantFlat) ? (arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
+        const int mode = (want || wantFlat) ? (arcadexr::config::GetInt("s22.cpuRaster", 0) ? 1 : 2) : 0;
         {   // Arcade cadence: 120 Hz display while a System 22 game is immersive, back to the baked rate after.
             const bool cadence = want && arcadexr::config::GetInt("s22.cadence", 1) != 0;
             if (cadence && !m_cadenceRequested) { arcadexr::xr::RequestRateForGame(120.0f, "System 22: 2 refreshes per 60 Hz frame"); m_cadenceRequested = true; }
@@ -1715,7 +1718,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22.PumpBanks(cmd);
         m_s22.SetFilter(arcadexr::config::GetInt("s22.filter", 3));   // 0 texel-exact, 1 bilinear, 2 + index mipmaps, 3 sharp + anisotropic
         m_s22.SetHudSharp(arcadexr::config::GetInt("s22.hudSharp", 3));
-        m_s22.SetLinearOut(arcadexr::config::GetInt("s22.linearOut", 0) != 0);   // superseded by raw colour views
+        m_s22.SetLinearOut(arcadexr::config::GetInt("s22.linearOut", 1) != 0);   // true colours on an _SRGB eye image
         m_s22.SetTextDiag(arcadexr::config::GetInt("s22.textDiag", 0));
         {
             const int req = arcadexr::config::GetInt("s22.dumpPrims", 0);
@@ -1943,6 +1946,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void SetM2SceneMode(int mode) {
+        // Both boards drive ONE recording switch on the MAME side (tcvr_mame_scene_enable). A System 22 game
+        // is the System 22 module's business: the Model 2 path setting "1" there made MAME rasterise Time
+        // Crisis again (30+ ms per frame, lag and audio underruns, 23/09).
+        if (arcadexr::profiles::IsSystem22()) return;
         if (mode == m_m2SceneMode) return;
         m_m2SceneMode = mode;
         arcadexr::hardware::sega_model2::EnableScene(mode);

@@ -107,7 +107,7 @@ public:
             DestroyMenuImage();
             m_menuW = w; m_menuH = h;
             VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {uint32_t(w), uint32_t(h), 1};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_SRGB;   // menu bytes are display values (see screen texture) ii.extent = {uint32_t(w), uint32_t(h), 1};
             ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             XRC_CHECK_THROW_VKCMD(vkCreateImage(m_dev, &ii, nullptr, &m_menuImage));
@@ -115,7 +115,7 @@ public:
             m_alloc->Allocate(req, &m_menuMem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_dev, m_menuImage, m_menuMem, 0));
             VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            vi.image = m_menuImage; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vi.image = m_menuImage; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_SRGB;
             vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &vi, nullptr, &m_menuView));
             m_menuStaging.Reset(m_dev);
