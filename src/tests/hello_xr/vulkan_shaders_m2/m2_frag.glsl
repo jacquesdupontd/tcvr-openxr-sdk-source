@@ -37,6 +37,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     int uPrepassClass;
     float uEdgeFade;
     float uHorizonRow;
+    float uOverlayK;        // screen overlays: enlargement of the arcade frame over the view (1 = flat)
     vec3 uSky;
     vec3 uGround;
     int uAniso;

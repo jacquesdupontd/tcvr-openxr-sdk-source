@@ -33,7 +33,7 @@ struct M2UniformBufferObject {
     int32_t uPrepassClass;   // 4 bytes, offset 224
     float uEdgeFade;         // 4 bytes, offset 228
     float uHorizonRow;       // 4 bytes, offset 232
-    int32_t pad1;            // 4 bytes, offset 236
+    float uOverlayK;         // 4 bytes, offset 236: screen overlays drawn this many times the view (1 = flat)
     float uSky[3];           // 12 bytes, offset 240
     int32_t pad2;            // 4 bytes, offset 252
     float uGround[3];        // 12 bytes, offset 256

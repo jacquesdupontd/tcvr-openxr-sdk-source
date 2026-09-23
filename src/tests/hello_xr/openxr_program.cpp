@@ -1641,6 +1641,23 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK(viewCountOutput > 0 && viewCountOutput == viewCapacityInput);
         CHECK(viewCountOutput == m_configViews.size());
         CHECK(viewCountOutput == m_swapchains.size());
+        // Bench (23/09): debug.tcvr.xr_lockView=1 puts both eyes where the player's head is expected (the arcade
+        // camera, in front of the screen) looking straight at it, level. With the headset on a table, eye dumps
+        // then show what a player sees while playing, instead of the table.
+        if (arcadexr::config::GetInt("xr.lockView", 0) != 0) {
+            arcadexr::gun::ScreenPlane scr;
+            if (arcadexr::video::GetVirtualScreen(scr)) {
+                const float dist = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
+                const XrVector3f cam{scr.center.x + scr.normal.x * dist, scr.center.y + scr.normal.y * dist, scr.center.z + scr.normal.z * dist};
+                const float yaw = std::atan2(scr.normal.x, scr.normal.z);   // look along -normal
+                const XrQuaternionf q{0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+                for (uint32_t i = 0; i < viewCountOutput; ++i) {
+                    const float side = (i == 0 ? -0.032f : 0.032f);
+                    m_views[i].pose.orientation = q;
+                    m_views[i].pose.position = {cam.x + scr.right.x * side, cam.y + scr.right.y * side, cam.z + scr.right.z * side};
+                }
+            }
+        }
         XrPosef head = m_views[0].pose;
         head.position = {};
         for (const auto& view : m_views) {

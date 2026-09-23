@@ -263,6 +263,7 @@ public:
         const bool haveRaw = frame.raw_prim_count != 0 && frame.raw_vertex_count != 0;
         if (!haveClipped && !haveRaw) return;
         m_built = true;
+        m_overlayOn = arcadexr::profiles::GetInt("immersive.screenOverlay", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
 
         // Fan-triangulate and sort primitives
         const tcvr_m2_prim* kp = frame.raw_prim_count ? frame.raw_prims : frame.prims;
@@ -376,6 +377,25 @@ public:
                 const std::uint32_t vc = std::min<std::uint32_t>(p.vertex_count, frame.raw_vertex_count - std::min(p.first_vertex, frame.raw_vertex_count));
                 q.vertex_count = vc;
                 q.zsort = intra_bucket_rank;
+                // Screen overlay (23/09, Virtua Cop): a polygon facing the camera at one depth that covers the whole
+                // arcade frame is a camera-attached effect (fade, hit flash, transition), a full-screen veil on the
+                // cabinet. In immersive it floated as a panel with visible edges. Flag it (bit 25 of rgb): the vertex
+                // stage draws it straight in screen space, enlarged to cover the whole view.
+                if (vc >= 3 && m_overlayOn) {
+                    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f, zmax = -1e9f; bool ok = true;
+                    for (std::uint32_t v = 0; v < vc && ok; v++) {
+                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                        if (rv.z <= 1e-3f) { ok = false; break; }
+                        const float sx = float(frame.crtc_xoffset + p.center_x) + rv.x / rv.z;
+                        const float sy = float((384 - p.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                        zmin = std::min(zmin, rv.z); zmax = std::max(zmax, rv.z);
+                    }
+                    const float fw = float(p.clip_r - p.clip_l + 1), fh = float(p.clip_b - p.clip_t + 1);
+                    if (ok && zmax - zmin <= 0.01f * zmin && x0 <= float(p.clip_l) + 0.05f * fw && x1 >= float(p.clip_r) - 0.05f * fw &&
+                        y0 <= float(p.clip_t) + 0.05f * fh && y1 >= float(p.clip_b) - 0.05f * fh)
+                        q.rgb |= 0x2000000u;
+                }
                 m_rawPrims[k] = q;
                 {
                     uint32_t slot = M2RegionTextures::kNone, micro = M2RegionTextures::kNone;
@@ -462,6 +482,28 @@ public:
             }
             m_rawIdx.resize(io);
             GroundProbe(frame, mainCx, mainCy, mainB);
+            if (arcadexr::config::GetInt("m2.overlayDiag", 0) != 0 && (++m_overlayDiagTick % 60u) == 0u) {
+                // Which main-view polygons cover (nearly) the whole arcade frame? Camera-attached overlays (fades,
+                // hit flashes) float as panels in immersive.
+                const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
+                for (uint32_t k = 0; k < m_rawPrims.size(); ++k) {
+                    // vertices of rank k: scan m_rawPrimOfVertex
+                    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f, zmax = -1e9f; int nv = 0; bool behind = false;
+                    for (size_t v = 0; v < m_rawPrimOfVertex.size(); ++v) {
+                        if (m_rawPrimOfVertex[v] != k) continue;
+                        const float* q = &m_rawVerts[v * 5];
+                        zmin = std::min(zmin, q[2]); zmax = std::max(zmax, q[2]); ++nv;
+                        if (q[2] <= 1e-3f) { behind = true; continue; }
+                        const float sx = fx + q[0] / q[2], sy = fy - q[1] / q[2];
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                    }
+                    if (nv == 0 || behind) continue;
+                    if (x1 - x0 < 0.8f * 496.0f || y1 - y0 < 0.6f * 384.0f) continue;
+                    const tcvr_m2_prim& p = m_rawPrims[k];
+                    Log::Write(Log::Level::Info, Fmt("TCVR_OVERLAY rank=%u/%zu z=%.2f..%.2f box=%.0f,%.0f..%.0f,%.0f tex=%u trans=%u checker=%u cb=%u luma=%u",
+                        k, m_rawPrims.size(), zmin, zmax, x0, y0, x1, y1, p.textured, p.translucent, p.checker, p.colorbase, p.luma));
+                }
+            }
 
             // first_vertex is not read by any shader: it now carries the region slots
             // (main | microtexture << 16) to the vertex stage, which hands them on flat.
@@ -698,6 +740,7 @@ public:
             ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.0f);
             ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", 0.0f);
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
+            ubo.uOverlayK = m_flatMode ? 1.0f : std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 3.0f));
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
             ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
             ubo.padEnd[0] = arcadexr::config::GetInt("m2.hwAnisoOn", 1) != 0 ? 0 : 4;   // = uSmpBase (live A/B)
@@ -847,6 +890,7 @@ public:
             const std::uint32_t i0 = m_rawIdx[i], i1 = m_rawIdx[i + 1], i2 = m_rawIdx[i + 2];
             const std::uint32_t rank = m_rawPrimOfVertex[i0];
             if (rank > bestRank) continue;
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay: not in the room
             const float* a = &m_rawVerts[size_t(i0) * 5];
             const float* b = &m_rawVerts[size_t(i1) * 5];
             const float* c = &m_rawVerts[size_t(i2) * 5];
@@ -1082,6 +1126,7 @@ public:
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
             if (rank >= best && !diag) continue;
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
             const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
             const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
             const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
@@ -1126,6 +1171,8 @@ public:
                 m_groundProbe[0], m_groundProbe[1], m_groundProbe[2]));
     }
     unsigned m_groundLogTick = 0;
+    unsigned m_overlayDiagTick = 0;
+    bool m_overlayOn = false;
     // Average display colour of a polygon through the Model 2 colour chain (CPU), 0 if it cannot be computed.
     int GroundColourOf(const tcvr_m2_frame& frame, const tcvr_m2_prim& p, float acc[3]) {
         auto u16 = [](const uint16_t* t, uint32_t n, uint32_t i) -> uint32_t { return i < n ? t[i] : 0u; };

@@ -26,6 +26,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     int uPrepassClass;
     float uEdgeFade;
     float uHorizonRow;
+    float uOverlayK;        // screen overlays: enlargement of the arcade frame over the view (1 = flat)
     vec3 uSky;
     vec3 uGround;
     int uAniso;
@@ -100,6 +101,14 @@ void main() {
                                      (384.0 - float(p.center_y)) + uCrtc.y - aPos.y / zr)
                               : aPos;
         vBoard = xs;
+        if ((p.rgb & 0x2000000u) != 0u) {
+            // Screen overlay (fade, hit flash): straight to the screen like the cabinet, enlarged over the view.
+            vec2 ndc = vec2(xs.x / uViewport.x * 2.0 - 1.0, xs.y / uViewport.y * 2.0 - 1.0) * uOverlayK;
+            gl_Position = vec4(ndc, 0.0, 1.0);
+            if (uDepthOrder != 0) gl_Position.z = (float(aPrim) + 0.5) / max(uPrimCount, 1.0);
+            vParam = (uRaw != 0) ? vec3(aParam.y / 8.0, aParam.z / 8.0, zr) : aParam;
+            return;
+        }
         if (p.center_x != uMainCenter.x || p.center_y != uMainCenter.y ||
             abs(p.clip_l - uMainClip.x) > 2 || abs(p.clip_t - uMainClip.y) > 2 ||
             abs(p.clip_r - uMainClip.z) > 2 || abs(p.clip_b - uMainClip.w) > 2) {
