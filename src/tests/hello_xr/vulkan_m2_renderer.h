@@ -543,32 +543,34 @@ public:
                                                  m_lastEyePixels ? double(m_dbgMapped[0]) / (2.0 * m_lastEyePixels) : 0.0));
             m_dbgMapped[0] = m_dbgMapped[1] = 0u;
         }
-        if (frame.geometry_unchanged != 0u) {
-            UploadLayers(frame, cmd);
-            return;
-        }
-        if (!m_built) return;
+        // Geometry unchanged (Virtua Cop draws its 3D at 30 Hz: every other frame): the scene is the last built
+        // one, but THIS frame slot's buffers still hold the scene from two frames ago. Returning here made the
+        // image alternate between the current and the previous scene -- flashes and double images everywhere
+        // (Guillaume, 23/09). Re-commit the last built arrays into this slot instead.
+        const bool reuse = frame.geometry_unchanged != 0u;
+        if (reuse && m_rawPrims.empty()) { UploadLayers(frame, cmd); return; }
+        if (!reuse && !m_built) return;
         {   // debug.tcvr.m2_regionsReset=<n>: rebuild every region/layer now (each new value triggers once)
             const int rr = arcadexr::config::GetInt("m2.regionsReset", 0);
             if (rr != m_lastRegionsReset) {
                 m_lastRegionsReset = rr;
                 vkDeviceWaitIdle(m_vkDevice);
                 m_regions.Clear();
-                BuildFrame(frame);
+                if (!reuse) BuildFrame(frame);
                 Log::Write(Log::Level::Info, "TCVR_M2VK regions reset (debug)");
-                if (!m_built) return;
+                if (!reuse && !m_built) return;
             }
         }
         UploadColourChain(frame);
         const bool texChanged = UploadTextures(frame, cmd);
-        if (texChanged) {
-            // Rare (course / menu load): the regions were chosen on the old sheets -> rebuild.
+        if (texChanged && !reuse) {
+            // Rare (course / menu load): the regions were chosen on the old sheets -> rebuild. (Not on a reused
+            // frame: its polygons still point at the current regions; the next built frame rebuilds.)
             if (m_regions.Count() > 0) {
                 vkDeviceWaitIdle(m_vkDevice);
                 m_regions.Clear();
             }
-            BuildFrame(frame);
-            if (!m_built) return;
+            if (!reuse) { BuildFrame(frame); if (!m_built) return; }
         }
         if (!m_rawPrims.empty()) {
             if (!m_rawVerts.empty()) {
