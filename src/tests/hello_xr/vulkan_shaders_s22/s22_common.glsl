@@ -8,7 +8,7 @@ layout(set = 0, binding = 0, std140) uniform S22 {
     vec4 OutText;         // OutSize.xy (target px), TextSize.xy
     vec4 DepthInfo;       // DepthMapScale, DepthMapSize.xy, SpriteMinDepth
     ivec4 Flags;          // Immersive, HudPlane, TexSamples, SpritesPerRow
-    ivec4 Sprite;         // SpriteSize.xy, unused, unused
+    ivec4 Sprite;         // SpriteSize.xy, composite: current scene layer, dark-flicker gate on
     uvec4 Bg;             // background rgb
     ivec4 Mix0;           // SpotEnabled, SpotFactor, SpotPalbase, TextPalbase
     uvec4 Mix1;           // FadeEnabled, FadeFactor, AlphaFactor, AlphaMask
@@ -29,7 +29,7 @@ layout(set = 0, binding = 10) uniform highp usampler2D TileAttr;
 layout(set = 0, binding = 11) uniform highp usampler2D Ayx;
 layout(set = 0, binding = 12) uniform highp usampler2D SpriteAtlas;
 layout(set = 0, binding = 13) uniform highp sampler2D DepthMap;
-layout(set = 0, binding = 14) uniform highp sampler2D SceneColor;   // composite: resolved scene
+layout(set = 0, binding = 14) uniform highp sampler2DArray SceneColor;   // composite: resolved scene, layers = current / previous arcade frame
 layout(set = 0, binding = 15) uniform highp sampler2D ScenePri;     // composite: resolved priority
 
 vec4 P(int p, int col) { return prim[p * 16 + col]; }

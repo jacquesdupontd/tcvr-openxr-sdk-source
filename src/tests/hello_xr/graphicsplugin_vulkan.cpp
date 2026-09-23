@@ -1244,6 +1244,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (m_s22FlatWanted && m_s22Prepared) {
                 arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
                 st.texSamples = 1;
+                st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
                 const float scale = std::max(1.0f, std::min(4.0f, arcadexr::config::GetFloat("s22.flatScale", 2.0f)));
                 if (m_s22.RenderFlat(cmd, scale, st)) {
                     m_flatDrawn = true;
@@ -1713,6 +1714,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.depthTest = arcadexr::profiles::GetInt("immersive.depthTest", 1) != 0;
         st.lean = arcadexr::config::GetInt("s22.lean", 1);
         st.skip = arcadexr::config::GetInt("s22.skip", 0);
+        st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
         st.depthBias = arcadexr::profiles::GetFloat("immersive.depthBias", 4e-8f);
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");

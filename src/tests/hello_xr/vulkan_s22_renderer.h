@@ -64,6 +64,7 @@ public:
         unsigned voidRGB[3] = {28, 30, 38};
         int texSamples = 4;
         float spriteMinDepth = 50.0f;
+        bool darkFlicker = false;   // profile temporal.darkFlicker (Dirt Dash): CRT-like integration of dark 30 Hz flashes
     };
 
     bool Ready() const { return m_ready; }
@@ -103,7 +104,7 @@ public:
         if (m_pool) vkDestroyDescriptorPool(m_dev, m_pool, nullptr);
         if (m_nearest) vkDestroySampler(m_dev, m_nearest, nullptr);
         if (m_linear) vkDestroySampler(m_dev, m_linear, nullptr);
-        DestroyImage(m_dummyU); DestroyImage(m_dummyF);
+        DestroyImage(m_dummyU); DestroyImage(m_dummyF); DestroyImage(m_dummyArr);
         m_dev = VK_NULL_HANDLE; m_ready = false;
     }
 
@@ -325,7 +326,8 @@ public:
         VkClearValue cv[5]{};
         cv[2].depthStencil = {1.0f, 0};
         VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        bi.renderPass = m_rpScene; bi.framebuffer = T.fb; bi.renderArea = {{0, 0}, {rw, rh}};
+        AdvanceTarget(T);
+        bi.renderPass = m_rpScene; bi.framebuffer = T.fbs[T.cur]; bi.renderArea = {{0, 0}, {rw, rh}};
         bi.clearValueCount = IsMsaa() ? 5 : 3; bi.pClearValues = cv;
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
         SetVp(cmd, rw, rh);
@@ -363,6 +365,7 @@ public:
         uc.OutText[0] = float(area.extent.width); uc.OutText[1] = float(area.extent.height);
         uc.ScreenOut[2] = float(area.extent.width) / float(std::max(1, m_textW));
         uc.ScreenOut[3] = float(area.extent.height) / float(std::max(1, m_textH));
+        uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? 1 : 0;
         std::memcpy(S.uboMap[3 + eye], &uc, sizeof(uc));
         VkRenderPassBeginInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         ci.renderPass = m_rpComp; ci.framebuffer = fb; ci.renderArea = area; ci.clearValueCount = 0;
@@ -397,7 +400,8 @@ public:
         VkClearValue cv[5]{};
         cv[2].depthStencil = {1.0f, 0};
         VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        bi.renderPass = m_rpScene; bi.framebuffer = T.fb; bi.renderArea = {{0, 0}, {w, h}};
+        AdvanceTarget(T);
+        bi.renderPass = m_rpScene; bi.framebuffer = T.fbs[T.cur]; bi.renderArea = {{0, 0}, {w, h}};
         bi.clearValueCount = IsMsaa() ? 5 : 3; bi.pClearValues = cv;
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
         SetVp(cmd, w, h);
@@ -416,6 +420,7 @@ public:
         }
         vkCmdEndRenderPass(cmd);
         Ubo uc = u;
+        uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? 1 : 0;
         std::memcpy(S.uboMap[6], &uc, sizeof(uc));
         VkRenderPassBeginInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         ci.renderPass = m_rpComp; ci.framebuffer = m_flatOutFb; ci.renderArea = {{0, 0}, {w, h}};
@@ -507,9 +512,20 @@ private:
     };
     struct EyeTarget {
         uint32_t w = 0, h = 0;
-        Img msColor, msPri, depth, color, pri;
-        VkFramebuffer fb = VK_NULL_HANDLE;
+        Img msColor, msPri, depth, color, pri;   // color: 2 layers (current / previous arcade frame), view = array
+        VkImageView layerView[2] = {};
+        VkFramebuffer fbs[2] = {};
+        int cur = 0;
+        bool havePrev = false;
+        uint64_t seq = ~0ull;
     };
+    // The resolved scene alternates layers only when MAME delivers a new frame, so the other layer is the
+    // PREVIOUS ARCADE FRAME (the dark-flicker gate compares against it, like the GL path did).
+    void AdvanceTarget(EyeTarget& T) {
+        if (m_frame.sequence == T.seq) return;
+        if (T.seq != ~0ull) { T.cur ^= 1; T.havePrev = true; }
+        T.seq = m_frame.sequence;
+    }
     struct CompFb { VkImage image; VkImageView view; VkFramebuffer fb; };
 
     bool IsMsaa() const { return m_samples != VK_SAMPLE_COUNT_1_BIT; }
@@ -557,7 +573,7 @@ private:
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = sa; b.dstAccessMask = da; b.oldLayout = from; b.newLayout = to;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
 
@@ -750,14 +766,16 @@ private:
         XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_linear));
         m_dummyU = NewImage(VK_FORMAT_R8_UINT, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         m_dummyF = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        m_dummyArr = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         m_dummyPending = true;
     }
 
     Img NewImage(VkFormat fmt, uint32_t w, uint32_t h, VkImageUsageFlags usage, VkSampleCountFlagBits s = VK_SAMPLE_COUNT_1_BIT,
-                 bool transient = false, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+                 bool transient = false, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, uint32_t layers = 1) {
         Img im;
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {w, h, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {w, h, 1}; ii.mipLevels = 1; ii.arrayLayers = layers;
         ii.samples = s; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage | (transient ? VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT : 0);
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         XRC_CHECK_THROW_VKCMD(vkCreateImage(m_dev, &ii, nullptr, &im.image));
@@ -767,7 +785,8 @@ private:
         if (!done) m_alloc->Allocate(req, &im.mem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_dev, im.image, im.mem, 0));
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = im.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt; vi.subresourceRange = {aspect, 0, 1, 0, 1};
+        vi.image = im.image; vi.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt;
+        vi.subresourceRange = {aspect, 0, 1, 0, layers};
         XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &vi, nullptr, &im.view));
         return im;
     }
@@ -797,7 +816,7 @@ private:
         Barrier(cmd, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         if (m_dummyPending) {   // the dummies ride on the first asset upload
-            for (Img* d : {&m_dummyU, &m_dummyF}) {
+            for (Img* d : {&m_dummyU, &m_dummyF, &m_dummyArr}) {
                 Barrier(cmd, d->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
             }
@@ -864,21 +883,29 @@ private:
     void CreateEyeTarget(EyeTarget& T, uint32_t w, uint32_t h) {
         T.w = w; T.h = h;
         const VkImageUsageFlags att = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        T.color = NewImage(VK_FORMAT_R8G8B8A8_UNORM, w, h, att | VK_IMAGE_USAGE_SAMPLED_BIT);
+        T.color = NewImage(VK_FORMAT_R8G8B8A8_UNORM, w, h, att | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT, false,
+                           VK_IMAGE_ASPECT_COLOR_BIT, 2);
+        for (uint32_t l = 0; l < 2; ++l) {
+            VkImageViewCreateInfo lv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            lv.image = T.color.image; lv.viewType = VK_IMAGE_VIEW_TYPE_2D; lv.format = VK_FORMAT_R8G8B8A8_UNORM;
+            lv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, l, 1};
+            XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &lv, nullptr, &T.layerView[l]));
+        }
         T.pri = NewImage(VK_FORMAT_R8_UNORM, w, h, att | VK_IMAGE_USAGE_SAMPLED_BIT);
         T.depth = NewImage(VK_FORMAT_D32_SFLOAT, w, h, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m_samples, true, VK_IMAGE_ASPECT_DEPTH_BIT);
-        std::vector<VkImageView> v;
         if (IsMsaa()) {
             T.msColor = NewImage(VK_FORMAT_R8G8B8A8_UNORM, w, h, att, m_samples, true);
             T.msPri = NewImage(VK_FORMAT_R8_UNORM, w, h, att, m_samples, true);
-            v = {T.msColor.view, T.msPri.view, T.depth.view, T.color.view, T.pri.view};
-        } else {
-            v = {T.color.view, T.pri.view, T.depth.view};
         }
-        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        fi.renderPass = m_rpScene; fi.attachmentCount = uint32_t(v.size()); fi.pAttachments = v.data();
-        fi.width = w; fi.height = h; fi.layers = 1;
-        XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_dev, &fi, nullptr, &T.fb));
+        for (int l = 0; l < 2; ++l) {
+            std::vector<VkImageView> v;
+            if (IsMsaa()) v = {T.msColor.view, T.msPri.view, T.depth.view, T.layerView[l], T.pri.view};
+            else v = {T.layerView[l], T.pri.view, T.depth.view};
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = m_rpScene; fi.attachmentCount = uint32_t(v.size()); fi.pAttachments = v.data();
+            fi.width = w; fi.height = h; fi.layers = 1;
+            XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_dev, &fi, nullptr, &T.fbs[l]));
+        }
         Log::Write(Log::Level::Info, Fmt("TCVR_S22VK eye target %ux%u MSAA x%d", w, h, int(m_samples)));
     }
     void CreateFlatOut(uint32_t w, uint32_t h) {
@@ -894,7 +921,10 @@ private:
         DestroyImage(m_flatOut);
     }
     void DestroyEyeTarget(EyeTarget& T) {
-        if (T.fb) vkDestroyFramebuffer(m_dev, T.fb, nullptr);
+        for (int l = 0; l < 2; ++l) {
+            if (T.fbs[l]) vkDestroyFramebuffer(m_dev, T.fbs[l], nullptr);
+            if (T.layerView[l]) vkDestroyImageView(m_dev, T.layerView[l], nullptr);
+        }
         DestroyImage(T.msColor); DestroyImage(T.msPri); DestroyImage(T.depth); DestroyImage(T.color); DestroyImage(T.pri);
         T = EyeTarget{};
     }
@@ -918,7 +948,7 @@ private:
                 }
                 const int eye = (k == 4) ? 1 : (k == 6 ? 2 : 0);   // composite sets read their eye's scene
                 VkImageView dm = m_dmView ? m_dmView : m_dummyF.view;
-                VkImageView sc = m_eye[eye].color.view ? m_eye[eye].color.view : m_dummyF.view;
+                VkImageView sc = m_eye[eye].color.view ? m_eye[eye].color.view : m_dummyArr.view;
                 VkImageView spv = m_eye[eye].pri.view ? m_eye[eye].pri.view : m_dummyF.view;
                 VkDescriptorImageInfo imgs[8] = {
                     {m_nearest, m_tileAtlas.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -952,7 +982,7 @@ private:
     VkRenderPass m_rpDepth = VK_NULL_HANDLE, m_rpScene = VK_NULL_HANDLE, m_rpComp = VK_NULL_HANDLE;
     VkPipeline m_pInit = VK_NULL_HANDLE, m_pScene3D = VK_NULL_HANDLE, m_pP3 = VK_NULL_HANDLE, m_pP3NoAa = VK_NULL_HANDLE, m_pSceneHud = VK_NULL_HANDLE, m_pDepth = VK_NULL_HANDLE, m_pComp = VK_NULL_HANDLE;
     VkSampler m_nearest = VK_NULL_HANDLE, m_linear = VK_NULL_HANDLE;
-    Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dmDepth;
+    Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dummyArr, m_dmDepth;
     std::vector<BufferAndMemory> m_stagings;
     int m_spriteW = 1, m_spriteH = 1, m_spritesPerRow = 1;
     Slot m_slots[kFrames];
