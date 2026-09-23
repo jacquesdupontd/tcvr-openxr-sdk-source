@@ -9,6 +9,7 @@ layout(push_constant) uniform PlanePushConstants {
     mat4 uHudMvp;
     vec2 uOutSize;
     int uKeyZero;
+    float uUvScaleX;   // 496/512: only the arcade's columns (the texture's last 16 are empty; they drew black bands, 23/09)
 };
 
 void main_body() {
@@ -22,7 +23,14 @@ void main_body() {
     if (u * c0.w + v * c1.w + c3.w <= 0.0) discard;
     bool inside = abs(u) <= 0.5 && abs(v) <= 0.5;
     if (uKeyZero != 0 && !inside) discard;
-    vec2 uv = (uKeyZero != 0) ? clamp(vec2(u + 0.5, 0.5 - v), 0.0, 1.0) : vec2(fract(u + 0.5), clamp(0.5 - v, 0.0, 1.0));
+    // Back layer beyond the arcade frame: repeated MIRRORED (identity inside the frame), so the edges meet
+    // without a seam; a plain repeat put the image's left edge against its right one (a hard line in the sky).
+    float t = u + 0.5, m = fract(t * 0.5) * 2.0;
+    vec2 uv = (uKeyZero != 0) ? clamp(vec2(u + 0.5, 0.5 - v), 0.0, 1.0) : vec2(m <= 1.0 ? m : 2.0 - m, clamp(0.5 - v, 0.0, 1.0));
+    // Stay half a texel inside the real columns: the bilinear filter at the last one otherwise blends in the
+    // first empty (black) column -- a thin dark line at every mirror seam of the sky.
+    float halfTexel = 0.5 / float(textureSize(uLayer, 0).x);
+    uv.x = clamp(uv.x * uUvScaleX, halfTexel, uUvScaleX - halfTexel);
     vec4 c = texture(uLayer, uv);
     if (uKeyZero != 0) {
         float a = clamp(c.a, 0.0, 1.0);

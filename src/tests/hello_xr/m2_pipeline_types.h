@@ -60,7 +60,7 @@ struct PlanePushConstants {
     float uHudMvp[16];
     float uOutSize[2];
     int32_t uKeyZero;
-    int32_t pad;
+    float uUvScaleX;   // content width / texture width: the 2D image is 496 wide in a 512-wide texture
 };
 
 }  // namespace arcadexr::vulkan

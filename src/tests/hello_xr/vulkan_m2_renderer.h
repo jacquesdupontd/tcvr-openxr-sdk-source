@@ -757,6 +757,7 @@ public:
                 memcpy(backPc.uHudMvp, hudMvpBack.m, sizeof(hudMvpBack.m));
                 backPc.uOutSize[0] = outW; backPc.uOutSize[1] = outH;
                 backPc.uKeyZero = 0;
+                backPc.uUvScaleX = m_layerUvScaleX[1];
     
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_planePipelineFar : m_planePipeline));
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[1], 0, nullptr);
@@ -792,6 +793,7 @@ public:
             memcpy(frontPc.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
             frontPc.uOutSize[0] = outW; frontPc.uOutSize[1] = outH;
             frontPc.uKeyZero = 1;
+            frontPc.uUvScaleX = m_layerUvScaleX[0];
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[0], 0, nullptr);
@@ -2057,6 +2059,7 @@ private:
 
             m_layerLayout[idx] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             m_haveLayer[idx] = true;
+            m_layerUvScaleX[idx] = float(copyW) / 512.0f;
         };
 
         uploadOne(0, frame.front2d, frame.front2d_stride, frame.width, frame.height);
@@ -2198,6 +2201,7 @@ private:
     BufferAndMemory m_layerStagingBufferF[kFrames][2];
     uint32_t* m_layerStagingMappedF[kFrames][2] = {};
     bool m_haveLayer[2] = {false, false};
+    float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
     // Geometry unpack state
     std::vector<std::uint32_t> m_rawKeys;
