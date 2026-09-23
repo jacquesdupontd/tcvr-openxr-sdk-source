@@ -308,7 +308,33 @@ public:
                 Log::Write(Log::Level::Info, Fmt("TCVR_M2VK focus %.1f x %.1f (was %.1f x %.1f)", frame.focus_x, frame.focus_y, m_m2FocusX, m_m2FocusY));
             m_m2FocusX = frame.focus_x; m_m2FocusY = frame.focus_y;
         }
+        m_directColour = kn > 0 && (kp[0].rgb & 0x1000000u) != 0u;   // Model 1 scene
         if (m_haveMainView) {
+            // "Far" was z >= 1000, Model 2 units. Model 1 units differ: its horizon appeared and vanished from frame
+            // to frame and the pitch derived from it shook the whole world (Guillaume, 24/09, Virtua Racing). On a
+            // Model 1 scene "far" is relative to the view's depth, and a view without depth (a menu with 3D icons)
+            // has no horizon at all. Model 2 keeps its validated threshold.
+            float farZ = 1000.0f;
+            if (m_directColour && frame.raw_prim_count) {
+                std::vector<float> zs;
+                for (std::uint32_t i = 0; i < kn; i++) {
+                    const tcvr_m2_prim& p = kp[i];
+                    if (p.clip_l != mainL || p.clip_t != mainT || p.clip_r != mainR || p.clip_b != mainB ||
+                        p.center_x != mainCx || p.center_y != mainCy) continue;
+                    for (std::uint32_t v = 0; v < p.vertex_count; v++) {
+                        const std::uint32_t index = p.first_vertex + v;
+                        if (index < frame.raw_vertex_count && frame.raw_vertices[index].z > 0.0f) zs.push_back(frame.raw_vertices[index].z);
+                    }
+                }
+                if (zs.size() >= 32) {
+                    std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+                    const float med = zs[zs.size() / 2];
+                    const float zmax = *std::max_element(zs.begin(), zs.end());
+                    farZ = (zmax > 3.0f * med) ? 0.4f * zmax : 1e30f;
+                } else {
+                    farZ = 1e30f;
+                }
+            }
             std::vector<float> farRows;
             for (std::uint32_t i = 0; i < kn; i++) {
                 const tcvr_m2_prim& p = kp[i];
@@ -319,11 +345,11 @@ public:
                     if (frame.raw_prim_count) {
                         if (index >= frame.raw_vertex_count) break;
                         const tcvr_m2_raw_vertex& rv = frame.raw_vertices[index];
-                        if (rv.z >= 1000.0f) farRows.push_back((384.0f - float(p.center_y)) + float(frame.crtc_yoffset) - rv.y / rv.z);
+                        if (rv.z >= farZ) farRows.push_back((384.0f - float(p.center_y)) + float(frame.crtc_yoffset) - rv.y / rv.z);
                     }
                 }
             }
-            if (farRows.size() >= 32) {
+            if (farRows.size() >= (m_directColour ? 8u : 32u)) {
                 std::nth_element(farRows.begin(), farRows.begin() + farRows.size() / 2, farRows.end());
                 m_horizonGeo = farRows[farRows.size() / 2];
             }
@@ -723,7 +749,7 @@ public:
         // A menu of the game (no main 3D view): its 2D back layer is part of the screen, not a sky -- same plane as the
         // HUD, level, not repeated (the course select showed ten copies of a course, and the selection frame of the
         // front layer did not sit on the course of the back one).
-        const bool menuScreen = !m_flatMode && !m_haveMainView;
+        const bool menuScreen = !m_flatMode && (!m_haveMainView || (m_directColour && m_horizonGeo < 0.0f));
         m_backNoTile = menuScreen;
         const bool skyAnchor = !menuScreen && !m_flatMode && m_horizonGeo >= 0.0f &&
             arcadexr::profiles::GetInt("immersive.skyAnchor", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;   // GOLD (Sega Rally) unchanged by default
@@ -763,6 +789,9 @@ public:
             // The board's screen offsets (0 on Sega Rally, not on Virtua Cop): everything placed in board pixels (secondary
             // views, screen overlays) was about 128 rows off with zeros here (23/09).
             ubo.uCrtc[0] = m_crtc[0]; ubo.uCrtc[1] = m_crtc[1];
+            // Menu screen (Virtua Racing course select): its small 3D objects (wheel, pedal, cursor) belong to the
+            // 2D page; drawn in perspective with the game camera's angle they did not sit on the page (24/09).
+            ubo.uMenuFlat = m_backNoTile ? 1 : 0;
             ubo.uMainClip[0] = m_mainClip[0]; ubo.uMainClip[1] = m_mainClip[1];
             ubo.uMainClip[2] = m_mainClip[2]; ubo.uMainClip[3] = m_mainClip[3];
             ubo.uMainCenter[0] = m_mainCenter[0]; ubo.uMainCenter[1] = m_mainCenter[1];
@@ -2507,6 +2536,7 @@ private:
     bool m_haveLayer[2] = {false, false};
     bool m_frontFullscreen = false;
     bool m_backNoTile = false;
+    bool m_directColour = false;
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
     // Geometry unpack state

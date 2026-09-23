@@ -22,6 +22,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     vec2 uViewport;
     vec2 uFocus;
     vec2 uCrtc;
+    int uMenuFlat;           // 1: menu screen, all views flat on the arcade plane
     ivec4 uMainClip;
     ivec2 uMainCenter;
     float uEyeOffset;

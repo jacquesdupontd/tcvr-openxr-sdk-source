@@ -11,6 +11,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     vec2 uViewport;
     vec2 uFocus;
     vec2 uCrtc;
+    int uMenuFlat;           // 1: menu screen, all views flat on the arcade plane
     ivec4 uMainClip;
     ivec2 uMainCenter;
     float uEyeOffset;
@@ -114,7 +115,7 @@ void main() {
             vParam = (uRaw != 0) ? vec3(aParam.y / 8.0, aParam.z / 8.0, zr) : aParam;
             return;
         }
-        if (p.center_x != uMainCenter.x || p.center_y != uMainCenter.y ||
+        if (uMenuFlat != 0 || p.center_x != uMainCenter.x || p.center_y != uMainCenter.y ||
             abs(p.clip_l - uMainClip.x) > 2 || abs(p.clip_t - uMainClip.y) > 2 ||
             abs(p.clip_r - uMainClip.z) > 2 || abs(p.clip_b - uMainClip.w) > 2) {
             vSecondary = 1u;
