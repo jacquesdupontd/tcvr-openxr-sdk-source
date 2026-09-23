@@ -1707,7 +1707,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         m_s22.SetDiagAlternating(arcadexr::config::GetInt("s22.diagAlt", 0) != 0);
         m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 1) != 0);
-        m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 96));
+        m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 4096));
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
         m_s22Prepared = true;

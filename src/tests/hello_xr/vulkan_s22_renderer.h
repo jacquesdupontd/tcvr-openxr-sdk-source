@@ -324,22 +324,26 @@ public:
     // group looked present every frame). Only groups with few instances are tracked (<= 16: not the road's
     // hundreds of quads); each polygon is matched to the previous frame's by screen position and depth.
     struct AltTrack {
-        uint64_t key = 0; float sx = 0, sy = 0, z = 0; uint8_t hist = 0; bool matched = false;
+        uint64_t key = 0; float sx = 0, sy = 0, z = 0, size = 0; uint8_t hist = 0; bool matched = false;
         tcvr_scene_prim prim{}; std::vector<tcvr_scene_vertex> verts;
     };
-    static bool Centroid(const tcvr_scene_prim& p, const tcvr_scene_vertex* v, float& sx, float& sy, float& z) {
+    // Screen centroid, screen size (bounding-box diagonal, board pixels) and mean depth of a primitive.
+    static bool Centroid(const tcvr_scene_prim& p, const tcvr_scene_vertex* v, float& sx, float& sy, float& z, float& size) {
         sx = sy = z = 0.0f;
-        if (p.kind == 1) {   // sprites: screen coordinates already, no depth to compare
-            for (uint32_t i = 0; i < p.vertex_count; ++i) { sx += v[i].x; sy += v[i].y; }
-            sx /= float(p.vertex_count); sy /= float(p.vertex_count); z = 1.0f;
-            return true;
-        }
+        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
         for (uint32_t i = 0; i < p.vertex_count; ++i) {
-            if (v[i].z <= 1e-3f) return false;
-            sx += v[i].x / v[i].z; sy += v[i].y / v[i].z; z += v[i].z;
+            float px, py;
+            if (p.kind == 1) { px = v[i].x; py = v[i].y; }   // sprites: screen coordinates already
+            else {
+                if (v[i].z <= 1e-3f) return false;
+                px = float(p.cx) + v[i].x / v[i].z; py = float(p.cy) - v[i].y / v[i].z; z += v[i].z;
+            }
+            sx += px; sy += py;
+            x0 = std::min(x0, px); x1 = std::max(x1, px); y0 = std::min(y0, py); y1 = std::max(y1, py);
         }
         const float n = float(p.vertex_count);
-        sx = float(p.cx) + sx / n; sy = float(p.cy) - sy / n; z /= n;
+        sx /= n; sy /= n; z = p.kind == 1 ? 1.0f : z / n;
+        size = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
         return true;
     }
     void UpdateAlternation(const tcvr_scene_frame& f) {
@@ -349,33 +353,66 @@ public:
         std::unordered_map<uint64_t, int> count;
         for (uint32_t i = 0; i < f.prim_count; ++i) if (AltKeyEligible(f.prims[i])) ++count[AltKey(f.prims[i])];
         for (AltTrack& t : m_tracks) { t.matched = false; t.hist = uint8_t(t.hist << 1); }
+        std::unordered_map<uint64_t, std::vector<std::pair<int, uint32_t>>> halfCand;
+        std::unordered_map<uint64_t, std::vector<size_t>> byKey;   // tracks per group: matching stays linear
+        for (size_t i = 0; i < m_tracks.size(); ++i) byKey[m_tracks[i].key].push_back(i);
         for (uint32_t i = 0; i < f.prim_count; ++i) {
             const tcvr_scene_prim& p = f.prims[i];
             if (!AltKeyEligible(p) || p.vertex_count < 3 || p.first_vertex + p.vertex_count > f.vertex_count) continue;
             const uint64_t key = AltKey(p);
             if (count[key] > m_altMaxGroup) continue;
             const tcvr_scene_vertex* v = f.vertices + p.first_vertex;
-            float sx, sy, z;
-            if (!Centroid(p, v, sx, sy, z)) continue;
+            float sx, sy, z, size;
+            if (!Centroid(p, v, sx, sy, z, size)) continue;
+            // Strict match (same group, same place, same size, same depth): a missing shadow rectangle must not
+            // be "found" in a neighbouring road quad of the same render state (measured: they share palette
+            // 22272 with 100-200 road quads).
             AltTrack* best = nullptr; float bestD = 1e30f;
-            for (AltTrack& t : m_tracks) {
-                if (t.matched || t.key != key || std::fabs(t.z - z) > 0.25f * z) continue;
+            const float tol = std::max(6.0f, 0.2f * size);
+            const auto bucket = byKey.find(key);
+            if (bucket != byKey.end()) for (size_t ti : bucket->second) {
+                AltTrack& t = m_tracks[ti];
+                if (t.matched || std::fabs(t.z - z) > 0.15f * z || std::fabs(t.size - size) > 0.3f * size + 2.0f) continue;
                 const float d = std::fabs(t.sx - sx) + std::fabs(t.sy - sy);
-                if (d < 40.0f && d < bestD) { bestD = d; best = &t; }
+                if (d < tol && d < bestD) { bestD = d; best = &t; }
             }
             if (!best) { m_tracks.emplace_back(); best = &m_tracks.back(); best->key = key; }
-            best->matched = true; best->hist |= 1u; best->sx = sx; best->sy = sy; best->z = z;
+            best->matched = true; best->hist |= 1u; best->sx = sx; best->sy = sy; best->z = z; best->size = size;
             best->prim = p; best->verts.assign(v, v + p.vertex_count);
-            if ((best->hist & 0x0f) == 0x5) m_altHalfPrim[i] = 1;   // present now, absent last frame, alternating
+            if ((best->hist & 0x0f) == 0x5)   // present now, absent last frame, alternating: candidate
+                halfCand[key].push_back({(best->hist == 0x55) ? 2 : 1, i});
         }
-        for (AltTrack& t : m_tracks) {
+        // Conservation: a polygon can only be really missing if its group shrank, and only really new if it grew
+        // (a bumpy camera makes road quads oscillate and look "alternating" to the matcher). Per group, keep at
+        // most |delta| candidates, the steadiest alternation first (8-frame pattern before 4-frame).
+        std::unordered_map<uint64_t, std::vector<std::pair<int, size_t>>> carryCand;
+        for (size_t ti = 0; ti < m_tracks.size(); ++ti) {
+            const AltTrack& t = m_tracks[ti];
             if (t.matched || (t.hist & 0x0f) != 0xa) continue;          // absent now, present last frame, alternating
-            m_altCarryFirst.push_back(m_altCarryVerts.size());
-            m_altCarryVerts.insert(m_altCarryVerts.end(), t.verts.begin(), t.verts.end());
-            m_altCarry.push_back(t.prim);
+            carryCand[t.key].push_back({(t.hist == 0xaa) ? 2 : 1, ti});
         }
+        auto delta = [&](uint64_t key) {
+            const auto c = count.find(key); const auto pv = m_altPrevCount.find(key);
+            return (c == count.end() ? 0 : c->second) - (pv == m_altPrevCount.end() ? 0 : pv->second);
+        };
+        for (auto& kv : halfCand) {
+            const int allowed = std::max(0, delta(kv.first));
+            std::stable_sort(kv.second.begin(), kv.second.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (int k = 0; k < allowed && k < int(kv.second.size()); ++k) m_altHalfPrim[kv.second[k].second] = 1;
+        }
+        for (auto& kv : carryCand) {
+            const int allowed = std::max(0, -delta(kv.first));
+            std::stable_sort(kv.second.begin(), kv.second.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (int k = 0; k < allowed && k < int(kv.second.size()); ++k) {
+                const AltTrack& t = m_tracks[kv.second[k].second];
+                m_altCarryFirst.push_back(m_altCarryVerts.size());
+                m_altCarryVerts.insert(m_altCarryVerts.end(), t.verts.begin(), t.verts.end());
+                m_altCarry.push_back(t.prim);
+            }
+        }
+        m_altPrevCount.swap(count);
         m_tracks.erase(std::remove_if(m_tracks.begin(), m_tracks.end(), [](const AltTrack& t) { return (t.hist & 0x0f) == 0; }), m_tracks.end());
-        if (m_tracks.size() > 4096) m_tracks.clear();   // safety: never grow without bound
+        if (m_tracks.size() > 16384) m_tracks.clear();   // safety: never grow without bound
         if (m_diagAlt) {
             static auto last = std::chrono::steady_clock::now();
             static int frames = 0, halves = 0, carries = 0;
@@ -389,9 +426,10 @@ public:
         }
     }
     bool m_altFix = true;
-    int m_altMaxGroup = 96;   // groups larger than this (the road: hundreds of quads) are not tracked
+    int m_altMaxGroup = 4096;   // no practical limit: the shadows share their render state with the road
     uint64_t m_altSeq = ~0ull;
     std::vector<AltTrack> m_tracks;
+    std::unordered_map<uint64_t, int> m_altPrevCount;
     std::vector<uint8_t> m_altHalfPrim;
     std::vector<tcvr_scene_prim> m_altCarry;
     std::vector<tcvr_scene_vertex> m_altCarryVerts;
