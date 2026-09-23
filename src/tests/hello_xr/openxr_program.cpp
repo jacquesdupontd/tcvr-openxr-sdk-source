@@ -1527,9 +1527,25 @@ struct OpenXrProgram : IOpenXrProgram {
         std::vector<XrCompositionLayerDepthInfoKHR> depthInfos;
         bool renderLayerOk = false;
         if (frameState.shouldRender == XR_TRUE) {
-            renderLayerOk = RenderLayer(frameState.predictedDisplayTime, projectionLayerViews, depthInfos, layer);
-            if (renderLayerOk) {
-                layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+            // Arcade cadence (60 Hz game on a 120 Hz display): when the game has no new frame, submit the last
+            // layer again - same images, same render poses; the runtime reprojects it to the new head pose.
+            const bool renderNow = !m_haveLastLayer || m_graphicsPlugin->RenderThisFrame();
+            if (!renderNow) {
+                layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&m_lastLayer));
+                renderLayerOk = true;
+            } else {
+                renderLayerOk = RenderLayer(frameState.predictedDisplayTime, projectionLayerViews, depthInfos, layer);
+                if (renderLayerOk) {
+                    layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+                    m_lastViews = projectionLayerViews;
+                    m_lastDepth = depthInfos;
+                    m_lastLayer = layer;
+                    m_lastLayer.next = nullptr;
+                    m_lastLayer.views = m_lastViews.data();
+                    for (size_t i = 0; i < m_lastViews.size(); ++i)
+                        m_lastViews[i].next = (i < depthInfos.size() && m_lastViews[i].next == &depthInfos[i]) ? &m_lastDepth[i] : nullptr;
+                    m_haveLastLayer = true;
+                }
             }
         }
         {
@@ -1590,6 +1606,11 @@ struct OpenXrProgram : IOpenXrProgram {
             m_loggedFirstEndFrame = true;
         }
     }
+
+    XrCompositionLayerProjection m_lastLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    std::vector<XrCompositionLayerProjectionView> m_lastViews;
+    std::vector<XrCompositionLayerDepthInfoKHR> m_lastDepth;
+    bool m_haveLastLayer = false;
 
     bool RenderLayer(XrTime predictedDisplayTime, std::vector<XrCompositionLayerProjectionView>& projectionLayerViews,
                      std::vector<XrCompositionLayerDepthInfoKHR>& depthInfos, XrCompositionLayerProjection& layer) {

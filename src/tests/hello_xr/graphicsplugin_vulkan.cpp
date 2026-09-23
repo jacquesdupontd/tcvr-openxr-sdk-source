@@ -44,6 +44,7 @@
 #include "vulkan_s22_renderer.h"
 #include "menu.h"
 #include "aim_state.h"
+#include "display_refresh.h"
 #include <chrono>
 #include <map>
 #include <algorithm>
@@ -1571,6 +1572,21 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     bool WantsFoveationFdm() const override { return m_fdmEnabled; }
     float ViewportScale() const override { return m_viewportScale; }
+    // Arcade cadence (s22.cadence, default on): System 22 runs at 60 Hz. The display is set to 120 Hz and a
+    // frame is drawn only when the game produced a new one, so every arcade frame is shown exactly twice
+    // (no 2-1-2-1 judder on 90 Hz, and an alternating 30 Hz effect stays regular) and each drawn frame has
+    // two refreshes of GPU time.
+    bool RenderThisFrame() override {
+        if (!m_cadenceActive) return true;
+        namespace s22 = arcadexr::hardware::namco_system22;
+        if (arcadexr::config::GetInt("s22.freeze", 0) != 0) return (++m_framesSinceRender & 1) == 0;   // bench: half rate
+        const tcvr_scene_frame* f = s22::AcquireScene();
+        if (f) m_s22Frame = f;
+        ++m_framesSinceRender;
+        const bool fresh = m_s22Frame && m_s22Frame->sequence != m_lastRenderedSeq;
+        if (fresh || m_framesSinceRender >= 3) { m_framesSinceRender = 0; return true; }
+        return false;
+    }
 
     void ChainFoveationImages(ISwapchainImageData* images, uint32_t count) override {
         auto& v = m_fdmImages[images];
@@ -1651,6 +1667,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                               arcadexr::config::GetInt("s22.vkFlat", 1) != 0;
         m_s22FlatWanted = wantFlat;
         const int mode = (want || wantFlat) ? (arcadexr::profiles::GetInt("scene.cpuRaster", 0) ? 1 : 2) : 0;
+        {   // Arcade cadence: 120 Hz display while a System 22 game is immersive, back to the baked rate after.
+            const bool cadence = want && arcadexr::config::GetInt("s22.cadence", 1) != 0;
+            if (cadence && !m_cadenceRequested) { arcadexr::xr::RequestRateForGame(120.0f, "System 22: 2 refreshes per 60 Hz frame"); m_cadenceRequested = true; }
+            if (!cadence && m_cadenceRequested) { arcadexr::xr::RequestRateForGame(90.0f, "leaving System 22 immersive"); m_cadenceRequested = false; }
+            m_cadenceActive = cadence;
+        }
         if (isS22 && mode != m_s22SceneMode) {
             m_s22SceneMode = mode;
             s22::EnableScene(mode);
@@ -1694,6 +1716,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22Active = true;
         // Immersive System 22 renders its scene at immersive.scale: into a sub-rectangle of the swapchain
         // (applied from the next frame), so the composite also runs at that size and the compositor scales.
+        m_lastRenderedSeq = m_s22Frame->sequence;
         if (arcadexr::config::GetInt("s22.viewportScale", 1) != 0)
             m_viewportScale = std::max(0.3f, std::min(1.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f)));
     }
@@ -1735,7 +1758,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.skip = arcadexr::config::GetInt("s22.skip", 0);
         st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
         st.merged = arcadexr::config::GetInt("s22.merged", 1) != 0;
-        st.depthBias = arcadexr::config::GetFloat("s22.depthBiasRel", 2.5e-7f);
+        st.depthBias = arcadexr::config::GetFloat("s22.depthBiasRel", 8e-6f);   // validated by eye on Dirt Dash shadows (23/09)
         st.nearClip = nearMetres;
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");
@@ -2073,6 +2096,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkImageView m_flatBoundView{VK_NULL_HANDLE};
     uint32_t m_flatW{0}, m_flatH{0};
     float m_viewportScale{1.0f};
+    bool m_cadenceActive{false}, m_cadenceRequested{false};
+    uint64_t m_lastRenderedSeq{~0ull};
+    int m_framesSinceRender{0};
     int m_primDumpDone{0};
     bool m_s22FlatWanted{false}, m_s22Prepared{false};
     arcadexr::vulkan::VulkanOverlay m_overlay;
