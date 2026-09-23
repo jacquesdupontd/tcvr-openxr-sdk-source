@@ -17,7 +17,9 @@ void main() {
         vec3 d = abs(cur - prev);
         float change = max(max(d.r, d.g), d.b);
         float integrate = (1.0 - smoothstep(0.08, 0.18, darkest)) * smoothstep(0.12, 0.28, change);
-        cur = mix(cur, (cur + prev) * 0.5, integrate);
+        // mode 1: average (a CRT's 30 Hz integration, half-strength shadow); mode 2: the darker of the two
+        // frames - the shadow held at full strength every frame ("pitch black"), Guillaume's request 23/09.
+        cur = mix(cur, Sprite.w == 2 ? min(cur, prev) : (cur + prev) * 0.5, integrate);
     }
     uvec3 c = uvec3(cur * 255.0 + 0.5);
     vec2 q; bool onPlane = textCoord(q);
@@ -34,5 +36,5 @@ void main() {
         if (pri == 6u) c = mixText(p, c, 6);
     }
     uvec3 g = uvec3(gammaAt(c.r), gammaAt(256u + c.g), gammaAt(512u + c.b));
-    oColor = vec4(vec3(g) / 255.0, 1.0);
+    oColor = vec4(outColor(vec3(g) / 255.0), 1.0);
 }

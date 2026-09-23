@@ -953,9 +953,23 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         return reinterpret_cast<const XrBaseInStructure*>(&m_graphicsBinding);
     }
 
+    // Arcade colours are display values (CRT-referred, like sRGB-encoded bytes). Rendered through an _SRGB view
+    // they get encoded AGAIN: lighter, washed out (measured by Guillaume's eyes 23/09; the GL build writes raw
+    // with GL_FRAMEBUFFER_SRGB off and looks right, and Sega Rally had a contrast 1.2 compensating it). The
+    // swapchain stays _SRGB for the compositor (created MUTABLE_FORMAT); every view and render pass we make on
+    // it is the _UNORM twin, so what the shaders write is the byte the compositor reads. xr.rawColor=0 = old.
+    static XrSwapchainCreateInfo RawColorCreateInfo(const XrSwapchainCreateInfo& in) {
+        XrSwapchainCreateInfo out = in;
+        if (arcadexr::config::GetInt("xr.rawColor", 1) == 0) return out;
+        if (in.format == VK_FORMAT_R8G8B8A8_SRGB) out.format = VK_FORMAT_R8G8B8A8_UNORM;
+        else if (in.format == VK_FORMAT_B8G8R8A8_SRGB) out.format = VK_FORMAT_B8G8R8A8_UNORM;
+        if (out.format != in.format) Log::Write(Log::Level::Info, Fmt("TCVR_VK raw colour views: swapchain %d viewed as %d", int(in.format), int(out.format)));
+        return out;
+    }
+
     ISwapchainImageData* AllocateSwapchainImageData(size_t size, const XrSwapchainCreateInfo& swapchainCreateInfo) override {
         auto typedResult = std::make_unique<VulkanSwapchainImageData>(
-            m_namer, uint32_t(size), swapchainCreateInfo, m_vkDevice, &m_memAllocator, m_pipelineLayout, m_computePipelineLayout,
+            m_namer, uint32_t(size), RawColorCreateInfo(swapchainCreateInfo), m_vkDevice, &m_memAllocator, m_pipelineLayout, m_computePipelineLayout,
             m_shaderProgram, m_computeShaderProgram, m_drawBuffer.bindDesc, m_drawBuffer.attrDesc);
 
         // Cast our derived type to the caller-expected type.
@@ -970,7 +984,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         size_t size, const XrSwapchainCreateInfo& colorSwapchainCreateInfo, XrSwapchain depthSwapchain,
         const XrSwapchainCreateInfo& depthSwapchainCreateInfo) override {
         auto typedResult = std::make_unique<VulkanSwapchainImageData>(
-            m_namer, uint32_t(size), colorSwapchainCreateInfo, depthSwapchain, depthSwapchainCreateInfo, m_vkDevice,
+            m_namer, uint32_t(size), RawColorCreateInfo(colorSwapchainCreateInfo), depthSwapchain, depthSwapchainCreateInfo, m_vkDevice,
             &m_memAllocator, m_pipelineLayout, m_computePipelineLayout, m_shaderProgram, m_computeShaderProgram,
             m_drawBuffer.bindDesc, m_drawBuffer.attrDesc);
 
@@ -1247,6 +1261,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
                 st.texSamples = 1;
                 st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
+        st.darkMode = std::max(1, arcadexr::profiles::GetInt("temporal.darkFlicker", 0));
                 const float scale = std::max(1.0f, std::min(4.0f, arcadexr::config::GetFloat("s22.flatScale", 2.0f)));
                 if (m_s22.RenderFlat(cmd, scale, st)) {
                     m_flatDrawn = true;
@@ -1700,13 +1715,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22.PumpBanks(cmd);
         m_s22.SetFilter(arcadexr::config::GetInt("s22.filter", 3));   // 0 texel-exact, 1 bilinear, 2 + index mipmaps, 3 sharp + anisotropic
         m_s22.SetHudSharp(arcadexr::config::GetInt("s22.hudSharp", 3));
+        m_s22.SetLinearOut(arcadexr::config::GetInt("s22.linearOut", 0) != 0);   // superseded by raw colour views
         m_s22.SetTextDiag(arcadexr::config::GetInt("s22.textDiag", 0));
         {
             const int req = arcadexr::config::GetInt("s22.dumpPrims", 0);
             if (req != 0 && req != m_primDumpDone) { m_primDumpDone = req; m_s22.RequestPrimDump(); }
         }
         m_s22.SetDiagAlternating(arcadexr::config::GetInt("s22.diagAlt", 0) != 0);
-        m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 1) != 0);
+        m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 0) != 0);   // off: the arcade flicker is kept (Guillaume 23/09)
         m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 4096));
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
@@ -1757,6 +1773,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.lean = arcadexr::config::GetInt("s22.lean", 1);
         st.skip = arcadexr::config::GetInt("s22.skip", 0);
         st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
+        st.darkMode = std::max(1, arcadexr::profiles::GetInt("temporal.darkFlicker", 0));
         st.merged = arcadexr::config::GetInt("s22.merged", 1) != 0;
         st.depthBias = arcadexr::config::GetFloat("s22.depthBiasRel", 8e-6f);   // validated by eye on Dirt Dash shadows (23/09)
         st.nearClip = nearMetres;

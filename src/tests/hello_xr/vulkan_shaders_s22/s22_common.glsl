@@ -13,7 +13,7 @@ layout(set = 0, binding = 0, std140) uniform S22 {
     ivec4 Mix0;           // SpotEnabled, SpotFactor, SpotPalbase, TextPalbase
     uvec4 Mix1;           // FadeEnabled, FadeFactor, AlphaFactor, AlphaMask
     uvec4 Mix2;           // AlphaCheck12, AlphaCheck13, HUD mode 3 (sharp text/sprites),
-    uvec4 FadeColor;
+    uvec4 FadeColor;      // xyz fade colour, w: output linearised for an sRGB target (1) or raw (0)
     vec4 Bias;            // relative painter-order depth offset per primitive, EyeOffset, Convergence, near plane (m)
 };
 layout(std430, set = 0, binding = 1) readonly buffer PrimTable { vec4 prim[]; };   // 16 vec4 per primitive
@@ -44,3 +44,11 @@ uint priAt(ivec2 p) { uint i = uint(p.y) * uint(OutText.z) + uint(p.x); return u
 uvec3 penRGB(uint idx) { uint p = pens[idx]; return uvec3((p >> 16u) & 255u, (p >> 8u) & 255u, p & 255u); }
 // rgbaint_t::blend(other, factor): (this*factor + other*(256-factor)) >> 8
 uvec3 blend(uvec3 c, uvec3 o, uint f) { return (c * f + o * (256u - f)) >> 8u; }
+
+// The arcade's colours are DISPLAY values (made for a CRT), like an sRGB-encoded byte. Written as they are
+// into an _SRGB attachment, the GPU would encode them again: lighter, washed out (the GL path writes them raw,
+// GL_FRAMEBUFFER_SRGB off, which is what MAME shows). Decoding them first makes the stored byte the arcade's.
+vec3 outColor(vec3 display) {
+    if (FadeColor.w == 0u) return display;
+    return mix(display / 12.92, pow((display + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), display));
+}

@@ -21,5 +21,5 @@ void main() {
         if (pri == 6u) c = mixText(p, c, 6);
     }
     uvec3 g = uvec3(gammaAt(c.r), gammaAt(256u + c.g), gammaAt(512u + c.b));
-    oColor = vec4(vec3(g) / 255.0, 1.0);
+    oColor = vec4(outColor(vec3(g) / 255.0), 1.0);
 }

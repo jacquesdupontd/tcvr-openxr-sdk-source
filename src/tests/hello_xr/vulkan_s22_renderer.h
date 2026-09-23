@@ -81,6 +81,7 @@ public:
         int texSamples = 4;
         float spriteMinDepth = 50.0f;
         bool darkFlicker = false;
+        int darkMode = 1;   // 1 average, 2 darker of the two frames
         bool merged = true;   // full resolution: scene + composite in one render pass (s22.merged)   // profile temporal.darkFlicker (Dirt Dash): CRT-like integration of dark 30 Hz flashes
     };
 
@@ -290,6 +291,8 @@ public:
         if (m_bankReadyMask == 0xffffu) Log::Write(Log::Level::Info, "TCVR_S22VK pen banks: 16/16 decoded and uploaded");
     }
     void SetFilter(int mode) { m_filter = mode; }
+    void SetLinearOut(bool on) { m_linearOut = on; }
+    bool m_linearOut = true;
     void SetHudSharp(int bits) { m_hudSharp = bits; }
     void SetTextDiag(int on) { m_textDiag = on; }
     void RequestPrimDump() { m_dumpPrims = true; }
@@ -540,7 +543,8 @@ public:
             for (uint32_t i = 0; i < pr.vertex_count; ++i) { g.x += f.vertices[pr.first_vertex + i].x; g.y += f.vertices[pr.first_vertex + i].y; }
             g.n += float(pr.vertex_count);
         }
-        if (f.sequence != m_altSeq) UpdateAlternation(f);
+        if (m_altFix && f.sequence != m_altSeq) UpdateAlternation(f);
+        if (!m_altFix) m_altHalfPrim.clear(), m_altCarry.clear();
         float neighbourZoom = 1.0f;
         // One primitive into the draw arrays. `verts` = its own vertices; `half` draws it at 50 % (see
         // UpdateAlternation). The vertex carries the index of its row in OUR table (not MAME's index).
@@ -699,7 +703,7 @@ public:
                                              int(m_rpMerged != VK_NULL_HANDLE), rw, rh, outExt.width, outExt.height, area.offset.x,
                                              area.offset.y, area.extent.width, area.extent.height));
         }
-        if (st.merged && m_rpMerged && rw == outExt.width && rh == outExt.height && area.offset.x == 0 && area.offset.y == 0 &&
+        if (st.merged && !st.darkFlicker && m_rpMerged && rw == outExt.width && rh == outExt.height && area.offset.x == 0 && area.offset.y == 0 &&
             area.extent.width == outExt.width && area.extent.height == outExt.height)
             return RenderEyeMerged(cmd, eye, mvp, hudMvp, target, outExt, st);
         EyeTarget& T = m_eye[eye];
@@ -734,9 +738,15 @@ public:
         vkCmdEndRenderPass(cmd);
         // ---- C: composite into the eye image
         VkFramebuffer fb = VK_NULL_HANDLE;
-        for (auto& f : m_compFbs) if (f.image == target) fb = f.fb;
+        for (auto it = m_compFbs.begin(); it != m_compFbs.end(); ++it)
+            if (it->image == target) {
+                if (it->w == outExt.width && it->h == outExt.height) { fb = it->fb; break; }
+                vkDeviceWaitIdle(m_dev);   // the render rectangle changed size (immersive.scale): rebuild
+                vkDestroyFramebuffer(m_dev, it->fb, nullptr); vkDestroyImageView(m_dev, it->view, nullptr);
+                m_compFbs.erase(it); break;
+            }
         if (!fb) {
-            CompFb f{}; f.image = target;
+            CompFb f{}; f.image = target; f.w = outExt.width; f.h = outExt.height;
             VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vi.image = target; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = m_eyeFormat;
             vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -752,7 +762,7 @@ public:
         uc.OutText[0] = float(area.extent.width); uc.OutText[1] = float(area.extent.height);
         uc.ScreenOut[2] = float(area.extent.width) / float(std::max(1, m_textW));
         uc.ScreenOut[3] = float(area.extent.height) / float(std::max(1, m_textH));
-        uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? 1 : 0;
+        uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? st.darkMode : 0;
         std::memcpy(S.uboMap[3 + eye], &uc, sizeof(uc));
         VkRenderPassBeginInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         ci.renderPass = m_rpComp; ci.framebuffer = fb; ci.renderArea = area; ci.clearValueCount = 0;
@@ -872,7 +882,7 @@ public:
         }
         vkCmdEndRenderPass(cmd);
         Ubo uc = u;
-        uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? 1 : 0;
+        uc.Sprite[2] = T.cur; uc.Sprite[3] = (st.darkFlicker && T.havePrev) ? st.darkMode : 0;
         uc.Flags[2] = m_textDiag == 1 ? 77 : (m_textDiag == 2 ? 78 : (m_textDiag == 3 ? 79 : 0));
         std::memcpy(S.uboMap[6], &uc, sizeof(uc));
         VkRenderPassBeginInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -981,7 +991,7 @@ private:
         if (T.seq != ~0ull) { T.cur ^= 1; T.havePrev = true; }
         T.seq = m_frame.sequence;
     }
-    struct CompFb { VkImage image; VkImageView view; VkFramebuffer fb; };
+    struct CompFb { VkImage image; VkImageView view; VkFramebuffer fb; uint32_t w = 0, h = 0; };
     struct MergedTarget { uint32_t w = 0, h = 0; Img msColor, msPri, depth, rColor, rPri; };
     struct MergedFb { VkImage image; int eye; VkImageView view; VkFramebuffer fb; };
     MergedTarget m_mt[2];
@@ -1033,6 +1043,7 @@ private:
         u.Mix2[0] = f.mix_alpha_check12 & 0xff; u.Mix2[1] = f.mix_alpha_check13 & 0xff;
         u.Mix2[2] = (m_filter >= 3 && (m_hudSharp & 1)) ? 1u : 0u;   // text layer in mode 3 (s22.hudSharp bit 0)
         u.Mix2[3] = (m_filter >= 3 && (m_hudSharp & 2)) ? 1u : 0u;   // sprites in mode 3 (bit 1)
+        u.FadeColor[3] = m_linearOut ? 1u : 0u;
         u.FadeColor[0] = unsigned(f.mix_fade_r); u.FadeColor[1] = unsigned(f.mix_fade_g); u.FadeColor[2] = unsigned(f.mix_fade_b);
         u.Bias[0] = (mvp && m_settings.depthTest) ? m_settings.depthBias : 0.0f;
         u.Bias[3] = m_settings.nearClip;

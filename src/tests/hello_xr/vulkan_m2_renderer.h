@@ -674,8 +674,10 @@ public:
             ubo.uFilterMode = std::max(0, std::min(5, arcadexr::config::GetInt("m2.filter", 5)));
             ubo.uMipBias = std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0)));
             ubo.uAlphaCoverage = IsMsaa() ? arcadexr::config::GetInt("m2.alphaCoverage", 1) : 0;
-            ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.2f);
-            ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", -0.02f);
+            // 1.2 / -0.02 compensated the washed-out sRGB double encoding, fixed at the root (raw colour views):
+            // neutral by default now; contrast/bright props remain for A/B.
+            ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.0f);
+            ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", 0.0f);
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
             ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
