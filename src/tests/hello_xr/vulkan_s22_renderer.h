@@ -15,9 +15,18 @@
 
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <cmath>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vulkan_utils.h"
@@ -59,7 +68,12 @@ public:
         bool depthTest = true;
         int lean = 1;
         int skip = 0;   // bench: 1 init, 2 polygons, 4 composite
-        float depthBias = 4e-8f;
+        // Reversed infinite depth: z_ndc = near * (1 + depthBias * primitive) / distance. Float precision is then
+        // relative everywhere, so the painter-order offset is relative too and the same for every game
+        // (2.5e-7 = ~4 ulp between consecutive primitives). The old per-game values were for the standard
+        // mapping, whose precision collapsed with distance (Dirt Dash's far shadows flashed on the road).
+        float depthBias = 2.5e-7f;
+        float nearClip = 0.005f;
         int voidMode = 0;              // 0 game bg, 1 fog colour (slate if black), 2 fixed
         unsigned voidRGB[3] = {28, 30, 38};
         int texSamples = 4;
@@ -85,6 +99,7 @@ public:
         Log::Write(Log::Level::Info, Fmt("TCVR_S22VK ready: MSAA x%d", int(m_samples)));
     }
 
+    ~VulkanSystem22Renderer() { StopBankWorker(); }
     void Destroy() {
         if (!m_dev) return;
         vkDeviceWaitIdle(m_dev);
@@ -104,14 +119,19 @@ public:
         if (m_pool) vkDestroyDescriptorPool(m_dev, m_pool, nullptr);
         if (m_nearest) vkDestroySampler(m_dev, m_nearest, nullptr);
         if (m_linear) vkDestroySampler(m_dev, m_linear, nullptr);
-        DestroyImage(m_dummyU); DestroyImage(m_dummyF); DestroyImage(m_dummyArr);
+        if (m_repeatNearest) vkDestroySampler(m_dev, m_repeatNearest, nullptr);
+        DestroyImage(m_dummyU); DestroyImage(m_dummyF); DestroyImage(m_dummyArr); DestroyImage(m_dummyU16);
         m_dev = VK_NULL_HANDLE; m_ready = false;
     }
 
     // ---- static assets (tile store, sprites): once per game --------------------------------------
     void ResetAssets() {
         if (!m_dev) return;
+        StopBankWorker();
         if (m_assetsReady) vkDeviceWaitIdle(m_dev);
+        DestroyImage(m_penBanks);
+        m_bankStaging.clear();
+        m_bankReadyMask = 0;
         DestroyImage(m_tileAtlas); DestroyImage(m_tileMap); DestroyImage(m_tileAttr); DestroyImage(m_ayx); DestroyImage(m_spriteAtlas);
         m_assetsReady = false;
         m_setsDirty = true;
@@ -147,12 +167,256 @@ public:
             const uint8_t none = 0xff;
             m_spriteAtlas = MakeImage(cmd, VK_FORMAT_R8_UINT, 1, 1, &none, 1);
         }
+        // Decoded pen banks for filtered sampling (see StartBankWorker). Shader-readable from the start;
+        // a bank is used only once its bit is in the ready mask, the ROM table chain covers the rest.
+        m_penBanks = NewImage(VK_FORMAT_R8_UINT, 4096, 4096, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 16, kBankMips);
+        Barrier(cmd, m_penBanks.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        StartBankWorker(a, tiles);
         m_assetsReady = true;
         m_setsDirty = true;
         Log::Write(Log::Level::Info, Fmt("TCVR_S22VK assets: tiles %u bytes, sprites %u (%ux%u)", a.tiledata_bytes, a.sprite_count,
                                          a.sprite_width, a.sprite_height));
         return true;
     }
+
+    // ---- decoded pen banks -----------------------------------------------------------------------
+    // The texture address is 12-bit u, 12-bit v and a 4-bit bank (texturebank * 0x1000 OR-ed into v),
+    // resolved by the board through three ROM tables (tile map, tile attribute, ayx swizzle). Decoding a
+    // bank gives a plain 4096x4096 image of palette indices: one textureGather then returns the 4
+    // neighbours a bilinear filter needs (the chain would cost 4 dependent fetches per neighbour).
+    // 16 banks = 256 MB, decoded on a worker at game load and uploaded one per frame.
+    void StartBankWorker(const tcvr_scene_assets& a, uint32_t tiles) {
+        StopBankWorker();
+        m_bankCancel = false;
+        m_bankReadyMask = 0;
+        const tcvr_scene_assets A = a;
+        m_bankWorker = std::thread([this, A, tiles] {
+            for (uint32_t bank = 0; bank < 16 && !m_bankCancel; ++bank) {
+                std::vector<uint8_t> img(size_t(4096) * 4096, 0);
+                for (uint32_t y = 0; y < 4096; ++y) {
+                    const uint32_t ty = (bank << 12) | y;
+                    uint8_t* row = &img[size_t(y) * 4096];
+                    for (uint32_t tx = 0; tx < 4096; ++tx) {
+                        const uint32_t to = ((ty << 4) & 0xfff00u) | (tx >> 4);
+                        if (to >= A.tilemap_entries || to >= A.tileattr_entries) continue;
+                        const uint32_t tile = A.tilemap[to];
+                        const uint32_t ai = (uint32_t(A.tileattr[to]) << 8) | ((ty << 4) & 0xf0u) | (tx & 0xfu);
+                        if (ai >= A.ayx_entries || tile >= tiles) continue;
+                        const uint32_t pix = A.ayx[ai];
+                        row[tx] = A.tiledata[size_t(tile) * 256 + (pix >> 4) * 16 + (pix & 15u)];
+                    }
+                }
+                // Index mipmaps: a palette index cannot be averaged (each polygon picks its own palette), so
+                // each level keeps, per 2x2 block, the index that occurs most (ties: first in scan order). A
+                // stable choice: the distance stops shimmering; the shader then blends COLOURS between levels.
+                size_t off = img.size();
+                img.resize(off + BankMipBytes() - size_t(4096) * 4096);
+                size_t prev = 0;
+                for (uint32_t l = 1; l < kBankMips; ++l) {
+                    const uint32_t ps = 4096u >> (l - 1), ns = ps >> 1;
+                    const uint8_t* src = img.data() + prev;
+                    uint8_t* dst = img.data() + off;
+                    for (uint32_t y = 0; y < ns; ++y)
+                        for (uint32_t x = 0; x < ns; ++x) {
+                            const uint8_t a = src[(2 * y) * ps + 2 * x], b = src[(2 * y) * ps + 2 * x + 1];
+                            const uint8_t c = src[(2 * y + 1) * ps + 2 * x], d = src[(2 * y + 1) * ps + 2 * x + 1];
+                            uint8_t m = a;
+                            if (b == c || b == d) m = b;
+                            if (a == b || a == c || a == d) m = a;
+                            else if (c == d) m = c;
+                            dst[y * ns + x] = m;
+                        }
+                    prev = off; off += size_t(ns) * ns;
+                }
+                std::lock_guard<std::mutex> lock(m_bankMutex);
+                m_bankQueue.emplace_back(int(bank), std::move(img));
+            }
+        });
+    }
+    void StopBankWorker() {
+        m_bankCancel = true;
+        if (m_bankWorker.joinable()) m_bankWorker.join();
+        std::lock_guard<std::mutex> lock(m_bankMutex);
+        m_bankQueue.clear();
+    }
+public:
+    // Once per frame at view 0: upload at most one decoded bank, free stagings no frame can still read.
+    void PumpBanks(VkCommandBuffer cmd) {
+        ++m_frameCounter;
+        while (!m_bankStaging.empty() && m_bankStaging.front().second + 4 <= m_frameCounter) {
+            m_bankStaging.front().first->Reset(m_dev);
+            m_bankStaging.erase(m_bankStaging.begin());
+        }
+        if (!m_assetsReady || !m_penBanks.image) return;
+        std::pair<int, std::vector<uint8_t>> job;
+        {
+            std::lock_guard<std::mutex> lock(m_bankMutex);
+            if (m_bankQueue.empty()) return;
+            job = std::move(m_bankQueue.front());
+            m_bankQueue.erase(m_bankQueue.begin());
+        }
+        auto sb = std::make_unique<BufferAndMemory>();
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = job.second.size(); bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        sb->Create(m_dev, *m_alloc, bi);
+        void* p = nullptr;
+        XRC_CHECK_THROW_VKCMD(vkMapMemory(m_dev, sb->mem, 0, bi.size, 0, &p));
+        std::memcpy(p, job.second.data(), job.second.size());
+        vkUnmapMemory(m_dev, sb->mem);
+        Barrier(cmd, m_penBanks.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy regions[kBankMips]{};
+        VkDeviceSize off = 0;
+        for (uint32_t l = 0; l < kBankMips; ++l) {
+            const uint32_t sz = 4096u >> l;
+            regions[l].bufferOffset = off;
+            regions[l].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, uint32_t(job.first), 1};
+            regions[l].imageExtent = {sz, sz, 1};
+            off += VkDeviceSize(sz) * sz;
+        }
+        vkCmdCopyBufferToImage(cmd, sb->buf, m_penBanks.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kBankMips, regions);
+        Barrier(cmd, m_penBanks.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        m_bankStaging.emplace_back(std::move(sb), m_frameCounter);
+        m_bankReadyMask |= 1u << job.first;
+        if (m_bankReadyMask == 0xffffu) Log::Write(Log::Level::Info, "TCVR_S22VK pen banks: 16/16 decoded and uploaded");
+    }
+    void SetFilter(int mode) { m_filter = mode; }
+    static constexpr uint32_t kBankMips = 9;   // 4096 .. 16
+    static size_t BankMipBytes() { size_t n = 0; for (uint32_t l = 0; l < kBankMips; ++l) n += size_t(4096u >> l) * (4096u >> l); return n; }
+    void SetDiagAlternating(bool on) { m_diagAlt = on; }
+    void SetAltFix(bool on) { m_altFix = on; }
+    // A 3D primitive group (same render state) drawn one arcade frame out of two - Dirt Dash's car
+    // shadows, measured 23/09 with s22.diagAlt: 8 quads present, then absent, every other frame. A CRT's
+    // phosphor showed that as a steady half-strength shadow; an XR display shows a 30 Hz flash. Drawing
+    // the group every frame at 50 % is exactly the time average of the on and off frames, in the scene
+    // (no image-space history, so no ghosting when the head moves): present frames draw it at 50 %,
+    // absent frames redraw the previous frame's copies at 50 %. Detection is generic (presence history
+    // per group), nothing is listed per game.
+    static bool AltKeyEligible(const tcvr_scene_prim& p) { return p.kind == 0 && p.direct == 0; }
+    static uint64_t AltKey(const tcvr_scene_prim& p) {
+        const uint32_t v[] = {p.pens_offset, p.bn, p.penmask, p.penshift, p.texture_enabled, p.shade_enabled, p.fog_mode,
+                              p.pfade_enabled, uint32_t(int(p.poly_r)), uint32_t(int(p.poly_g)), uint32_t(int(p.poly_b)),
+                              p.alpha_enabled, uint32_t(p.alpha), p.alpha_pen, p.fade_enabled, p.prioverchar};
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t x : v) { h ^= x; h *= 1099511628211ull; }
+        return h;
+    }
+    // Per-INSTANCE tracking (a group-level test missed cars whose shadows flash in opposite phases: the
+    // group looked present every frame). Only groups with few instances are tracked (<= 16: not the road's
+    // hundreds of quads); each polygon is matched to the previous frame's by screen position and depth.
+    struct AltTrack {
+        uint64_t key = 0; float sx = 0, sy = 0, z = 0; uint8_t hist = 0; bool matched = false;
+        tcvr_scene_prim prim{}; std::vector<tcvr_scene_vertex> verts;
+    };
+    static bool Centroid(const tcvr_scene_prim& p, const tcvr_scene_vertex* v, float& sx, float& sy, float& z) {
+        sx = sy = z = 0.0f;
+        for (uint32_t i = 0; i < p.vertex_count; ++i) {
+            if (v[i].z <= 1e-3f) return false;
+            sx += v[i].x / v[i].z; sy += v[i].y / v[i].z; z += v[i].z;
+        }
+        const float n = float(p.vertex_count);
+        sx = float(p.cx) + sx / n; sy = float(p.cy) - sy / n; z /= n;
+        return true;
+    }
+    void UpdateAlternation(const tcvr_scene_frame& f) {
+        m_altSeq = f.sequence;
+        m_altHalfPrim.assign(f.prim_count, 0);
+        m_altCarry.clear(); m_altCarryVerts.clear(); m_altCarryFirst.clear();
+        std::unordered_map<uint64_t, int> count;
+        for (uint32_t i = 0; i < f.prim_count; ++i) if (AltKeyEligible(f.prims[i])) ++count[AltKey(f.prims[i])];
+        for (AltTrack& t : m_tracks) { t.matched = false; t.hist = uint8_t(t.hist << 1); }
+        for (uint32_t i = 0; i < f.prim_count; ++i) {
+            const tcvr_scene_prim& p = f.prims[i];
+            if (!AltKeyEligible(p) || p.vertex_count < 3 || p.first_vertex + p.vertex_count > f.vertex_count) continue;
+            const uint64_t key = AltKey(p);
+            if (count[key] > 16) continue;
+            const tcvr_scene_vertex* v = f.vertices + p.first_vertex;
+            float sx, sy, z;
+            if (!Centroid(p, v, sx, sy, z)) continue;
+            AltTrack* best = nullptr; float bestD = 1e30f;
+            for (AltTrack& t : m_tracks) {
+                if (t.matched || t.key != key || std::fabs(t.z - z) > 0.25f * z) continue;
+                const float d = std::fabs(t.sx - sx) + std::fabs(t.sy - sy);
+                if (d < 40.0f && d < bestD) { bestD = d; best = &t; }
+            }
+            if (!best) { m_tracks.emplace_back(); best = &m_tracks.back(); best->key = key; }
+            best->matched = true; best->hist |= 1u; best->sx = sx; best->sy = sy; best->z = z;
+            best->prim = p; best->verts.assign(v, v + p.vertex_count);
+            if ((best->hist & 0x0f) == 0x5) m_altHalfPrim[i] = 1;   // present now, absent last frame, alternating
+        }
+        for (AltTrack& t : m_tracks) {
+            if (t.matched || (t.hist & 0x0f) != 0xa) continue;          // absent now, present last frame, alternating
+            m_altCarryFirst.push_back(m_altCarryVerts.size());
+            m_altCarryVerts.insert(m_altCarryVerts.end(), t.verts.begin(), t.verts.end());
+            m_altCarry.push_back(t.prim);
+        }
+        m_tracks.erase(std::remove_if(m_tracks.begin(), m_tracks.end(), [](const AltTrack& t) { return (t.hist & 0x0f) == 0; }), m_tracks.end());
+        if (m_tracks.size() > 4096) m_tracks.clear();   // safety: never grow without bound
+        if (m_diagAlt) {
+            static auto last = std::chrono::steady_clock::now();
+            static int frames = 0, halves = 0, carries = 0;
+            ++frames; carries += int(m_altCarry.size());
+            for (uint8_t h : m_altHalfPrim) halves += h;
+            if (std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22ALTFIX frames=%d tracks=%zu half/frame=%.2f carried/frame=%.2f",
+                                                 frames, m_tracks.size(), halves / float(frames), carries / float(frames)));
+                last = std::chrono::steady_clock::now(); frames = halves = carries = 0;
+            }
+        }
+    }
+    bool m_altFix = true;
+    uint64_t m_altSeq = ~0ull;
+    std::vector<AltTrack> m_tracks;
+    std::vector<uint8_t> m_altHalfPrim;
+    std::vector<tcvr_scene_prim> m_altCarry;
+    std::vector<tcvr_scene_vertex> m_altCarryVerts;
+    std::vector<size_t> m_altCarryFirst;
+    // Diagnostic (s22.diagAlt=1): which primitives appear in one arcade frame and not the next? Groups the
+    // primitives by their full render state and logs, every 2 s, the groups whose count differs between
+    // the last two frames. Raw matter for "what is the flashing shadow" - no judgement, all fields printed.
+    void DiagAlternating(const tcvr_scene_frame& f) {
+        if (f.sequence == m_diagSeq) return;
+        m_diagSeq = f.sequence;
+        std::unordered_map<std::string, int> cur;
+        for (uint32_t i = 0; i < f.prim_count; ++i) {
+            const tcvr_scene_prim& p = f.prims[i];
+            char k[256];
+            std::snprintf(k, sizeof(k), "kind%u dir%u nv%u tex%u shade%u pens%u bn%u mask%u fog%u pfade%u rgb%d,%d,%d aen%u a%d apen%u fade%u prio%u",
+                          p.kind, p.direct, p.vertex_count, p.texture_enabled, p.shade_enabled, p.pens_offset, p.bn >> 12, p.penmask,
+                          p.fog_mode, p.pfade_enabled, int(p.poly_r), int(p.poly_g), int(p.poly_b), p.alpha_enabled, p.alpha,
+                          p.alpha_pen, p.fade_enabled, p.prioverchar);
+            ++cur[k];
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_diagPrev.empty() && now - m_diagLast > std::chrono::seconds(2)) {
+            m_diagLast = now;
+            std::vector<std::pair<int, std::string>> diffs;
+            for (const auto& kv : cur) { auto it = m_diagPrev.find(kv.first); const int pv = it == m_diagPrev.end() ? 0 : it->second;
+                if (pv != kv.second) diffs.push_back({kv.second - pv, kv.first + Fmt(" cur=%d prev=%d", kv.second, pv)}); }
+            for (const auto& kv : m_diagPrev) if (!cur.count(kv.first)) diffs.push_back({-kv.second, kv.first + Fmt(" cur=0 prev=%d", kv.second)});
+            std::sort(diffs.begin(), diffs.end(), [](const auto& a, const auto& b) { return std::abs(a.first) > std::abs(b.first); });
+            Log::Write(Log::Level::Info, Fmt("TCVR_S22ALT seq=%llu prims=%u groups=%zu differing=%zu", (unsigned long long)f.sequence, f.prim_count, cur.size(), diffs.size()));
+            for (size_t i = 0; i < diffs.size() && i < 8; ++i) Log::Write(Log::Level::Info, "TCVR_S22ALT   " + diffs[i].second);
+        }
+        m_diagPrev.swap(cur);
+    }
+    bool m_diagAlt = false;
+    uint64_t m_diagSeq = ~0ull;
+    std::unordered_map<std::string, int> m_diagPrev;
+    std::chrono::steady_clock::time_point m_diagLast{};
+private:
+    std::thread m_bankWorker;
+    std::atomic<bool> m_bankCancel{false};
+    std::mutex m_bankMutex;
+    std::vector<std::pair<int, std::vector<uint8_t>>> m_bankQueue;
+    std::vector<std::pair<std::unique_ptr<BufferAndMemory>, uint64_t>> m_bankStaging;
+    uint32_t m_bankReadyMask = 0;
+    uint64_t m_frameCounter = 0;
+    int m_filter = 1;
+    VkSampler m_repeatNearest = VK_NULL_HANDLE;
+public:
 
     // ---- per frame (view 0, after the slot's fence) --------------------------------------------
     // CPU port of SceneRenderer::PrepareFrame, written into this slot's buffers.
@@ -170,6 +434,7 @@ public:
             if (pr.kind == 0 && pr.direct == 0) anyPoly = true;
             if (!m_fogBgValid && pr.fog_mode == 2) { m_fogBg[0] = pr.fog_r; m_fogBg[1] = pr.fog_g; m_fogBg[2] = pr.fog_b; m_fogBgValid = true; }
         }
+        if (m_diagAlt) DiagAlternating(f);
         m_groupCentre.clear();
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
@@ -178,10 +443,14 @@ public:
             for (uint32_t i = 0; i < pr.vertex_count; ++i) { g.x += f.vertices[pr.first_vertex + i].x; g.y += f.vertices[pr.first_vertex + i].y; }
             g.n += float(pr.vertex_count);
         }
+        if (f.sequence != m_altSeq) UpdateAlternation(f);
         float neighbourZoom = 1.0f;
-        for (uint32_t p = 0; p < f.prim_count; ++p) {
-            const tcvr_scene_prim& pr = f.prims[p];
-            if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
+        // One primitive into the draw arrays. `verts` = its own vertices; `half` draws it at 50 % (see
+        // UpdateAlternation). The vertex carries the index of its row in OUR table (not MAME's index).
+        auto emit = [&](const tcvr_scene_prim& pr0, const tcvr_scene_vertex* verts, bool half) {
+            tcvr_scene_prim pr = pr0;
+            if (half) { pr.alpha_enabled = 1; pr.alpha = 128; }
+            const float primIdx = float(m_primData.size() / 64);
             float spriteDepth = 0.0f;
             if (pr.kind == 0 && pr.direct == 0) { neighbourZoom = pr.zoom; if (pr.zoom > 0.0f) m_lastZoom = pr.zoom; }
             float centreX = 0.0f, centreY = 0.0f;
@@ -192,8 +461,8 @@ public:
             }
             const uint32_t base = uint32_t(m_vertexData.size() / 8);
             for (uint32_t i = 0; i < pr.vertex_count; ++i) {
-                const tcvr_scene_vertex& v = f.vertices[pr.first_vertex + i];
-                const float row[8] = {v.x, v.y, v.z, v.u, v.v, v.bri, pr.zoom, float(p)};
+                const tcvr_scene_vertex& v = verts[i];
+                const float row[8] = {v.x, v.y, v.z, v.u, v.v, v.bri, pr.zoom, primIdx};
                 m_vertexData.insert(m_vertexData.end(), row, row + 8);
             }
             const bool hud = pr.kind != 0 || pr.direct != 0;
@@ -220,7 +489,14 @@ public:
                 centreX, centreY, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
             m_primData.insert(m_primData.end(), row, row + 64);
+        };
+        for (uint32_t p = 0; p < f.prim_count; ++p) {
+            const tcvr_scene_prim& pr = f.prims[p];
+            if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
+            emit(pr, f.vertices + pr.first_vertex, m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0);
         }
+        if (m_altFix)
+            for (size_t i = 0; i < m_altCarry.size(); ++i) emit(m_altCarry[i], m_altCarryVerts.data() + m_altCarryFirst[i], true);
         if (!m_runs.empty()) m_runs.back().count = uint32_t(m_indexData.size()) - m_runs.back().first;
         if (m_reorder) ReorderOpaqueFrontToBack();
         m_lastPrims = uint32_t(m_primData.size() / 64);
@@ -285,7 +561,7 @@ public:
         FillCommonUbo(u, nullptr, nullptr, float(m_textW), float(m_textH));
         u.Flags[0] = 0;   // board projection
         std::memcpy(S.uboMap[2], &u, sizeof(u));
-        VkClearValue cv[2]{}; cv[1].depthStencil = {1.0f, 0};
+        VkClearValue cv[2]{}; cv[1].depthStencil = {0.0f, 0};   // reversed depth
         VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         bi.renderPass = m_rpDepth; bi.framebuffer = m_dmFb; bi.renderArea = {{0, 0}, {dw, dh}};
         bi.clearValueCount = 2; bi.pClearValues = cv;
@@ -324,7 +600,7 @@ public:
         std::memcpy(S.uboMap[eye], &u, sizeof(u));
         // ---- S: scene pass
         VkClearValue cv[5]{};
-        cv[2].depthStencil = {1.0f, 0};
+        cv[2].depthStencil = {0.0f, 0};   // reversed depth
         VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         AdvanceTarget(T);
         bi.renderPass = m_rpScene; bi.framebuffer = T.fbs[T.cur]; bi.renderArea = {{0, 0}, {rw, rh}};
@@ -398,7 +674,7 @@ public:
         FillCommonUbo(u, nullptr, nullptr, float(w), float(h));
         std::memcpy(S.uboMap[5], &u, sizeof(u));
         VkClearValue cv[5]{};
-        cv[2].depthStencil = {1.0f, 0};
+        cv[2].depthStencil = {0.0f, 0};   // reversed depth
         VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         AdvanceTarget(T);
         bi.renderPass = m_rpScene; bi.framebuffer = T.fbs[T.cur]; bi.renderArea = {{0, 0}, {w, h}};
@@ -436,6 +712,8 @@ public:
         return true;
     }
     VkImageView FlatView() const { return m_flatOut.view; }
+    VkImage FlatImage() const { return m_flatOut.image; }
+    VkFormat FlatFormat() const { return m_eyeFormat; }
     uint32_t FlatWidth() const { return m_eye[2].w; }
     uint32_t FlatHeight() const { return m_eye[2].h; }
 
@@ -540,6 +818,9 @@ private:
         u.DepthInfo[0] = 0.5f; u.DepthInfo[1] = float(m_dmW); u.DepthInfo[2] = float(m_dmH); u.DepthInfo[3] = m_settings.spriteMinDepth;
         u.Flags[0] = mvp ? 1 : 0; u.Flags[1] = hud ? 1 : 0; u.Flags[2] = mvp ? m_settings.texSamples : 1; u.Flags[3] = m_spritesPerRow;
         u.Sprite[0] = m_spriteW; u.Sprite[1] = m_spriteH;
+        // Scene passes: Sprite.z = decoded pen banks ready (bit per bank), Sprite.w = texture filter
+        // (0 texel-exact like the board, 1 bilinear). The composite overwrites both with its own meaning.
+        u.Sprite[2] = int(m_bankReadyMask); u.Sprite[3] = m_filter;
         if (mvp && m_settings.voidMode == 2) {
             u.Bg[0] = m_settings.voidRGB[0]; u.Bg[1] = m_settings.voidRGB[1]; u.Bg[2] = m_settings.voidRGB[2];
         } else if (mvp && m_settings.voidMode == 1) {
@@ -555,6 +836,7 @@ private:
         u.Mix2[0] = f.mix_alpha_check12 & 0xff; u.Mix2[1] = f.mix_alpha_check13 & 0xff;
         u.FadeColor[0] = unsigned(f.mix_fade_r); u.FadeColor[1] = unsigned(f.mix_fade_g); u.FadeColor[2] = unsigned(f.mix_fade_b);
         u.Bias[0] = (mvp && m_settings.depthTest) ? m_settings.depthBias : 0.0f;
+        u.Bias[3] = m_settings.nearClip;
     }
 
     void BindGeometry(VkCommandBuffer cmd, Slot& S) {
@@ -573,7 +855,7 @@ private:
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = sa; b.dstAccessMask = da; b.oldLayout = from; b.newLayout = to;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
+        b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
 
@@ -593,7 +875,7 @@ private:
         };
         add(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         for (uint32_t i = 1; i <= 7; ++i) add(i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        for (uint32_t i = 8; i <= 15; ++i) add(i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        for (uint32_t i = 8; i <= 16; ++i) add(i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount = uint32_t(b.size()); li.pBindings = b.data();
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_dev, &li, nullptr, &m_setLayout));
@@ -601,7 +883,7 @@ private:
         pli.setLayoutCount = 1; pli.pSetLayouts = &m_setLayout;
         XRC_CHECK_THROW_VKCMD(vkCreatePipelineLayout(m_dev, &pli, nullptr, &m_layout));
         VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
-                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 128}};
+                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 160}};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pi.maxSets = 16; pi.poolSizeCount = 3; pi.pPoolSizes = ps;
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_dev, &pi, nullptr, &m_pool));
@@ -714,8 +996,8 @@ private:
         viScene.vertexAttributeDescriptionCount = 3; viScene.pVertexAttributeDescriptions = ad;
         VkPipelineDepthStencilStateCreateInfo dsOff{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         VkPipelineDepthStencilStateCreateInfo dsTest = dsOff;
-        dsTest.depthTestEnable = VK_TRUE; dsTest.depthWriteEnable = VK_TRUE; dsTest.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-        VkPipelineDepthStencilStateCreateInfo dsLess = dsTest; dsLess.depthCompareOp = VK_COMPARE_OP_LESS;
+        dsTest.depthTestEnable = VK_TRUE; dsTest.depthWriteEnable = VK_TRUE; dsTest.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;   // reversed depth (see s22_scene_vert)
+        VkPipelineDepthStencilStateCreateInfo dsLess = dsTest; dsLess.depthCompareOp = VK_COMPARE_OP_GREATER;
         VkPipelineColorBlendAttachmentState noBlend{}; noBlend.colorWriteMask = 0xf;
         // Scene colour: src*a + dst*(1-a), alpha kept (glBlendFuncSeparate(SRC_ALPHA, 1-SRC_ALPHA, ZERO, ONE)).
         VkPipelineColorBlendAttachmentState sceneBlend{};
@@ -764,18 +1046,23 @@ private:
         XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_nearest));
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
         XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_linear));
+        si.magFilter = si.minFilter = VK_FILTER_NEAREST;   // integer image: gather only, wraps like the 12-bit address
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_dev, &si, nullptr, &m_repeatNearest));
         m_dummyU = NewImage(VK_FORMAT_R8_UINT, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         m_dummyF = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         m_dummyArr = NewImage(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 2);
+        m_dummyU16 = NewImage(VK_FORMAT_R8_UINT, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                               VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         m_dummyPending = true;
     }
 
     Img NewImage(VkFormat fmt, uint32_t w, uint32_t h, VkImageUsageFlags usage, VkSampleCountFlagBits s = VK_SAMPLE_COUNT_1_BIT,
-                 bool transient = false, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, uint32_t layers = 1) {
+                 bool transient = false, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, uint32_t layers = 1, uint32_t mips = 1) {
         Img im;
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {w, h, 1}; ii.mipLevels = 1; ii.arrayLayers = layers;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {w, h, 1}; ii.mipLevels = mips; ii.arrayLayers = layers;
         ii.samples = s; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage | (transient ? VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT : 0);
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         XRC_CHECK_THROW_VKCMD(vkCreateImage(m_dev, &ii, nullptr, &im.image));
@@ -786,7 +1073,7 @@ private:
         XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_dev, im.image, im.mem, 0));
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = im.image; vi.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt;
-        vi.subresourceRange = {aspect, 0, 1, 0, layers};
+        vi.subresourceRange = {aspect, 0, mips, 0, layers};
         XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_dev, &vi, nullptr, &im.view));
         return im;
     }
@@ -816,7 +1103,7 @@ private:
         Barrier(cmd, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         if (m_dummyPending) {   // the dummies ride on the first asset upload
-            for (Img* d : {&m_dummyU, &m_dummyF, &m_dummyArr}) {
+            for (Img* d : {&m_dummyU, &m_dummyF, &m_dummyArr, &m_dummyU16}) {
                 Barrier(cmd, d->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
             }
@@ -909,7 +1196,7 @@ private:
         Log::Write(Log::Level::Info, Fmt("TCVR_S22VK eye target %ux%u MSAA x%d", w, h, int(m_samples)));
     }
     void CreateFlatOut(uint32_t w, uint32_t h) {
-        m_flatOut = NewImage(m_eyeFormat, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        m_flatOut = NewImage(m_eyeFormat, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         fi.renderPass = m_rpComp; fi.attachmentCount = 1; fi.pAttachments = &m_flatOut.view;
         fi.width = w; fi.height = h; fi.layers = 1;
@@ -950,7 +1237,7 @@ private:
                 VkImageView dm = m_dmView ? m_dmView : m_dummyF.view;
                 VkImageView sc = m_eye[eye].color.view ? m_eye[eye].color.view : m_dummyArr.view;
                 VkImageView spv = m_eye[eye].pri.view ? m_eye[eye].pri.view : m_dummyF.view;
-                VkDescriptorImageInfo imgs[8] = {
+                VkDescriptorImageInfo imgs[9] = {
                     {m_nearest, m_tileAtlas.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                     {m_nearest, m_tileMap.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                     {m_nearest, m_tileAttr.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -958,8 +1245,9 @@ private:
                     {m_nearest, m_spriteAtlas.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                     {m_nearest, dm, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                     {m_linear, sc, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                    {m_nearest, spv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-                for (uint32_t b = 0; b < 8; ++b) {
+                    {m_nearest, spv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                    {m_repeatNearest, m_penBanks.view ? m_penBanks.view : m_dummyU16.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+                for (uint32_t b = 0; b < 9; ++b) {
                     VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                     x.dstSet = S.set[k]; x.dstBinding = 8 + b; x.descriptorCount = 1;
                     x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; x.pImageInfo = &imgs[b];
@@ -982,7 +1270,7 @@ private:
     VkRenderPass m_rpDepth = VK_NULL_HANDLE, m_rpScene = VK_NULL_HANDLE, m_rpComp = VK_NULL_HANDLE;
     VkPipeline m_pInit = VK_NULL_HANDLE, m_pScene3D = VK_NULL_HANDLE, m_pP3 = VK_NULL_HANDLE, m_pP3NoAa = VK_NULL_HANDLE, m_pSceneHud = VK_NULL_HANDLE, m_pDepth = VK_NULL_HANDLE, m_pComp = VK_NULL_HANDLE;
     VkSampler m_nearest = VK_NULL_HANDLE, m_linear = VK_NULL_HANDLE;
-    Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dummyArr, m_dmDepth;
+    Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dummyArr, m_dummyU16, m_dmDepth, m_penBanks;
     std::vector<BufferAndMemory> m_stagings;
     int m_spriteW = 1, m_spriteH = 1, m_spritesPerRow = 1;
     Slot m_slots[kFrames];

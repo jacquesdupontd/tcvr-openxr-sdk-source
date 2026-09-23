@@ -1180,6 +1180,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_cmdBuffer[s0 + 1].Clear();
             ReadGpuTimestamps();
             if (m_dumpState == 1 && m_cmdBuffer[m_dumpCb].state != CmdBuffer::CmdBufferState::Executing) WriteDump();
+            FlushOracle();
             m_m2Renderer.SetFrameSlot(int(m_frameSlot));
             if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m_m2SceneRequested = true;
@@ -1260,6 +1261,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     }
                 }
             }
+            if (m_flatDrawn) RecordOracle(cmd, uint32_t(v));
             // Game selector menu: CPU-drawn picture, uploaded when it changed.
             if (arcadexr::ui::Menu::Get().IsOpen()) {
                 if (!m_overlayInit) {
@@ -1671,6 +1673,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             tcvr_scene_assets assets{};
             if (!s22::SceneAssets(assets) || !m_s22.UploadAssets(cmd, assets)) return;
         }
+        m_s22.PumpBanks(cmd);
+        m_s22.SetFilter(arcadexr::config::GetInt("s22.filter", 3));   // 0 texel-exact, 1 bilinear, 2 + index mipmaps, 3 sharp + anisotropic
+        m_s22.SetDiagAlternating(arcadexr::config::GetInt("s22.diagAlt", 0) != 0);
+        m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 1) != 0);
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
         m_s22Prepared = true;
@@ -1715,7 +1721,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.lean = arcadexr::config::GetInt("s22.lean", 1);
         st.skip = arcadexr::config::GetInt("s22.skip", 0);
         st.darkFlicker = arcadexr::profiles::GetInt("temporal.darkFlicker", 0) != 0;
-        st.depthBias = arcadexr::profiles::GetFloat("immersive.depthBias", 4e-8f);
+        st.depthBias = arcadexr::config::GetFloat("s22.depthBiasRel", 2.5e-7f);
+        st.nearClip = nearMetres;
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");
             unsigned r = 0, g = 0, b = 0;
@@ -1787,6 +1794,96 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         vkUnmapMemory(m_vkDevice, m_dumpMem);
         Log::Write(Log::Level::Info, Fmt("TCVR_DUMP wrote %s (%ux%u) %s", path.c_str(), m_dumpW, m_dumpH, f ? "ok" : "FAILED"));
+    }
+
+    // ---- Oracle capture (debug.tcvr.oracle=<tag>), for scripts/port_oracle.py ------------------------
+    // With the scene recorded ALONGSIDE MAME's CPU raster (scene mode 1), the same arcade frame exists
+    // twice: MAME's own rasterised image (the reference) and our GPU module's flat image. For
+    // kOracleFrames consecutive frames we save both, unpaired: MAME publishes its image with a lag
+    // (asynchronous raster), so the host script pairs them by content. Raw files, a descriptor listing
+    // what was written and what was not; no verdict here.
+    static constexpr int kOracleFrames = 16;
+    struct OracleCap { VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; uint32_t cb = 0, w = 0, h = 0, idx = 0; };
+    std::vector<OracleCap> m_oraclePending;
+    std::string m_oracleTag, m_oracleDoneTag;
+    int m_oracleNext = 0;
+    FILE* m_oracleDesc = nullptr;
+    std::string OracleDir() const {
+        const std::string dir = arcadexr::config::ExternalDirectory();
+        return dir.empty() ? std::string("/sdcard/Android/data/io.tcvr2.prototype.vulkan/files") : dir;
+    }
+    void RecordOracle(VkCommandBuffer cmd, uint32_t cb) {
+        if (m_oracleTag.empty()) {
+            const std::string tag = arcadexr::config::GetString("oracle", "0");
+            if (tag.empty() || tag == "0" || tag == m_oracleDoneTag) return;
+            m_oracleTag = tag; m_oracleNext = 0;
+            m_oracleDesc = std::fopen((OracleDir() + "/oracle-" + tag + ".txt").c_str(), "w");
+        }
+        const bool s22 = m_s22FlatWanted && m_s22.FlatImage() != VK_NULL_HANDLE;
+        const VkImage img = s22 ? m_s22.FlatImage() : m_m2Renderer.FlatImage();
+        const VkFormat fmt = s22 ? m_s22.FlatFormat() : m_m2Renderer.FlatFormat();
+        if (img == VK_NULL_HANDLE || m_flatW == 0) return;
+        OracleCap c; c.cb = cb; c.w = m_flatW; c.h = m_flatH; c.idx = uint32_t(m_oracleNext);
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = VkDeviceSize(c.w) * c.h * 4; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(m_vkDevice, &bi, nullptr, &c.buf) != VK_SUCCESS) return;
+        VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(m_vkDevice, c.buf, &req);
+        m_memAllocator.Allocate(req, &c.mem);
+        vkBindBufferMemory(m_vkDevice, c.buf, c.mem, 0);
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy r{}; r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; r.imageExtent = {c.w, c.h, 1};
+        vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.buf, 1, &r);
+        std::swap(b.oldLayout, b.newLayout);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        m_oraclePending.push_back(c);
+        if (m_oracleDesc) std::fprintf(m_oracleDesc, "gpu %u %u %u fmt=%d board=%s\n", c.idx, c.w, c.h, int(fmt), s22 ? "s22" : "m2");
+        // MAME's latest rasterised frame at the same moment (0x00RRGGBB words).
+        arcadexr::video::FrameInfo got;
+        const std::uint32_t* px = arcadexr::video::AcquireLatestFrame(got);
+        if (px && got.width > 0 && got.height > 0) {
+            FILE* f = std::fopen((OracleDir() + Fmt("/oracle-%s-c%u.ppm", m_oracleTag.c_str(), c.idx)).c_str(), "wb");
+            if (f) {
+                std::fprintf(f, "P6\n%d %d\n255\n", got.width, got.height);
+                std::vector<uint8_t> row(size_t(got.width) * 3);
+                for (int y = 0; y < got.height; ++y) {
+                    const std::uint32_t* s = px + size_t(y) * got.stride;
+                    for (int x = 0; x < got.width; ++x) { row[x * 3] = uint8_t(s[x] >> 16); row[x * 3 + 1] = uint8_t(s[x] >> 8); row[x * 3 + 2] = uint8_t(s[x]); }
+                    std::fwrite(row.data(), 1, row.size(), f);
+                }
+                std::fclose(f);
+            }
+            if (m_oracleDesc) std::fprintf(m_oracleDesc, "cpu %u %d %d video_seq=%llu\n", c.idx, got.width, got.height, (unsigned long long)got.sequence);
+        } else if (m_oracleDesc) {
+            std::fprintf(m_oracleDesc, "cpu %u missing (no MAME framebuffer: is the scene recorded in mode 1?)\n", c.idx);
+        }
+        if (++m_oracleNext >= kOracleFrames) { m_oracleDoneTag = m_oracleTag; m_oracleTag.clear(); }
+    }
+    void FlushOracle() {
+        for (auto it = m_oraclePending.begin(); it != m_oraclePending.end();) {
+            if (m_cmdBuffer[it->cb].state == CmdBuffer::CmdBufferState::Executing) { ++it; continue; }
+            void* p = nullptr;
+            if (vkMapMemory(m_vkDevice, it->mem, 0, VkDeviceSize(it->w) * it->h * 4, 0, &p) == VK_SUCCESS) {
+                const std::string name = m_oracleDoneTag.empty() ? m_oracleTag : m_oracleDoneTag;
+                FILE* f = std::fopen((OracleDir() + Fmt("/oracle-%s-g%u.rgba", (m_oracleTag.empty() ? m_oracleDoneTag : m_oracleTag).c_str(), it->idx)).c_str(), "wb");
+                (void)name;
+                if (f) { std::fwrite(p, 1, size_t(it->w) * it->h * 4, f); std::fclose(f); }
+                vkUnmapMemory(m_vkDevice, it->mem);
+            }
+            vkDestroyBuffer(m_vkDevice, it->buf, nullptr); vkFreeMemory(m_vkDevice, it->mem, nullptr);
+            it = m_oraclePending.erase(it);
+        }
+        if (m_oraclePending.empty() && m_oracleTag.empty() && m_oracleDesc) {
+            std::fprintf(m_oracleDesc, "done\n");
+            std::fclose(m_oracleDesc); m_oracleDesc = nullptr;
+            Log::Write(Log::Level::Info, "TCVR_ORACLE done " + m_oracleDoneTag);
+        }
     }
 
     void SetM2SceneMode(int mode) {

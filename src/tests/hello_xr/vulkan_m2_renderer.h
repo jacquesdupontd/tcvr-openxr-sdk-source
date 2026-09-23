@@ -804,6 +804,8 @@ public:
 
     bool HaveMainView() const { return m_haveMainView; }
     VkImageView FlatView() const { return m_flat.view; }
+    VkImage FlatImage() const { return m_flat.image; }
+    VkFormat FlatFormat() const { return m_colorFormat; }
     uint32_t FlatWidth() const { return m_flat.w; }
     uint32_t FlatHeight() const { return m_flat.h; }
 
