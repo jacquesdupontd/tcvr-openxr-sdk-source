@@ -102,7 +102,9 @@ void main() {
                               : aPos;
         vBoard = xs;
         if ((p.rgb & 0x2000000u) != 0u) {
-            // Screen overlay (fade, hit flash): straight to the screen like the cabinet, enlarged over the view.
+            // Screen overlay (fade, hit flash): straight to the screen like the cabinet, enlarged over the view. A
+            // letterbox band (bit 26) is the edge of a screen the headset does not have: not drawn in immersive.
+            if ((p.rgb & 0x4000000u) != 0u && uOverlayK > 1.0) { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); vParam = vec3(0.0); return; }
             vec2 ndc = vec2(xs.x / uViewport.x * 2.0 - 1.0, xs.y / uViewport.y * 2.0 - 1.0) * uOverlayK;
             gl_Position = vec4(ndc, 0.0, 1.0);
             if (uDepthOrder != 0) gl_Position.z = (float(aPrim) + 0.5) / max(uPrimCount, 1.0);

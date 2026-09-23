@@ -392,9 +392,23 @@ public:
                         zmin = std::min(zmin, rv.z); zmax = std::max(zmax, rv.z);
                     }
                     const float fw = float(p.clip_r - p.clip_l + 1), fh = float(p.clip_b - p.clip_t + 1);
-                    if (ok && zmax - zmin <= 0.01f * zmin && x0 <= float(p.clip_l) + 0.05f * fw && x1 >= float(p.clip_r) - 0.05f * fw &&
-                        y0 <= float(p.clip_t) + 0.05f * fh && y1 >= float(p.clip_b) - 0.05f * fh)
+                    const bool facing = ok && zmax - zmin <= 0.01f * zmin;
+                    const bool fullW = x0 <= float(p.clip_l) + 0.05f * fw && x1 >= float(p.clip_r) - 0.05f * fw;
+                    const bool fullH = y0 <= float(p.clip_t) + 0.05f * fh && y1 >= float(p.clip_b) - 0.05f * fh;
+                    // Letterbox strips too (a black band along the top of Virtua Cop's attract floated as a bar):
+                    // full width against the top or bottom edge, or full height against a side.
+                    const bool band = (fullW && y1 - y0 <= 0.25f * fh && (y0 <= float(p.clip_t) + 0.05f * fh || y1 >= float(p.clip_b) - 0.05f * fh)) ||
+                                      (fullH && x1 - x0 <= 0.25f * fw && (x0 <= float(p.clip_l) + 0.05f * fw || x1 >= float(p.clip_r) - 0.05f * fw));
+                    // A band is a letterbox only if it is drawn OVER the scene (near the top of the draw order): a black
+                    // background plate against the bottom edge caught by the same test blacked out a third of the view.
+                    const bool front = k < std::max<std::uint32_t>(8u, n / 20u);
+                    if (facing && ((fullW && fullH) || (band && front))) {
                         q.rgb |= 0x2000000u;
+                        if (!(fullW && fullH)) q.rgb |= 0x4000000u;   // letterbox band: dropped in immersive
+                        if (arcadexr::config::GetInt("m2.overlayDiag", 0) != 0)
+                            Log::Write(Log::Level::Info, Fmt("TCVR_OVERLAYFLAG rank=%u/%u %s box=%.0f,%.0f..%.0f,%.0f clip=%d,%d..%d,%d z=%.2f tex=%u trans=%u cb=%u",
+                                k, n, (fullW && fullH) ? "plein" : "bande", x0, y0, x1, y1, p.clip_l, p.clip_t, p.clip_r, p.clip_b, zmin, p.textured, p.translucent, p.colorbase));
+                    }
                 }
                 m_rawPrims[k] = q;
                 {
