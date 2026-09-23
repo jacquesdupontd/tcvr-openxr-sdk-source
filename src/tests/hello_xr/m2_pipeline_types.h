@@ -61,6 +61,8 @@ struct PlanePushConstants {
     float uOutSize[2];
     int32_t uKeyZero;
     float uUvScaleX;   // content width / texture width: the 2D image is 496 wide in a 512-wide texture
+    float uClipRow;    // > 0: the back layer is not drawn below this board row (ground fill, gun games)
+    float pad2;
 };
 
 }  // namespace arcadexr::vulkan

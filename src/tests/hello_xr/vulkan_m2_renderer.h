@@ -461,6 +461,7 @@ public:
                 m_rawIdx[io++] = idx;
             }
             m_rawIdx.resize(io);
+            GroundProbe(frame, mainCx, mainCy, mainB);
 
             // first_vertex is not read by any shader: it now carries the region slots
             // (main | microtexture << 16) to the vertex stage, which hands them on flat.
@@ -583,6 +584,11 @@ public:
         const float focusY = capF((m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f);
         const float focusX = capF((m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f);
         if (!m_flatMode && viewIndex == 0) { m_aimFocus[0] = focusX; m_aimFocus[1] = focusY; }
+        // Ground fill (gun games): below the game's horizon, the colour of the floor the arcade shows, not its 2D layer.
+        const bool groundFill = !m_flatMode && m_groundProbed &&
+            arcadexr::profiles::GetInt("immersive.groundFill", 0) != 0;   // OFF until the CPU colour chain matches the shader (23/09: blue-grey instead of brown dirt)
+        const float* groundCol = groundFill ? m_groundProbe : m_groundColor;
+        const float clipRow = (groundFill && m_horizonGeo >= 0.0f) ? m_horizonGeo + 2.0f : 0.0f;
 
         float pitchTarget = 0.0f;
         if (arcadexr::config::GetInt("m2.immersivePitch", 1) != 0 && m_haveMainView && m_horizonGeo >= 0.0f) {
@@ -682,7 +688,7 @@ public:
             ubo.uEdgeFade = 0.0f;
             ubo.uHorizonRow = m_horizonGeo;
             ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2];
-            ubo.uGround[0] = m_groundColor[0]; ubo.uGround[1] = m_groundColor[1]; ubo.uGround[2] = m_groundColor[2];
+            ubo.uGround[0] = groundCol[0]; ubo.uGround[1] = groundCol[1]; ubo.uGround[2] = groundCol[2];
             ubo.uAniso = std::max(1, std::min(8, arcadexr::config::GetInt("m2.aniso", 1)));
             ubo.uFilterMode = std::max(0, std::min(5, arcadexr::config::GetInt("m2.filter", 5)));
             ubo.uMipBias = std::max(0, std::min(512, arcadexr::config::GetInt("m2.mipBias", 0)));
@@ -751,7 +757,7 @@ public:
                 VoidPushConstants voidPc{};
                 memcpy(voidPc.uInvMvp, invMvp, sizeof(invMvp));
                 voidPc.uSky[0] = m_voidColor[0]; voidPc.uSky[1] = m_voidColor[1]; voidPc.uSky[2] = m_voidColor[2]; voidPc.uSky[3] = 1.0f;
-                voidPc.uGround[0] = m_groundColor[0]; voidPc.uGround[1] = m_groundColor[1]; voidPc.uGround[2] = m_groundColor[2]; voidPc.uGround[3] = 1.0f;
+                voidPc.uGround[0] = groundCol[0]; voidPc.uGround[1] = groundCol[1]; voidPc.uGround[2] = groundCol[2]; voidPc.uGround[3] = 1.0f;
                 voidPc.uOutSize[0] = outW; voidPc.uOutSize[1] = outH;
     
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_voidPipelineFar : m_voidPipeline));
@@ -766,6 +772,7 @@ public:
                 backPc.uOutSize[0] = outW; backPc.uOutSize[1] = outH;
                 backPc.uKeyZero = 0;
                 backPc.uUvScaleX = m_layerUvScaleX[1];
+                backPc.uClipRow = clipRow;
     
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_planePipelineFar : m_planePipeline));
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[1], 0, nullptr);
@@ -1055,6 +1062,99 @@ public:
         m_regionHasHoles.emplace(key, holes);
         return holes;
     }
+    // Ground colour (23/09, Virtua Cop): below its horizon the arcade always shows its 3D floor, never the 2D
+    // layer behind it. In immersive the floor the game draws ends where its camera stops seeing it, and the 2D
+    // layer showed through (a flat plum area in the desert stage). The ground there takes the colour of the
+    // floor the ARCADE shows at the bottom centre of its screen: the frontmost main-view polygon under that pixel,
+    // averaged through the Model 2 colour chain on the CPU (texel -> lumaram -> palette -> colorxlat -> gamma).
+    void GroundProbe(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy, int32_t mainB) {
+        if (!m_haveMainView || !frame.palram || !frame.colorxlat || !frame.lumaram || !frame.gamma) return;
+        const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
+        const float px = 248.0f, py = float(std::max(0, mainB - 12));
+        const size_t end = std::min<size_t>(m_secIndexStart, m_rawIdx.size());
+        uint32_t best = 0xffffffffu;
+        for (size_t i = 0; i + 2 < end; i += 3) {
+            const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
+            if (rank >= best) continue;
+            float sx[3], sy[3]; bool ok = true;
+            for (int k = 0; k < 3; ++k) {
+                const float* v = &m_rawVerts[size_t(m_rawIdx[i + k]) * 5];
+                if (v[2] <= 1e-3f) { ok = false; break; }
+                sx[k] = fx + v[0] / v[2]; sy[k] = fy - v[1] / v[2];
+            }
+            if (!ok) continue;
+            // Floor only: a nearly horizontal surface in camera space (billboards, effects and walls in front of
+            // the camera cover that pixel too, and were picked first).
+            {
+                const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
+                const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
+                const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
+                const float ffx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, ffy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+                const float e1[3] = {(b[0] - a[0]) / ffx, (b[1] - a[1]) / ffy, b[2] - a[2]};
+                const float e2[3] = {(c[0] - a[0]) / ffx, (c[1] - a[1]) / ffy, c[2] - a[2]};
+                const float nx = e1[1] * e2[2] - e1[2] * e2[1], ny = e1[2] * e2[0] - e1[0] * e2[2], nz = e1[0] * e2[1] - e1[1] * e2[0];
+                const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (len < 1e-9f || std::fabs(ny) < 0.8f * len) continue;
+            }
+            // Degenerate (a quad with a repeated vertex): zero area passes every sign test, skip it.
+            const float area2 = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+            if (std::fabs(area2) < 0.5f) continue;
+            const float d1 = (px - sx[1]) * (sy[0] - sy[1]) - (sx[0] - sx[1]) * (py - sy[1]);
+            const float d2 = (px - sx[2]) * (sy[1] - sy[2]) - (sx[1] - sx[2]) * (py - sy[2]);
+            const float d3 = (px - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (py - sy[0]);
+            const bool neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
+            if (!(neg && pos)) best = rank;
+        }
+        if (best == 0xffffffffu || best >= m_rawPrims.size()) return;
+        const tcvr_m2_prim& p = m_rawPrims[best];
+        auto u16 = [](const uint16_t* t, uint32_t n, uint32_t i) -> uint32_t { return i < n ? t[i] : 0u; };
+        auto shadeCpu = [&](uint32_t luma, float out[3]) {
+            const uint32_t color = u16(frame.palram, frame.palram_entries, p.colorbase + 0x1000u) & 0x7fffu;
+            const uint32_t c[3] = {color & 0x1fu, (color >> 5) & 0x1fu, (color >> 10) & 0x1fu};
+            const uint32_t base[3] = {0x0000u / 2u, 0x4000u / 2u, 0x8000u / 2u};
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t x = u16(frame.colorxlat, frame.colorxlat_entries, base[k] + (c[k] << 8) + luma) & 0xffu;
+                out[k] = float(x < frame.gamma_entries ? frame.gamma[x] : x) / 255.0f;
+            }
+        };
+        float acc[3] = {0, 0, 0}; int n = 0;
+        if ((p.rgb & 0x1000000u) != 0u) {
+            acc[0] = float((p.rgb >> 16) & 0xffu) / 255.0f; acc[1] = float((p.rgb >> 8) & 0xffu) / 255.0f; acc[2] = float(p.rgb & 0xffu) / 255.0f; n = 1;
+        } else if (p.textured == 0u) {
+            shadeCpu(std::min(p.luma >> 2, 0x3fu), acc); n = 1;
+        } else {
+            const uint32_t sh = p.texsheet & 1u, w = p.texwidth, h = p.texheight;
+            if (m_sheetCpu[sh].empty() || w == 0 || h == 0 || w > 2048 || h > 1024) return;
+            const uint32_t ox = (p.texx - 2048u) & 2047u, oy = (p.texy - 1024u) & 1023u;
+            const std::vector<uint8_t>& cpu = m_sheetCpu[sh];
+            for (uint32_t gy = 0; gy < 16; ++gy)
+                for (uint32_t gx = 0; gx < 16; ++gx) {
+                    int x2 = int(ox + (gx * w) / 16), y2 = int(oy + (gy * h) / 16);
+                    if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
+                    const size_t at = size_t(y2) * 1024 + size_t(x2);
+                    if (at >= cpu.size()) continue;
+                    const uint32_t texel = cpu[at];
+                    if (p.translucent != 0u && texel == 15u) continue;
+                    const uint32_t t8 = texel << 4;
+                    const uint32_t li = p.lumabase + (t8 >> 1);
+                    const uint32_t lr = li < frame.lumaram_entries ? frame.lumaram[li] : 0u;
+                    float c[3]; shadeCpu(std::min((lr * p.luma) / 256u, 0x3fu), c);
+                    acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2]; ++n;
+                }
+        }
+        if (n == 0) return;
+        const float a = m_groundProbed ? 0.15f : 1.0f;   // settle quickly, then follow the stage smoothly
+        for (int k = 0; k < 3; ++k) m_groundProbe[k] += (acc[k] / float(n) - m_groundProbe[k]) * a;
+        m_groundProbed = true;
+        if ((++m_groundLogTick % 120u) == 0u)
+            Log::Write(Log::Level::Info, Fmt("TCVR_GROUND rank=%u/%zu tex=%u trans=%u sheet=%u xy=%u,%u wh=%ux%u cb=%u lb=%u luma=%u n=%d -> %.2f %.2f %.2f",
+                best, m_rawPrims.size(), p.textured, p.translucent, p.texsheet, p.texx, p.texy, p.texwidth, p.texheight, p.colorbase, p.lumabase, p.luma, n,
+                m_groundProbe[0], m_groundProbe[1], m_groundProbe[2]));
+    }
+    unsigned m_groundLogTick = 0;
+    float m_groundProbe[3] = {0.18f, 0.16f, 0.14f};
+    bool m_groundProbed = false;
+
     bool HasGeometry() const { return m_initialized && m_opaqueIndexCount > 0; }
     bool IsMsaa() const { return m_samples != VK_SAMPLE_COUNT_1_BIT; }
 

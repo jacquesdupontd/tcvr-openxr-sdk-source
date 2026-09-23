@@ -10,6 +10,8 @@ layout(push_constant) uniform PlanePushConstants {
     vec2 uOutSize;
     int uKeyZero;
     float uUvScaleX;   // 496/512: only the arcade's columns (the texture's last 16 are empty; they drew black bands, 23/09)
+    float uClipRow;    // > 0: back layer cut below this board row, the ground colour shows there (gun games)
+    float pad2;
 };
 
 void main_body() {
@@ -31,6 +33,7 @@ void main_body() {
     // first empty (black) column -- a thin dark line at every mirror seam of the sky.
     float halfTexel = 0.5 / float(textureSize(uLayer, 0).x);
     uv.x = clamp(uv.x * uUvScaleX, halfTexel, uUvScaleX - halfTexel);
+    if (uClipRow > 0.0 && uKeyZero == 0 && uv.y * 384.0 > uClipRow) discard;
     vec4 c = texture(uLayer, uv);
     if (uKeyZero != 0) {
         float a = clamp(c.a, 0.0, 1.0);
