@@ -1654,7 +1654,8 @@ struct OpenXrProgram : IOpenXrProgram {
             if (arcadexr::video::GetVirtualScreen(scr)) {
                 const float dist = std::max(0.25f, arcadexr::config::GetFloat("screen.distance", 2.0f));
                 const XrVector3f cam{scr.center.x + scr.normal.x * dist, scr.center.y + scr.normal.y * dist, scr.center.z + scr.normal.z * dist};
-                const float yaw = std::atan2(scr.normal.x, scr.normal.z);   // look along -normal
+                // xr.lockYaw (degrees): turn the fixed head, to look at the sides and back on the bench
+                const float yaw = std::atan2(scr.normal.x, scr.normal.z) + arcadexr::config::GetFloat("xr.lockYaw", 0.0f) * 0.0174533f;
                 const XrQuaternionf q{0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
                 for (uint32_t i = 0; i < viewCountOutput; ++i) {
                     const float side = (i == 0 ? -0.032f : 0.032f);

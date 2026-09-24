@@ -338,9 +338,10 @@ public:
                     const float med = zs[zs.size() / 2];
                     const float zmax = *std::max_element(zs.begin(), zs.end());
                     farZ = (zmax > 3.0f * med) ? 0.4f * zmax : 1e30f;
-                    // Pop-in fade depth: where the bulk of the scenery ends (90th percentile), not the farthest mountain.
-                    std::nth_element(zs.begin(), zs.begin() + (zs.size() * 9) / 10, zs.end());
-                    const float z90 = zs[(zs.size() * 9) / 10];
+                    // Pop-in fade depth: where the scenery ends (99th percentile). The 90th with a fade from 70 % washed the
+                    // far forest into the sky and read as a SHORT draw distance (24/09); now only the last metres fade.
+                    std::nth_element(zs.begin(), zs.begin() + (zs.size() * 99) / 100, zs.end());
+                    const float z90 = zs[(zs.size() * 99) / 100];
                     m_zMaxSmooth = (m_zMaxSmooth > 0.0f) ? m_zMaxSmooth + (z90 - m_zMaxSmooth) * 0.05f : z90;
                 } else {
                     farZ = 1e30f;

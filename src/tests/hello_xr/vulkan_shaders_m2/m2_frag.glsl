@@ -756,7 +756,7 @@ void main() {
     // Pop-in fade (24/09, like Wanszai's PC port of Virtua Racing): the scenery the game only sends within its
     // draw distance fades in from the sky's haze instead of popping up. uSky = the sky just above the horizon.
     if (uFogFar > 0.0 && uImmersive != 0 && vSecondary == 0u) {
-        float f = smoothstep(0.7 * uFogFar, uFogFar, vParam.z);
+        float f = smoothstep(0.85 * uFogFar, uFogFar, vParam.z);
         oColor.rgb = mix(oColor.rgb, uSky, f);
     }
     vec3 d = clamp(oColor.rgb, 0.0, 1.0);
