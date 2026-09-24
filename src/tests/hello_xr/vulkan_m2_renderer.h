@@ -634,7 +634,8 @@ public:
             }
         }
         UploadColourChain(frame);
-        const bool texChanged = UploadTextures(frame, cmd);
+        const bool texChanged = UploadTextures(frame, cmd) == 1;
+        m_regions.ProcessRefills(m_sheetCpu);   // regions whose texels a partial update rewrote
         if (texChanged && !reuse) {
             // Rare (course / menu load): the regions were chosen on the old sheets -> rebuild. (Not on a reused
             // frame: its polygons still point at the current regions; the next built frame rebuilds.)
@@ -2331,8 +2332,9 @@ private:
         }
     }
 
-    bool UploadTextures(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
-        if (!frame.textureram[0] || !frame.textureram[1] || frame.textureram_words == 0) return false;
+    // 0 = unchanged, 1 = full upload (regions must be rebuilt), 2 = partial update done in place.
+    int UploadTextures(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
+        if (!frame.textureram[0] || !frame.textureram[1] || frame.textureram_words == 0) return 0;
 
         // Model 2B (Sega Rally) does not update dirty_generation.
         // Fingerprint both sheets using FNV-1a hash (sampling every 4 words)
@@ -2353,7 +2355,100 @@ private:
         }
 
         const bool needsUpload = !m_texturesUploaded || hashChanged;
-        if (!needsUpload) return false;
+        if (!needsUpload) return 0;
+
+        // Partial update (24/09): Super GT 24h rewrites a few 4 KB blocks of texture RAM every frame (Model 2B/2C
+        // texture RAM is plain shared RAM: no write handler, no dirty marks). A full upload + every region dropped +
+        // the frame rebuilt cost ~35 ms a frame (30-40 fps in the headset). Compare with the previous copy block
+        // by block; up to a quarter of the blocks changed -> only those rows go up, only the regions reading them
+        // are re-filled. More (a course / menu load) -> the full path below.
+        const uint32_t totalWords = std::min(frame.textureram_words, 524288u);
+        if (m_texturesUploaded && m_texShadow[0].size() == totalWords && m_texShadow[1].size() == totalWords) {
+            constexpr uint32_t kBlock = 1024;   // words: 8 rows of the 1024-texel sheet
+            std::vector<uint32_t> dirty[2];
+            size_t nDirty = 0;
+            for (int sheet = 0; sheet < 2; ++sheet)
+                for (uint32_t b = 0; b * kBlock < totalWords; ++b) {
+                    const uint32_t n = std::min(kBlock, totalWords - b * kBlock);
+                    if (std::memcmp(frame.textureram[sheet] + b * kBlock, m_texShadow[sheet].data() + b * kBlock, n * 4) != 0) {
+                        dirty[sheet].push_back(b); ++nDirty;
+                    }
+                }
+            const size_t nBlocks = 2 * ((totalWords + kBlock - 1) / kBlock);
+            if (nDirty == 0) return 0;
+            if (nDirty * 4 <= nBlocks) {
+                for (int sheet = 0; sheet < 2; ++sheet) {
+                    if (dirty[sheet].empty()) continue;
+                    const uint32_t* words = frame.textureram[sheet];
+                    std::vector<uint8_t>& cpu = m_sheetCpu[sheet];
+                    uint8_t* dst = reinterpret_cast<uint8_t*>(m_sheetStagingMapped[sheet]);
+                    uint8_t* cut = reinterpret_cast<uint8_t*>(m_sheetStagingMapped[sheet + 2]);
+                    std::vector<uint8_t> rowDirty(4096, 0);
+                    for (uint32_t b : dirty[sheet]) {
+                        const uint32_t w0 = b * kBlock, w1 = std::min(totalWords, w0 + kBlock);
+                        std::memcpy(m_texShadow[sheet].data() + w0, words + w0, size_t(w1 - w0) * 4);
+                        for (uint32_t word_idx = w0; word_idx < w1; ++word_idx) {
+                            const uint32_t w = words[word_idx];
+                            for (uint32_t half = 0; half < 2; ++half) {
+                                const uint32_t off = word_idx * 2 + half;
+                                const uint32_t x0 = (off % 512) * 2, y0 = (off / 512) * 2;
+                                const uint32_t hw = (w >> (16 * half)) & 0xffff;
+                                cpu[y0 * 1024 + x0] = (hw >> 12) & 0xf;
+                                cpu[y0 * 1024 + x0 + 1] = (hw >> 8) & 0xf;
+                                cpu[(y0 + 1) * 1024 + x0] = (hw >> 4) & 0xf;
+                                cpu[(y0 + 1) * 1024 + x0 + 1] = hw & 0xf;
+                            }
+                        }
+                        for (uint32_t row = b * 8; row < b * 8 + 8 && row < 4096; ++row) {
+                            rowDirty[row] = 1;
+                            for (uint32_t x = 0; x < 1024; ++x) {
+                                const size_t i = size_t(row) * 1024 + x;
+                                const uint8_t t = cpu[i];
+                                dst[i] = uint8_t(t * 17);
+                                cut[2 * i] = (t == 15) ? 0 : uint8_t(t * 17);
+                                cut[2 * i + 1] = (t == 15) ? 0 : 255;
+                            }
+                        }
+                    }
+                    for (int img = sheet; img < 4; img += 2) {
+                        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                        barrier.oldLayout = m_sheetLayout[img];
+                        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                        barrier.image = m_sheetImage[img];
+                        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+                        const size_t bpp = (img >= 2) ? 2 : 1;
+                        for (size_t k = 0; k < dirty[sheet].size();) {   // one copy per run of contiguous blocks
+                            size_t e = k + 1;
+                            while (e < dirty[sheet].size() && dirty[sheet][e] == dirty[sheet][e - 1] + 1) ++e;
+                            const uint32_t r0 = dirty[sheet][k] * 8, r1 = std::min(4096u, (dirty[sheet][e - 1] + 1) * 8);
+                            VkBufferImageCopy region{};
+                            region.bufferOffset = VkDeviceSize(r0) * 1024 * bpp;
+                            region.bufferRowLength = 1024;
+                            region.bufferImageHeight = r1 - r0;
+                            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                            region.imageOffset = {0, int32_t(r0), 0};
+                            region.imageExtent = {1024, r1 - r0, 1};
+                            vkCmdCopyBufferToImage(cmd, m_sheetStagingBuffer[img].buf, m_sheetImage[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                            k = e;
+                        }
+                        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+                        m_sheetLayout[img] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    }
+                    m_regions.InvalidateRows(uint32_t(sheet), rowDirty);
+                }
+                m_regionHasHoles.clear();
+                if ((++m_partialTexLog % 120u) == 0u)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_M2VK partial texture update: %zu of %zu blocks", nDirty, nBlocks));
+                return 2;
+            }
+        }
 
         // The sheet staging buffers are shared by both frame slots: let any in-flight copy finish (rare: loads).
         if (m_texturesUploaded) vkDeviceWaitIdle(m_vkDevice);
@@ -2413,10 +2508,12 @@ private:
             m_sheetLayout[img] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             }
         }
+        for (int sheet = 0; sheet < 2; ++sheet)
+            m_texShadow[sheet].assign(frame.textureram[sheet], frame.textureram[sheet] + totalWords);
         m_texturesUploaded = true;
         m_sheetGeneration = frame.dirty_generation;
         m_regionHasHoles.clear();
-        return true;
+        return 1;
     }
 
     void UploadLayers(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
@@ -2965,6 +3062,8 @@ private:
     std::unordered_map<uint64_t, bool> m_regionHasHoles;      // region key -> contains texel 15
     uint64_t m_sheetGeneration = 0;
     uint64_t m_texHash = 0;
+    std::vector<uint32_t> m_texShadow[2];   // texture RAM as last uploaded (partial updates)
+    uint32_t m_partialTexLog = 0;
     bool m_texturesUploaded = false;
 
     VkImage m_layerImage[2] = {};

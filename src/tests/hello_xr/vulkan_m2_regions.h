@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 #include <unordered_map>
 #include <vector>
+#include <set>
 #include <string>
 #include <cstdio>
 #include <cstring>
@@ -116,6 +117,7 @@ public:
         m_pendingLayers.clear();
         m_pending.clear();
         m_dirtySlots.clear();
+        m_refillSlots.clear(); m_refillLayers.clear();
         m_resetDescriptors = true;
         m_stagingUsed = 0;
         m_lutPending = false;
@@ -199,6 +201,64 @@ public:
         return layer;
     }
     uint32_t LayerCount() const { return m_layerCount; }
+
+    // ---- Partial texture updates (24/09, Super GT 24h rewrites a few texture blocks EVERY frame; clearing all
+    // regions and rebuilding the frame each time cost ~35 ms). The regions and layers that read a rewritten row
+    // are re-filled in place, in the staging budget of this frame; the rest waits for the next frame.
+    void InvalidateRows(uint32_t sheet, const std::vector<uint8_t>& rowDirty) {
+        auto touches = [&](uint64_t key) {
+            if (((key >> 60) & 1u) != (sheet & 1u)) return false;
+            const uint32_t ox = uint32_t(key >> 44) & 0xffffu, oy = uint32_t(key >> 28) & 0xffffu;
+            const uint32_t w = uint32_t(key >> 14) & 0x3fffu, h = uint32_t(key) & 0x3fffu;
+            for (uint32_t y = oy; y < oy + h; ++y) {
+                if (ox < 1024 && y < rowDirty.size() && rowDirty[y]) return true;
+                if (ox + w > 1024 && (y ^ 1024u) < rowDirty.size() && rowDirty[y ^ 1024u]) return true;
+            }
+            return false;
+        };
+        for (const auto& kv : m_map) if (touches(kv.first)) m_refillSlots.insert(kv.first);
+        for (const auto& kv : m_layerMap) if (touches(kv.first)) m_refillLayers.insert(kv.first);
+    }
+    void ProcessRefills(const std::vector<uint8_t>* sheets) {
+        auto decode = [](uint64_t key, uint32_t& sh, uint32_t& ox, uint32_t& oy, uint32_t& w, uint32_t& h) {
+            sh = uint32_t(key >> 60) & 1u; ox = uint32_t(key >> 44) & 0xffffu; oy = uint32_t(key >> 28) & 0xffffu;
+            w = uint32_t(key >> 14) & 0x3fffu; h = uint32_t(key) & 0x3fffu;
+        };
+        auto texel = [](const std::vector<uint8_t>& cpu, uint32_t ox, uint32_t oy, uint32_t x, uint32_t y, uint8_t* px) {
+            int x2 = int(ox + x), y2 = int(oy + y);
+            if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
+            const size_t at = size_t(y2) * 1024 + size_t(x2);
+            const uint8_t t = at < cpu.size() ? cpu[at] : 0;
+            const bool opaque = t != 15;
+            px[0] = uint8_t(t * 17); px[1] = opaque ? uint8_t(t * 17) : 0; px[2] = opaque ? 255 : 0; px[3] = 255;
+        };
+        for (auto it = m_refillLayers.begin(); it != m_refillLayers.end();) {
+            auto lm = m_layerMap.find(*it);
+            if (lm == m_layerMap.end()) { it = m_refillLayers.erase(it); continue; }
+            const size_t bytes = size_t(kLayerSize) * kLayerSize * 4;
+            if (m_stagingUsed + bytes > kHalfBytes) break;
+            uint32_t sh, ox, oy, w, h; decode(*it, sh, ox, oy, w, h);
+            uint8_t* dst = m_stagingPtr + Base() + m_stagingUsed;
+            for (uint32_t y = 0; y < kLayerSize; ++y)
+                for (uint32_t x = 0; x < kLayerSize; ++x) texel(sheets[sh], ox, oy, x % w, y % h, dst + (size_t(y) * kLayerSize + x) * 4);
+            m_pendingLayers.push_back({lm->second, Base() + m_stagingUsed});
+            m_stagingUsed += bytes;
+            it = m_refillLayers.erase(it);
+        }
+        for (auto it = m_refillSlots.begin(); it != m_refillSlots.end();) {
+            auto sm = m_map.find(*it);
+            if (sm == m_map.end()) { it = m_refillSlots.erase(it); continue; }
+            uint32_t sh, ox, oy, w, h; decode(*it, sh, ox, oy, w, h);
+            const size_t bytes = size_t(w) * h * 4;
+            if (m_stagingUsed + bytes > kHalfBytes) break;
+            uint8_t* dst = m_stagingPtr + Base() + m_stagingUsed;
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x) texel(sheets[sh], ox, oy, x, y, dst + (size_t(y) * w + x) * 4);
+            m_pending.push_back({sm->second, Base() + m_stagingUsed});
+            m_stagingUsed += (bytes + 255) & ~size_t(255);
+            it = m_refillSlots.erase(it);
+        }
+    }
 
     // Debug readback: level 0 of one region present BOTH as a layer and as its own image, copied to a
     // host buffer (layer 256x256 then image w x h). Call RecordReadback(cmd) then, after the fence,
@@ -544,6 +604,7 @@ private:
     std::unordered_map<uint64_t, uint32_t> m_map;
     std::vector<Pending> m_pending;
     std::vector<uint32_t> m_dirtySlots;
+    std::set<uint64_t> m_refillSlots, m_refillLayers;
     bool m_resetDescriptors = true;
     uint32_t m_created = 0;
 };
