@@ -290,6 +290,11 @@ public:
                 if (k == n && n < 8) keys[n++] = {p.clip_l, p.clip_t, p.clip_r, p.clip_b, p.center_x, p.center_y, 0};
                 if (k < n) keys[k].prims++;
             }
+            if (arcadexr::config::GetInt("m2.viewDiag", 0) != 0 && (++m_viewDiagTick % 120u) == 0u)
+                for (unsigned k = 0; k < n; ++k)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_VIEWS %u/%u clip=%d,%d..%d,%d centre screen=%d,%d prims=%u", k, n,
+                        keys[k].l, keys[k].t, keys[k].r, keys[k].b, frame.crtc_xoffset + keys[k].cx, (384 - keys[k].cy) + frame.crtc_yoffset, keys[k].prims));
+            m_mainLike.clear();
             const std::int64_t halfScreen = std::int64_t(496) * std::int64_t(384) / 2;
             for (unsigned k = 0; k < n; ++k) {
                 const std::int64_t area = std::int64_t(keys[k].r - keys[k].l + 1) * std::int64_t(keys[k].b - keys[k].t + 1);
@@ -297,6 +302,7 @@ public:
                 const int sy = (384 - keys[k].cy) + frame.crtc_yoffset;
                 const bool centred = std::abs(sx - 496 / 2) <= 496 / 8 && std::abs(sy - 384 / 2) <= 384 / 8;
                 if (area < halfScreen || !centred) continue;
+                if (m_mainLike.size() < 8) m_mainLike.push_back({keys[k].l, keys[k].t, keys[k].r, keys[k].b, keys[k].cx, keys[k].cy});
                 if (area > bestArea || (area == bestArea && keys[k].prims > bestPrims)) {
                     bestArea = area; bestPrims = keys[k].prims;
                     mainL = keys[k].l; mainT = keys[k].t; mainR = keys[k].r; mainB = keys[k].b;
@@ -490,6 +496,19 @@ public:
                     m_rawPrimOfVertex[vo + v] = k;
                 }
 
+                // Every full-screen, centred view is the main camera in immersive (25/09, Top Skater: its backdrop
+                // uses the same window with the projection centre 10 px lower; drawn as a flat secondary view, its
+                // few full-screen polygons cost 27 ms of GPU). The vertices are eye space: the centre does not place
+                // them in 3D, so they take the main view's centre and window.
+                if (!m_flatMode && m_haveMainView && !(q.center_x == mainCx && q.center_y == mainCy))
+                    for (const auto& ml : m_mainLike)
+                        if (q.center_x == ml.cx && q.center_y == ml.cy && q.clip_l == ml.l && q.clip_t == ml.t &&
+                            q.clip_r == ml.r && q.clip_b == ml.b) {
+                            q.center_x = mainCx; q.center_y = mainCy;
+                            q.clip_l = mainL; q.clip_t = mainT; q.clip_r = mainR; q.clip_b = mainB;
+                            m_rawPrims[k] = q;   // the GPU reads the copy
+                            break;
+                        }
                 const bool isGlass = (q.checker != 0u);
                 const bool isMain = q.center_x == mainCx && q.center_y == mainCy &&
                                     std::abs(q.clip_l - mainL) <= 2 && std::abs(q.clip_t - mainT) <= 2 &&
@@ -2723,7 +2742,10 @@ private:
     VkPipeline m_voidPipelineFar = VK_NULL_HANDLE;
     VkPipeline m_planePipelineFar = VK_NULL_HANDLE;
     uint32_t m_fastIndexCount = 0;
-    uint32_t m_leanIndexCount = 0;   // [0, lean) lean shader; [lean, fast) full shader (no region image nor layer)
+    uint32_t m_leanIndexCount = 0;
+    uint32_t m_viewDiagTick = 0;
+    struct MainLike { std::int32_t l, t, r, b, cx, cy; };
+    std::vector<MainLike> m_mainLike;   // full-screen, centred views of this frame (main camera candidates)   // [0, lean) lean shader; [lean, fast) full shader (no region image nor layer)
 
     VkPipeline m_voidPipeline = VK_NULL_HANDLE;
     VkPipeline m_planePipeline = VK_NULL_HANDLE;
