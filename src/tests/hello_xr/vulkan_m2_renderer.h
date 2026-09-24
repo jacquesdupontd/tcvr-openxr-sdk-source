@@ -2786,6 +2786,31 @@ private:
         std::vector<const MotionQuad*> bqs;
         std::vector<float> own;   // per quad: own motion on screen (x, y)
         size_t rigidQuads = 0;
+        // Pass 1: each matched object's own mean motion (raw space, camera removed) and every object's centroid.
+        // An UNMATCHED object borrows the motion of the nearest matched one: the game swaps wheel models every frame
+        // to spin them, so a wheel never finds itself and, taken as static scenery, slid away from its car.
+        std::vector<float> objOwn(curObjs.size() * 3, 0.0f), objC(curObjs.size() * 3, 0.0f);
+        std::vector<char> objHasOwn(curObjs.size(), 0);
+        for (uint32_t o = 0; o < curObjs.size(); ++o) {
+            const uint32_t n = curObjs[o].second - curObjs[o].first;
+            for (uint32_t i = 0; i < n; ++i)
+                for (int c = 0; c < 3; ++c) objC[o * 3 + c] += m_curQuads[curOrder[curObjs[o].first + i]].c[c] / float(n);
+            if (curTaken[o] < 0) continue;
+            const auto& lr = lastObjs[uint32_t(curTaken[o])];
+            uint32_t nm = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
+                for (uint32_t k = lr.first; k < lr.second; ++k)
+                    if (m_lastQuads[lastOrder[k]].key == cq.key) {
+                        float moved[3]; apply(m_lastQuads[lastOrder[k]].c, moved);
+                        for (int c = 0; c < 3; ++c) objOwn[o * 3 + c] += cq.c[c] - moved[c];
+                        ++nm;
+                        break;
+                    }
+            }
+            if (nm) { for (int c = 0; c < 3; ++c) objOwn[o * 3 + c] /= float(nm); objHasOwn[o] = 1; }
+        }
+        size_t borrowed = 0;
         for (uint32_t o = 0; o < curObjs.size(); ++o) {
             const uint32_t n = curObjs[o].second - curObjs[o].first;
             bqs.assign(n, nullptr);
@@ -2808,6 +2833,19 @@ private:
                 }
             }
             if (nm) { meanOwn[0] /= nm; meanOwn[1] /= nm; for (int c = 0; c < 3; ++c) meanRaw[c] /= nm; }
+            bool borrow = false;
+            if (!nm) {   // nearest matched object, on screen and in depth, within 48 (pixels + depth %)
+                float bestD = 48.0f; int32_t bo = -1;
+                for (uint32_t o2 = 0; o2 < curObjs.size(); ++o2) {
+                    if (!objHasOwn[o2]) continue;
+                    const float d = dist1(&objC[o2 * 3], &objC[o * 3]);
+                    if (d < bestD) { bestD = d; bo = int32_t(o2); }
+                }
+                if (bo >= 0) { for (int c = 0; c < 3; ++c) meanRaw[c] = objOwn[size_t(bo) * 3 + c]; borrow = true; ++borrowed; }
+                if (diag && (m_motionDiagTick % 8u) == 7u)
+                    __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION", "unmatched obj n=%u c=(%.0f %.0f %.1f) nearest=%.1f",
+                                        curObjs[o].second - curObjs[o].first, objC[o * 3], objC[o * 3 + 1], objC[o * 3 + 2], bestD);
+            }
             const float ownLen = std::sqrt(meanOwn[0] * meanOwn[0] + meanOwn[1] * meanOwn[1]);
             for (uint32_t i = 0; i < n; ++i) {
                 const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
@@ -2817,6 +2855,7 @@ private:
                     const float dx = own[i * 2] - meanOwn[0], dy = own[i * 2 + 1] - meanOwn[1];
                     rigid = std::sqrt(dx * dx + dy * dy) > 2.0f + 0.25f * ownLen;
                 }
+                if (!bq && (borrow || nm)) rigid = true;   // a facet with no partner follows its object
                 if (bq && !rigid) {
                     ++matchedQuads;
                     for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
@@ -2838,22 +2877,31 @@ private:
                 }
             }
         }
-        // A vertex whose previous place is behind or at the eye, or far away on screen, is not blended: a straight
-        // line through z <= 0 projects to infinity and draws a triangle across the whole view (Guillaume, 24/09:
-        // "lignes bleues sur toute la largeur au niveau de ma voiture").
+        // Whole quads only: a quad blended at some corners and not at others tears into slivers (the grass under
+        // the car in green shards, 24/09 -- a per-vertex guard did that). Crossing z = 0 is fine: the GPU clips in
+        // homogeneous space. A matched quad whose own motion (camera removed) exceeds 64 screen pixels is a bad
+        // match: it follows the camera instead, as static scenery.
         size_t guarded = 0;
-        for (size_t v = 0; v < nv; ++v) {
-            float* o4 = &m_prevPosCpu[v * 4];
-            if (o4[3] < 0.5f) continue;
-            const float* d = &m_rawVerts[v * 5];
-            bool bad = o4[2] * d[2] <= 0.0f || std::fabs(o4[2]) < 1.0f || std::fabs(d[2]) < 1.0f;
-            if (!bad) {
-                const float sx = o4[0] / o4[2] - d[0] / d[2], sy = o4[1] / o4[2] - d[1] / d[2];
-                bad = sx * sx + sy * sy > 64.0f * 64.0f;
+        for (const MotionQuad& cq : m_curQuads) {
+            bool all = true;
+            for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) all = all && m_prevPosCpu[size_t(v) * 4 + 3] > 0.5f;
+            if (!all) { for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) m_prevPosCpu[size_t(v) * 4 + 3] = 0.0f; continue; }
+            if (!fitOk) continue;
+            float pc[3] = {0, 0, 0}, sc[3];
+            for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v)
+                for (int c = 0; c < 3; ++c) pc[c] += m_prevPosCpu[size_t(v) * 4 + c] / float(cq.n);
+            for (int r = 0; r < 3; ++r) sc[r] = Ai[r * 4] * cq.c[0] + Ai[r * 4 + 1] * cq.c[1] + Ai[r * 4 + 2] * cq.c[2] + Ai[r * 4 + 3];
+            if (pc[2] <= 1.0f || sc[2] <= 1.0f) continue;
+            const float dx = pc[0] / pc[2] - sc[0] / sc[2], dy = pc[1] / pc[2] - sc[1] / sc[2];
+            if (dx * dx + dy * dy <= 64.0f * 64.0f) continue;
+            ++guarded;
+            for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
+                const float* d = &m_rawVerts[size_t(v) * 5];
+                float* o4 = &m_prevPosCpu[size_t(v) * 4];
+                for (int r = 0; r < 3; ++r) o4[r] = Ai[r * 4] * d[0] + Ai[r * 4 + 1] * d[1] + Ai[r * 4 + 2] * d[2] + Ai[r * 4 + 3];
             }
-            if (bad) { o4[3] = 0.0f; ++guarded; }
         }
-        if (diag && (m_motionDiagTick % 8u) == 7u) __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION", "guarded vertices=%zu", guarded);
+        if (diag && (m_motionDiagTick % 8u) == 7u) __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION", "guarded quads=%zu", guarded);
         // A camera cut (replay angles, attract mode): almost nothing matches -> no blend for this step at all,
         // or the whole scene would sweep from the old shot to the new one.
         if (matchedQuads * 10 < m_curQuads.size() * 3) {
@@ -2867,8 +2915,8 @@ private:
                 fitErr[fitErr.size() / 2], fitErr[fitErr.size() * 9 / 10], fitErr[fitErr.size() * 99 / 100]);
             auto pc = [&](float f) { return rel.empty() ? -1.0f : rel[std::min(rel.size() - 1, size_t(f * rel.size()))]; };
             __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION",
-                                "quads=%zu last=%zu pairs=%zu fitMedRes=%.3f T=(%.2f %.2f %.2f) matched=%zu static=%zu rigid=%zu | screen motion px p50=%.4f p90=%.4f p99=%.4f max=%.4f | period=%.1fms",
-                                m_curQuads.size(), m_lastQuads.size(), m_motionPairs.size(), medRes, T[0], T[1], T[2], matchedQuads, staticQuads, rigidQuads,
+                                "quads=%zu last=%zu pairs=%zu fitMedRes=%.3f T=(%.2f %.2f %.2f) matched=%zu static=%zu rigid=%zu borrowedObjs=%zu | screen motion px p50=%.4f p90=%.4f p99=%.4f max=%.4f | period=%.1fms",
+                                m_curQuads.size(), m_lastQuads.size(), m_motionPairs.size(), medRes, T[0], T[1], T[2], matchedQuads, staticQuads, rigidQuads, borrowed,
                                 pc(0.5f), pc(0.9f), pc(0.99f), rel.empty() ? -1.0f : rel.back(), m_stepPeriod * 1000.0f);
         }
         m_lastQuads.swap(m_curQuads);
