@@ -118,6 +118,7 @@ public:
         m_pending.clear();
         m_dirtySlots.clear();
         m_refillSlots.clear(); m_refillLayers.clear();
+        m_hash.clear();
         m_resetDescriptors = true;
         m_stagingUsed = 0;
         m_lutPending = false;
@@ -155,6 +156,7 @@ public:
         const uint32_t slot = uint32_t(m_slots.size());
         m_slots.push_back(e);
         m_map.emplace(key, slot);
+        m_hash[key] = RegionHash(cpu, ox, oy, w, h);
         m_pending.push_back({slot, Base() + m_stagingUsed});
         m_dirtySlots.push_back(slot);
         m_stagingUsed += (bytes + 255) & ~size_t(255);
@@ -196,6 +198,7 @@ public:
             }
         const uint32_t layer = m_layerCount++;
         m_layerMap.emplace(key, layer);
+        m_hash[key] = RegionHash(cpu, ox, oy, w, h);
         m_pendingLayers.push_back({layer, Base() + m_stagingUsed});
         m_stagingUsed += bytes;
         return layer;
@@ -219,6 +222,55 @@ public:
         for (const auto& kv : m_map) if (touches(kv.first)) m_refillSlots.insert(kv.first);
         for (const auto& kv : m_layerMap) if (touches(kv.first)) m_refillLayers.insert(kv.first);
     }
+    // Self-check (25/09): each region / layer keeps a hash of its texels as filled; a few are re-hashed against the
+    // current sheets every frame, round robin, and re-filled if they differ. The House of the Dead's tiled floor was
+    // drawn for a whole scene with the texels of a previous one (a layer never invalidated) -- whatever path misses
+    // an invalidation, this catches it within a few seconds.
+    static uint64_t RegionHash(const std::vector<uint8_t>& cpu, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h) {
+        uint64_t hh = 1469598103934665603ull;
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) {
+                int x2 = int(ox + x), y2 = int(oy + y);
+                if (x2 >= 1024) { x2 -= 1024; y2 ^= 1024; }
+                const size_t at = size_t(y2) * 1024 + size_t(x2);
+                hh ^= (at < cpu.size() ? cpu[at] : 0); hh *= 1099511628211ull;
+            }
+        return hh;
+    }
+    static void DecodeKey(uint64_t key, uint32_t& sh, uint32_t& ox, uint32_t& oy, uint32_t& w, uint32_t& h) {
+        sh = uint32_t(key >> 60) & 1u; ox = uint32_t(key >> 44) & 0xffffu; oy = uint32_t(key >> 28) & 0xffffu;
+        w = uint32_t(key >> 14) & 0x3fffu; h = uint32_t(key) & 0x3fffu;
+    }
+    void NoteFilled(const std::vector<uint8_t>* sheets, uint64_t key) {
+        uint32_t sh, ox, oy, w, h; DecodeKey(key, sh, ox, oy, w, h);
+        m_hash[key] = RegionHash(sheets[sh], ox, oy, w, h);
+    }
+    uint32_t Validate(const std::vector<uint8_t>* sheets, uint32_t budget) {
+        uint32_t stale = 0;
+        m_validateKeys.clear();
+        for (const auto& kv : m_layerMap) m_validateKeys.push_back(kv.first);
+        for (const auto& kv : m_map) m_validateKeys.push_back(kv.first);
+        if (m_validateKeys.empty()) return 0;
+        std::sort(m_validateKeys.begin(), m_validateKeys.end());
+        m_validateKeys.erase(std::unique(m_validateKeys.begin(), m_validateKeys.end()), m_validateKeys.end());
+        for (uint32_t i = 0; i < budget && i < m_validateKeys.size(); ++i) {
+            const uint64_t key = m_validateKeys[(m_validateCursor++) % m_validateKeys.size()];
+            uint32_t sh, ox, oy, w, h; DecodeKey(key, sh, ox, oy, w, h);
+            const uint64_t now = RegionHash(sheets[sh], ox, oy, w, h);
+            auto it = m_hash.find(key);
+            if (it != m_hash.end() && it->second == now) continue;
+            m_hash[key] = now;
+            if (it == m_hash.end()) continue;   // first sight: just record it
+            ++stale; ++m_staleTotal;
+            if ((m_staleTotal % 50u) == 1u) { m_lastStale[0] = sh; m_lastStale[1] = ox; m_lastStale[2] = oy; m_lastStale[3] = w; m_lastStale[4] = h; }
+            if (m_layerMap.count(key)) m_refillLayers.insert(key);
+            if (m_map.count(key)) m_refillSlots.insert(key);
+        }
+        return stale;
+    }
+    uint64_t StaleTotal() const { return m_staleTotal; }
+    uint32_t m_lastStale[5] = {0, 0, 0, 0, 0};
+
     void ProcessRefills(const std::vector<uint8_t>* sheets) {
         auto decode = [](uint64_t key, uint32_t& sh, uint32_t& ox, uint32_t& oy, uint32_t& w, uint32_t& h) {
             sh = uint32_t(key >> 60) & 1u; ox = uint32_t(key >> 44) & 0xffffu; oy = uint32_t(key >> 28) & 0xffffu;
@@ -242,6 +294,7 @@ public:
             for (uint32_t y = 0; y < kLayerSize; ++y)
                 for (uint32_t x = 0; x < kLayerSize; ++x) texel(sheets[sh], ox, oy, x % w, y % h, dst + (size_t(y) * kLayerSize + x) * 4);
             m_pendingLayers.push_back({lm->second, Base() + m_stagingUsed});
+            m_hash[*it] = RegionHash(sheets[sh], ox, oy, w, h);
             m_stagingUsed += bytes;
             it = m_refillLayers.erase(it);
         }
@@ -255,6 +308,7 @@ public:
             for (uint32_t y = 0; y < h; ++y)
                 for (uint32_t x = 0; x < w; ++x) texel(sheets[sh], ox, oy, x, y, dst + (size_t(y) * w + x) * 4);
             m_pending.push_back({sm->second, Base() + m_stagingUsed});
+            m_hash[*it] = RegionHash(sheets[sh], ox, oy, w, h);
             m_stagingUsed += (bytes + 255) & ~size_t(255);
             it = m_refillSlots.erase(it);
         }
@@ -605,6 +659,9 @@ private:
     std::vector<Pending> m_pending;
     std::vector<uint32_t> m_dirtySlots;
     std::set<uint64_t> m_refillSlots, m_refillLayers;
+    std::unordered_map<uint64_t, uint64_t> m_hash;   // texel hash of each region/layer as last filled
+    std::vector<uint64_t> m_validateKeys;
+    uint64_t m_validateCursor = 0, m_staleTotal = 0;
     bool m_resetDescriptors = true;
     uint32_t m_created = 0;
 };

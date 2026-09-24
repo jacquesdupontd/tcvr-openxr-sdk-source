@@ -43,6 +43,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     int uSmpBase;       // 0 = samplers with hardware anisotropy, 4 = without (debug.tcvr.m2_hwAnisoOn)
     int uGammaFolded;   // 1 = colorxlat already holds gamma(colorxlat): skip gamma8()
     int uTexImplicit;   // bit 0: texture() with implicit derivatives; bit 1: use the texture array
+    int uBoardLod;      // 1: the board's mip level in the exact path (m2.boardLod)
 };
 
 struct Prim {

@@ -46,7 +46,8 @@ struct M2UniformBufferObject {
     float uBright;           // 4 bytes, offset 288
     int32_t uTestStage;      // 4 bytes, offset 292
     int32_t uCountOverdraw;  // 4 bytes, offset 296
-    int32_t padEnd[3];       // 12 bytes, total 312 -> 320
+    int32_t padEnd[3];       // 12 bytes, offset 300
+    int32_t uBoardLod;       // 4 bytes, offset 312: 1 = the board's mip level (-texlod + log2 z) in the exact path
 };
 
 struct VoidPushConstants {

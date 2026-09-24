@@ -380,6 +380,13 @@ public:
         m_mainCenter[0] = mainCx; m_mainCenter[1] = mainCy;
 
         // Build raw pre-clip geometry
+        m_primDiagOn = false;
+        if (arcadexr::config::GetInt("m2.primDiag", 0) != 0 && (++m_primDiagTick % 60u) == 0u) {
+            m_primDiagOn = true;
+            m_primDiagX = float(arcadexr::config::GetInt("m2.primDiagX", 248));
+            m_primDiagY = float(arcadexr::config::GetInt("m2.primDiagY", 330));
+            __android_log_print(ANDROID_LOG_INFO, "TCVR_PRIM", "---- pixel (%.0f, %.0f) seq=%llu", m_primDiagX, m_primDiagY, (unsigned long long)frame.sequence);
+        }
         if (frame.raw_prim_count > 0 && frame.raw_vertex_count > 0) {
             const std::uint32_t n = std::min<std::uint32_t>(frame.raw_prim_count, 0xffffu);
             m_rawKeys.resize(n);
@@ -405,6 +412,7 @@ public:
             rawCutIdx.reserve(icount / 4);
             std::vector<std::uint32_t> cutSegStart;   // per cut polygon, to emit them FAR to NEAR
             std::vector<std::uint32_t> rawSecIdx;     // secondary views (other cameras, on the screen plane)
+            std::vector<std::uint32_t> leanFallbackIdx;   // opaque, textured, no region image nor layer
 
             std::size_t vo = 0, io = 0;
             std::uint32_t last_zsort = 0xffffffffu;
@@ -490,6 +498,39 @@ public:
                 const bool invisible = q.textured == 0u && q.translucent != 0u;
                 // Discard-free: opaque, no stipple, main camera (secondary views need the clip test).
                 const bool fast = !isGlass && isMain && (q.translucent == 0u || !RegionHasHoles(q));
+                if (m_primDiagOn && vc >= 3) {
+                    // debug.tcvr.m2_primDiag=1: every polygon covering arcade pixel (m2.primDiagX, m2.primDiagY), with
+                    // its draw rank, bucket, attributes and the pass that draws it (24/09, House of the Dead floor).
+                    float sx[8], sy[8]; bool ok = true;
+                    for (std::uint32_t v = 0; v < vc && v < 8; v++) {
+                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                        if (rv.z <= 0.0f) { ok = false; break; }
+                        sx[v] = float(frame.crtc_xoffset + q.center_x) + rv.x / rv.z;
+                        sy[v] = float((384 - q.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
+                    }
+                    bool inside = false;
+                    if (ok)
+                        for (std::uint32_t i2 = 0, j2 = std::min<std::uint32_t>(vc, 8) - 1; i2 < std::min<std::uint32_t>(vc, 8); j2 = i2++)
+                            if (((sy[i2] > m_primDiagY) != (sy[j2] > m_primDiagY)) &&
+                                (m_primDiagX < (sx[j2] - sx[i2]) * (m_primDiagY - sy[i2]) / (sy[j2] - sy[i2]) + sx[i2]))
+                                inside = !inside;
+                    if (inside)
+                        __android_log_print(ANDROID_LOG_INFO, "TCVR_PRIM",
+                            "rank=%u src=%u bucket=%u pass=%s tex=%u transl=%u checker=%u main=%d sheet=%u tx=%u ty=%u w=%u h=%u utex=%u luma=%u lumabase=%u colorbase=%u texlod=%d z0=%.1f",
+                            k, 0xffffu - (m_rawKeys[k] & 0xffffu), m_rawKeys[k] >> 16,
+                            invisible ? "none" : (!isGlass && !isMain) ? "sec" : (!isGlass && !fast) ? "cut" : isGlass ? "glass" : "fast",
+                            q.textured, q.translucent, q.checker, int(isMain), q.texsheet, q.texx, q.texy, q.texwidth, q.texheight, q.utex,
+                            q.luma, q.lumabase, q.colorbase, q.texlod, frame.raw_vertices[p.first_vertex].z);
+                    if (inside) {
+                        float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+                        for (std::uint32_t v = 0; v < vc; v++) {
+                            const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                            u0 = std::min(u0, rv.u); u1 = std::max(u1, rv.u); v0 = std::min(v0, rv.v); v1 = std::max(v1, rv.v);
+                        }
+                        __android_log_print(ANDROID_LOG_INFO, "TCVR_PRIM", "   wrapx=%u wrapy=%u mirx=%u miry=%u u=%.1f..%.1f v=%.1f..%.1f vc=%u",
+                            q.texwrapx, q.texwrapy, q.texmirrorx, q.texmirrory, u0, u1, v0, v1, vc);
+                    }
+                }
                 if (invisible) {
                 } else if (!isGlass && !isMain) {
                     for (std::uint32_t t = 1; t + 1 < vc; t++) {
@@ -511,15 +552,31 @@ public:
                         rawGlassIdx.push_back(q.first_vertex + t + 1);
                     }
                 } else {
-                    for (std::uint32_t t = 1; t + 1 < vc; t++) {
-                        m_rawIdx[io++] = q.first_vertex;
-                        m_rawIdx[io++] = q.first_vertex + t;
-                        m_rawIdx[io++] = q.first_vertex + t + 1;
+                    // The LEAN shader only knows the region images and layers: a textured polygon that has neither
+                    // (caches full) got a flat placeholder -- The House of the Dead's tiled floor as one dark green
+                    // (25/09). Those go to the full shader, which falls back to the sheets like the board.
+                    const bool mirrored = (q.texmirrorx | q.texmirrory) != 0u;
+                    const bool noSlot = (m_primSlot[k] & 0xffffu) == (M2RegionTextures::kNone & 0xffffu);
+                    const bool noLayer = (m_primLayer[k] & 0xffffu) == (M2RegionTextures::kNone & 0xffffu) || mirrored;
+                    if (q.textured != 0u && noSlot && noLayer) {
+                        for (std::uint32_t t = 1; t + 1 < vc; t++) {
+                            leanFallbackIdx.push_back(q.first_vertex);
+                            leanFallbackIdx.push_back(q.first_vertex + t);
+                            leanFallbackIdx.push_back(q.first_vertex + t + 1);
+                        }
+                    } else {
+                        for (std::uint32_t t = 1; t + 1 < vc; t++) {
+                            m_rawIdx[io++] = q.first_vertex;
+                            m_rawIdx[io++] = q.first_vertex + t;
+                            m_rawIdx[io++] = q.first_vertex + t + 1;
+                        }
                     }
                 }
                 vo += vc;
             }
 
+            m_leanIndexCount = unsigned(io);
+            for (std::uint32_t idx : leanFallbackIdx) m_rawIdx[io++] = idx;
             m_fastIndexCount = unsigned(io);
             // Cut-outs are drawn WITHOUT depth writes (so the Adreno keeps its early depth test and
             // skips every tree fragment hidden by the opaque scene): among themselves they must then
@@ -634,12 +691,22 @@ public:
             }
         }
         UploadColourChain(frame);
-        const bool texChanged = UploadTextures(frame, cmd) == 1;
+        // A full upload on a REUSED frame (geometry unchanged: every other frame in 30 Hz games) cannot rebuild
+        // the regions then; it must happen on the next built frame, even though the textures no longer change by
+        // then. It never happened: stale regions and layers until a restart (The House of the Dead's tiled floor
+        // drawn with the previous scene's texels, 25/09).
+        if (UploadTextures(frame, cmd) == 1) m_regionsStale = true;
+        if (const uint32_t st = m_regions.Validate(m_sheetCpu, 6u))
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK stale region/layer caught: %u now, %llu in total (e.g. sheet %u at %u,%u %ux%u), partial uploads %u",
+                                             st, (unsigned long long)m_regions.StaleTotal(), m_regions.m_lastStale[0], m_regions.m_lastStale[1],
+                                             m_regions.m_lastStale[2], m_regions.m_lastStale[3], m_regions.m_lastStale[4], m_partialTexLog));
         m_regions.ProcessRefills(m_sheetCpu);   // regions whose texels a partial update rewrote
+        const bool texChanged = m_regionsStale;
         if (texChanged && !reuse) {
+            m_regionsStale = false;
             // Rare (course / menu load): the regions were chosen on the old sheets -> rebuild. (Not on a reused
             // frame: its polygons still point at the current regions; the next built frame rebuilds.)
-            if (m_regions.Count() > 0) {
+            if (m_regions.Count() > 0 || m_regions.LayerCount() > 0) {   // layers too: they can exist alone
                 vkDeviceWaitIdle(m_vkDevice);
                 m_regions.Clear();
             }
@@ -897,6 +964,7 @@ public:
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
             ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
             ubo.padEnd[0] = arcadexr::config::GetInt("m2.hwAnisoOn", 1) != 0 ? 0 : 4;   // = uSmpBase (live A/B)
+            ubo.uBoardLod = arcadexr::config::GetInt("m2.boardLod", 1) != 0 ? 1 : 0;
             ubo.uCountOverdraw = (m_useRegions && arcadexr::config::GetInt("m2.regions", 1) != 0) ? 1 : 0;  // = uUseRegions
         }
 
@@ -920,8 +988,19 @@ public:
             if (m_fastIndexCount > 0 && !(skip & 4)) {
                 // LEAN: the same opaque polygons through a shader holding only their path (occupancy).
                 const bool lean = (arcadexr::config::GetInt("m2.lean", 3) & 1) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lean ? m_m2PipelineFastLean : m_m2PipelineFast);
-                vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
+                if (lean) {
+                    if (m_leanIndexCount > 0) {
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineFastLean);
+                        vkCmdDrawIndexed(cmd, m_leanIndexCount, 1, 0, 0, 0);
+                    }
+                    if (m_fastIndexCount > m_leanIndexCount) {
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineFast);
+                        vkCmdDrawIndexed(cmd, m_fastIndexCount - m_leanIndexCount, 1, m_leanIndexCount, 0, 0);
+                    }
+                } else {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineFast);
+                    vkCmdDrawIndexed(cmd, m_fastIndexCount, 1, 0, 0, 0);
+                }
             }
             const bool leanOn = (arcadexr::config::GetInt("m2.lean", 3) & 2) != 0 && ubo_texArray(eye) && m_edgeFadeOff;
             if (leanOn && m_secIndexStart > m_fastIndexCount && !(skip & 8)) {
@@ -2354,7 +2433,15 @@ private:
             }
         }
 
-        const bool needsUpload = !m_texturesUploaded || hashChanged;
+        {   // debug.tcvr.m2_texReupload=<n>: force one FULL upload of both sheets (each new value triggers once)
+            const int ru = arcadexr::config::GetInt("m2.texReupload", 0);
+            if (ru != m_lastTexReupload) { m_lastTexReupload = ru; if (ru != 0) { m_texShadow[0].clear(); m_texShadow[1].clear(); hashChanged = true; } }
+        }
+        // The sampled hash (1 word in 4) missed rewrites of the other words: The House of the Dead's tiled floor
+        // stayed on the previous scene's texels in the sheets (25/09). Once uploaded, the block comparison below is
+        // the change detector (4 MB of memcmp, ~0.4 ms); the hash only decides the very first upload.
+        const bool needsUpload = !m_texturesUploaded || hashChanged ||
+                                 (m_texShadow[0].size() == std::min(frame.textureram_words, 524288u));
         if (!needsUpload) return 0;
 
         // Partial update (24/09): Super GT 24h rewrites a few 4 KB blocks of texture RAM every frame (Model 2B/2C
@@ -2636,6 +2723,7 @@ private:
     VkPipeline m_voidPipelineFar = VK_NULL_HANDLE;
     VkPipeline m_planePipelineFar = VK_NULL_HANDLE;
     uint32_t m_fastIndexCount = 0;
+    uint32_t m_leanIndexCount = 0;   // [0, lean) lean shader; [lean, fast) full shader (no region image nor layer)
 
     VkPipeline m_voidPipeline = VK_NULL_HANDLE;
     VkPipeline m_planePipeline = VK_NULL_HANDLE;
@@ -3063,6 +3151,8 @@ private:
     uint64_t m_sheetGeneration = 0;
     uint64_t m_texHash = 0;
     std::vector<uint32_t> m_texShadow[2];   // texture RAM as last uploaded (partial updates)
+    bool m_regionsStale = false;
+    int m_lastTexReupload = 0;            // a full upload happened: regions to rebuild on the next built frame
     uint32_t m_partialTexLog = 0;
     bool m_texturesUploaded = false;
 
@@ -3087,6 +3177,7 @@ private:
 
     // Geometry unpack state
     std::vector<std::uint32_t> m_rawKeys;
+    bool m_primDiagOn = false; uint32_t m_primDiagTick = 0; float m_primDiagX = 0, m_primDiagY = 0;
     std::vector<tcvr_m2_prim> m_rawPrims;
     std::vector<float> m_rawVerts;
     std::vector<std::uint32_t> m_rawPrimOfVertex;

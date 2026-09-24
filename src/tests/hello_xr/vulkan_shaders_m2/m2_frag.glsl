@@ -54,6 +54,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     int uSmpBase;       // 0 = samplers with hardware anisotropy, 4 = without (debug.tcvr.m2_hwAnisoOn)
     int uGammaFolded;   // 1 = colorxlat already holds gamma(colorxlat): skip gamma8()
     int uTexImplicit;   // bit 0: texture() with implicit derivatives; bit 1: use the texture array
+    int uBoardLod;      // 1: the board's mip level in the exact path (m2.boardLod)
 };
 
 struct Prim {
@@ -490,7 +491,9 @@ void main_body() {
         float bias = float(uMipBias) / 128.0;
         vec4 c;
         if (layer != 0xffffu && ((fl >> 3) & 3u) == 0u) {
-            c = texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias);
+            c = (uTestStage == 12) ? textureLod(uRegionArr, vec3(tc / 256.0, float(layer)), 0.0)   // diag: mip 0 only
+                                   : texture(uRegionArr, vec3(tc / 256.0, float(layer)), bias);
+            if (uTestStage == 13) { oColor = vec4(1, 0, 0, 1); return; }   // diag: layer path in red
         } else {
             uint slot = vSlot & 0xffffu;
             uint smp = ((fl >> 3) & 1u) | (((fl >> 4) & 1u) << 1);
@@ -650,13 +653,21 @@ void main_body() {
             vec2 maj = (lx >= ly) ? dx : dy;
             float majL = sqrt(max(lx, ly)), minL = sqrt(max(min(lx, ly), 1e-12));
             float n = clamp(ceil(majL / minL), 1.0, float(max(uAniso, 1)));
-            float lod = log2(max(majL / n, minL)) + float(uMipBias) / 128.0;
+            // The BOARD's level of detail (25/09): mml = -texlod + log2(z)*256, per pixel, like MAME. Games do not
+            // always keep a scaled copy of the texture in its mip levels: The House of the Dead's tiled floor has
+            // moss there, and a screen-derivative level showed the moss where the cabinet shows the tiles.
+            int mmlb = -p.texlod + fast_log2(z) + uMipBias;
+            float lod = (uBoardLod != 0) ? float(mmlb) / 128.0 : log2(max(majL / n, minL)) + float(uMipBias) / 128.0;
             vec2 ts;
             if (lod < 0.0 && p.utex != 0u && !translucent) {
                 // Close up: the board fades its microtexture in, weighted by how far below level 0.
                 float tb = level_t(p, 0, tc);
                 float w = min(-lod * 128.0 / float(1 << int(p.utexminlod)), 127.0) / 256.0;
                 ts = vec2(mix(tb, micro_t(p, tc), w), 1.0);
+            } else if (uBoardLod != 0) {
+                int L = clamp(mmlb >> 7, 0, max_level);
+                ts = level_s(p, L, tc, translucent);
+                if (mmlb > 0 && L < max_level) ts = mix(ts, level_s(p, L + 1, tc, translucent), float((mmlb & 127) << 1) / 256.0);
             } else {
                 float l = max(lod, 0.0);
                 if (n <= 1.0) {
