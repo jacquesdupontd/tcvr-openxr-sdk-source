@@ -1209,19 +1209,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             } else if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
                 if (m2Frame) m_lastM2Frame = m2Frame;
-                {   // Smooth motion clock: when did the current arcade frame arrive, how far apart do they come.
-                    const auto now = clk::now();
-                    if (m2Frame && m2Frame->sequence != m_smoothSeq) {
-                        if (m_smoothSeq != 0) {
-                            const float dt = std::chrono::duration<float>(now - m_smoothArrive).count();
-                            if (dt > 0.005f && dt < 0.1f) m_smoothPeriod += (dt - m_smoothPeriod) * 0.1f;
-                        }
-                        m_smoothSeq = m2Frame->sequence;
-                        m_smoothArrive = now;
-                    }
-                    const float a = std::chrono::duration<float>(now - m_smoothArrive).count() / std::max(0.008f, m_smoothPeriod);
-                    m_m2Renderer.SetInterp(m_smoothOn ? a : 1.0f);
-                }
+                m_m2Renderer.SetSmooth(m_smoothOn);
                 if (m2Frame) {
                     const auto tp = clk::now();
                     m_m2Renderer.BuildFrame(*m2Frame);
@@ -1951,9 +1939,6 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool m_m2CadenceRequested = false, m_m2CadenceActive = false;
     bool m_smoothOn = false;
     int m_m2RateRequested = 0;
-    uint64_t m_smoothSeq = 0;
-    std::chrono::steady_clock::time_point m_smoothArrive{};
-    float m_smoothPeriod = 1.0f / 57.5f;
     uint64_t m_lastM2RenderedSeq = 0;
 
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {

@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <unordered_map>
+#include <chrono>
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -542,23 +543,26 @@ public:
             m_rawIdx.resize(io);
             GroundProbe(frame, mainCx, mainCy, mainB);
             if (m_directColour) {
-                // Model 1 carries a stable id per quad (u) and the corner (v): match each vertex to the same corner
-                // of the same quad in the previous arcade frame.
-                // Open-addressed tables reused every frame (generation stamps, no allocation): the std::unordered_map
-                // version cost enough CPU to drop MAME from 57.5 to 51 fps (24/09).
+                // Smooth motion (Model 1). Virtua Racing computes its 3D every OTHER arcade frame (30 Hz; measured
+                // 24/09) and the same frame is rebuilt for several refreshes: the blend runs between the last two
+                // frames that really changed. The match is done once per change, in MatchMotion().
                 const size_t nv = m_rawVerts.size() / 5;
-                m_prevPosCpu.assign(nv * 4, 0.0f);
-                MotionTable& last = m_motion[m_motionCur ^ 1];
-                MotionTable& cur = m_motion[m_motionCur];
-                cur.Begin();
-                for (size_t v = 0; v < nv; ++v) {
+                bool same = m_newestPos.size() == nv * 3;
+                for (size_t v = 0; same && v < nv; ++v) {
                     const float* d = &m_rawVerts[v * 5];
-                    const uint32_t key = (uint32_t(d[3]) << 2) | (uint32_t(d[4]) & 3u);
-                    cur.Put(key, d);
-                    float* o = &m_prevPosCpu[v * 4];
-                    if (const float* q = last.Get(key)) { o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = 1.0f; }
+                    const float* q = &m_newestPos[v * 3];
+                    same = d[0] == q[0] && d[1] == q[1] && d[2] == q[2];
                 }
-                m_motionCur ^= 1;
+                if (!same) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const float dt = std::chrono::duration<float>(now - m_stepTime).count();
+                    if (dt > 0.01f && dt < 0.1f) m_stepPeriod += (dt - m_stepPeriod) * 0.2f;
+                    m_stepTime = now;
+                    m_newestPos.resize(nv * 3);
+                    for (size_t v = 0; v < nv; ++v)
+                        for (int c = 0; c < 3; ++c) m_newestPos[v * 3 + c] = m_rawVerts[v * 5 + c];
+                    MatchMotion(nv);
+                }
                 m_newGeometry = true;
             } else {
                 m_prevPosCpu.clear();
@@ -868,7 +872,13 @@ public:
             const bool popFade = m_directColour && !m_flatMode && !m_backNoTile && m_zMaxSmooth > 0.0f &&
                                  arcadexr::profiles::GetInt("immersive.popInFade", 1) != 0;
             ubo.uFogFar = popFade ? m_zMaxSmooth : 0.0f;
-            ubo.uInterp = (m_directColour && !m_prevPosCpu.empty()) ? m_interp : 1.0f;
+            if (m_smooth && m_directColour && !m_prevPosCpu.empty()) {
+                // Blend at THIS refresh: time since the newest moving frame over the measured step interval.
+                const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_stepTime).count();
+                ubo.uInterp = std::max(0.0f, std::min(1.0f, t / std::max(0.008f, m_stepPeriod)));
+            } else {
+                ubo.uInterp = 1.0f;
+            }
             if (popFade) { ubo.uSky[0] = m_fogColour[0]; ubo.uSky[1] = m_fogColour[1]; ubo.uSky[2] = m_fogColour[2]; }
             else { ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2]; }
             ubo.uGround[0] = groundCol[0]; ubo.uGround[1] = groundCol[1]; ubo.uGround[2] = groundCol[2];
@@ -2584,32 +2594,184 @@ private:
     float* m_prevMappedF[kFrames] = {};
     size_t m_prevSize = 0;
     std::vector<float> m_prevPosCpu;                         // per vertex: previous x, y, z, matched
-    struct MotionTable {   // (id << 2 | corner) -> position, open addressing, cleared by a generation stamp
-        static constexpr uint32_t kSize = 1u << 16;
-        std::vector<uint32_t> keys = std::vector<uint32_t>(kSize), gens = std::vector<uint32_t>(kSize);
-        std::vector<float> pos = std::vector<float>(kSize * 3);
-        uint32_t gen = 1;
-        void Begin() { if (++gen == 0) { std::fill(gens.begin(), gens.end(), 0u); gen = 1; } }
-        void Put(uint32_t key, const float* p) {
-            uint32_t h = (key * 2654435761u) & (kSize - 1);
-            for (uint32_t n = 0; n < 64; ++n, h = (h + 1) & (kSize - 1))
-                if (gens[h] != gen || keys[h] == key) { gens[h] = gen; keys[h] = key; pos[h * 3] = p[0]; pos[h * 3 + 1] = p[1]; pos[h * 3 + 2] = p[2]; return; }
-        }
-        const float* Get(uint32_t key) const {
-            uint32_t h = (key * 2654435761u) & (kSize - 1);
-            for (uint32_t n = 0; n < 64; ++n, h = (h + 1) & (kSize - 1)) {
-                if (gens[h] != gen) return nullptr;
-                if (keys[h] == key) return &pos[h * 3];
+    std::vector<float> m_newestPos;                          // positions of the newest changed frame, by vertex
+    struct MotionQuad { uint32_t key; uint32_t v0, n; float c[3]; float p[4][3]; };
+    std::vector<MotionQuad> m_lastQuads, m_curQuads;         // sorted by key
+    std::vector<std::pair<const MotionQuad*, const MotionQuad*>> m_motionPairs;
+    uint32_t m_motionDiagTick = 0;
+
+    // Match every quad of the new frame with the same quad in the previous changed frame. Copies of a model share
+    // one key (road sections, trackside objects): estimate the game camera's rigid motion on the keys seen exactly
+    // once in both frames, then give each quad the copy that lands nearest once moved by it. An occurrence number
+    // in MAME did not work: it shifts by one whenever a copy leaves the view (24/09, half the scene mismatched).
+    void MatchMotion(size_t nv) {
+        m_curQuads.clear();
+        for (size_t v = 0; v < nv;) {
+            const uint32_t k = m_rawPrimOfVertex[v];
+            size_t e = v + 1;
+            while (e < nv && m_rawPrimOfVertex[e] == k) ++e;
+            MotionQuad q{};
+            q.key = uint32_t(m_rawVerts[v * 5 + 3]);
+            q.v0 = uint32_t(v); q.n = uint32_t(e - v);
+            for (size_t i = v; i < e; ++i) {
+                const float* d = &m_rawVerts[i * 5];
+                const uint32_t corner = uint32_t(d[4]) & 3u;
+                for (int c = 0; c < 3; ++c) { q.p[corner][c] = d[c]; q.c[c] += d[c] / float(e - v); }
             }
-            return nullptr;
+            m_curQuads.push_back(q);
+            v = e;
         }
-    };
-    MotionTable m_motion[2];
-    int m_motionCur = 0;
-    float m_interp = 1.0f;
+        std::sort(m_curQuads.begin(), m_curQuads.end(), [](const MotionQuad& x, const MotionQuad& y) { return x.key < y.key; });
+
+        // Keys present exactly once in both frames.
+        m_motionPairs.clear();
+        for (size_t i = 0, j = 0; i < m_curQuads.size() && j < m_lastQuads.size();) {
+            const uint32_t ki = m_curQuads[i].key, kj = m_lastQuads[j].key;
+            if (ki < kj) { ++i; continue; }
+            if (kj < ki) { ++j; continue; }
+            size_t ie = i, je = j;
+            while (ie < m_curQuads.size() && m_curQuads[ie].key == ki) ++ie;
+            while (je < m_lastQuads.size() && m_lastQuads[je].key == ki) ++je;
+            if (ie - i == 1 && je - j == 1) m_motionPairs.push_back({&m_lastQuads[j], &m_curQuads[i]});
+            i = ie; j = je;
+        }
+
+        // Camera motion prev -> cur. The raw positions are (zoom*x + view*z, zoom*y + view*z, z): a rigid move of the
+        // game camera is an AFFINE map in that space, fitted exactly by least squares (one 4x4 system per output
+        // coordinate), trimmed at 3x the median residual.
+        float A3[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        auto apply = [&](const float* p, float* o) {
+            for (int r = 0; r < 3; ++r) o[r] = A3[r * 4] * p[0] + A3[r * 4 + 1] * p[1] + A3[r * 4 + 2] * p[2] + A3[r * 4 + 3];
+        };
+        float trim = 1e30f, medRes = -1.0f;
+        std::vector<float> res;
+        for (int it = 0; it < 4 && m_motionPairs.size() >= 8; ++it) {
+            double N[4][4] = {}, B[4][3] = {};
+            res.clear();
+            int used = 0;
+            for (const auto& pr : m_motionPairs) {
+                float p[3]; apply(pr.first->c, p);
+                const float* q = pr.second->c;
+                const float e = std::sqrt((q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1]) + (q[2] - p[2]) * (q[2] - p[2]));
+                res.push_back(e);
+                if (e > trim) continue;
+                const double x[4] = {pr.first->c[0], pr.first->c[1], pr.first->c[2], 1.0};
+                for (int r = 0; r < 4; ++r) {
+                    for (int c = 0; c < 4; ++c) N[r][c] += x[r] * x[c];
+                    for (int c = 0; c < 3; ++c) B[r][c] += x[r] * q[c];
+                }
+                ++used;
+            }
+            std::vector<float> sr = res;
+            std::nth_element(sr.begin(), sr.begin() + sr.size() / 2, sr.end());
+            medRes = sr[sr.size() / 2];
+            trim = std::max(3.0f * medRes, 1e-3f);
+            if (used < 8) break;
+            bool ok = true;   // Gauss-Jordan with partial pivoting, 3 right-hand sides
+            for (int c = 0; c < 4 && ok; ++c) {
+                int piv = c;
+                for (int r = c + 1; r < 4; ++r) if (std::fabs(N[r][c]) > std::fabs(N[piv][c])) piv = r;
+                if (std::fabs(N[piv][c]) < 1e-9) { ok = false; break; }
+                for (int k = 0; k < 4; ++k) std::swap(N[c][k], N[piv][k]);
+                for (int k = 0; k < 3; ++k) std::swap(B[c][k], B[piv][k]);
+                for (int r = 0; r < 4; ++r) {
+                    if (r == c) continue;
+                    const double f = N[r][c] / N[c][c];
+                    for (int k = 0; k < 4; ++k) N[r][k] -= f * N[c][k];
+                    for (int k = 0; k < 3; ++k) B[r][k] -= f * B[c][k];
+                }
+            }
+            if (!ok) break;
+            for (int o = 0; o < 3; ++o)
+                for (int c = 0; c < 4; ++c) A3[o * 4 + c] = float(B[c][o] / N[c][c]);
+        }
+        const float T[3] = {A3[3], A3[7], A3[11]};
+        // Inverse map: where a static piece of the world was in the previous frame (fallback for unmatched quads).
+        const bool fitOk = medRes >= 0.0f && m_motionPairs.size() >= 8;
+        float Ai[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        if (fitOk) {
+            const float a = A3[0], b = A3[1], c = A3[2], d = A3[4], e = A3[5], f = A3[6], g = A3[8], h = A3[9], k = A3[10];
+            const float det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+            if (std::fabs(det) > 1e-6f) {
+                const float inv[9] = {(e * k - f * h) / det, (c * h - b * k) / det, (b * f - c * e) / det,
+                                      (f * g - d * k) / det, (a * k - c * g) / det, (c * d - a * f) / det,
+                                      (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det};
+                for (int r = 0; r < 3; ++r) {
+                    for (int cc = 0; cc < 3; ++cc) Ai[r * 4 + cc] = inv[r * 3 + cc];
+                    Ai[r * 4 + 3] = -(inv[r * 3] * A3[3] + inv[r * 3 + 1] * A3[7] + inv[r * 3 + 2] * A3[11]);
+                }
+            }
+        }
+
+        // Each quad takes the copy that lands nearest once moved; refused when ambiguous or too far.
+        m_prevPosCpu.assign(nv * 4, 0.0f);
+        size_t matchedQuads = 0, staticQuads = 0;
+        std::vector<float> rel, fitErr;
+        const bool diag = arcadexr::config::GetInt("m2.motionDiag", 0) != 0;
+        for (size_t i = 0, j = 0; i < m_curQuads.size();) {
+            const uint32_t key = m_curQuads[i].key;
+            size_t ie = i;
+            while (ie < m_curQuads.size() && m_curQuads[ie].key == key) ++ie;
+            while (j < m_lastQuads.size() && m_lastQuads[j].key < key) ++j;
+            size_t je = j;
+            while (je < m_lastQuads.size() && m_lastQuads[je].key == key) ++je;
+            for (size_t a2 = i; a2 < ie; ++a2) {
+                const MotionQuad& cq = m_curQuads[a2];
+                auto fallback = [&]() {   // unmatched: assume it is static in the world
+                    if (!fitOk) return;
+                    ++staticQuads;
+                    for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
+                        const float* d = &m_rawVerts[size_t(v) * 5];
+                        float* o = &m_prevPosCpu[size_t(v) * 4];
+                        for (int r = 0; r < 3; ++r) o[r] = Ai[r * 4] * d[0] + Ai[r * 4 + 1] * d[1] + Ai[r * 4 + 2] * d[2] + Ai[r * 4 + 3];
+                        o[3] = 1.0f;
+                    }
+                };
+                // Distance in arcade screen pixels (raw x, y carry the zoom: x/z is the screen offset) plus the
+                // relative depth gap, weighted so 1 % of depth counts as one pixel.
+                auto dist = [](const float* p, const float* c) {
+                    const float pz = std::max(std::fabs(p[2]), 1e-3f), cz = std::max(std::fabs(c[2]), 1e-3f);
+                    const float sx = p[0] / pz - c[0] / cz, sy = p[1] / pz - c[1] / cz;
+                    return std::sqrt(sx * sx + sy * sy) + 100.0f * std::fabs(p[2] - c[2]) / cz;
+                };
+                float best = 1e30f, second = 1e30f; const MotionQuad* bq = nullptr;
+                for (size_t b2 = j; b2 < je; ++b2) {
+                    float p[3]; apply(m_lastQuads[b2].c, p);
+                    // moved with the world, or fixed to the screen (HUD, the player's own car)
+                    const float d = std::min(dist(p, cq.c), dist(m_lastQuads[b2].c, cq.c));
+                    if (d < best) { second = best; best = d; bq = &m_lastQuads[b2]; } else if (d < second) second = d;
+                }
+                // Accept: within 16 (pixels + depth %) of the predicted place, and clearly nearer than any other copy.
+                if (!bq || best > 16.0f || (second < 1e29f && best > 0.5f * second)) { fallback(); continue; }
+                ++matchedQuads;
+                for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
+                    const uint32_t corner = uint32_t(m_rawVerts[size_t(v) * 5 + 4]) & 3u;
+                    float* o = &m_prevPosCpu[size_t(v) * 4];
+                    o[0] = bq->p[corner][0]; o[1] = bq->p[corner][1]; o[2] = bq->p[corner][2]; o[3] = 1.0f;
+                }
+                if (diag) { rel.push_back(dist(bq->c, cq.c)); fitErr.push_back(best); }   // raw motion; fit residual
+            }
+            i = ie; j = je;
+        }
+        if (diag && (++m_motionDiagTick % 8u) == 0u) {
+            std::sort(rel.begin(), rel.end());
+            std::sort(fitErr.begin(), fitErr.end());
+            if (!fitErr.empty()) __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION", "match residual p50=%.2f p90=%.2f p99=%.2f",
+                fitErr[fitErr.size() / 2], fitErr[fitErr.size() * 9 / 10], fitErr[fitErr.size() * 99 / 100]);
+            auto pc = [&](float f) { return rel.empty() ? -1.0f : rel[std::min(rel.size() - 1, size_t(f * rel.size()))]; };
+            __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION",
+                                "quads=%zu last=%zu pairs=%zu fitMedRes=%.3f T=(%.2f %.2f %.2f) matched=%zu static=%zu | screen motion px p50=%.4f p90=%.4f p99=%.4f max=%.4f | period=%.1fms",
+                                m_curQuads.size(), m_lastQuads.size(), m_motionPairs.size(), medRes, T[0], T[1], T[2], matchedQuads, staticQuads,
+                                pc(0.5f), pc(0.9f), pc(0.99f), rel.empty() ? -1.0f : rel.back(), m_stepPeriod * 1000.0f);
+        }
+        m_lastQuads.swap(m_curQuads);
+    }
+    bool m_smooth = false;
+    std::chrono::steady_clock::time_point m_stepTime{};
+    float m_stepPeriod = 2.0f / 57.5f;
 public:
     // Smooth motion: blend of the previous and current arcade frames for this display refresh (1 = current).
-    void SetInterp(float a) { m_interp = std::max(0.0f, std::min(1.0f, a)); }
+    void SetSmooth(bool on) { m_smooth = on; }
     bool HasMotionIds() const { return m_directColour; }
 private:
     float* m_vboMappedF[kFrames] = {};
