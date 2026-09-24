@@ -36,7 +36,7 @@ struct M2UniformBufferObject {
     float uHorizonRow;       // 4 bytes, offset 232
     float uOverlayK;         // 4 bytes, offset 236: screen overlays drawn this many times the view (1 = flat)
     float uSky[3];           // 12 bytes, offset 240
-    int32_t pad2;            // 4 bytes, offset 252
+    float uInterp;           // 4 bytes, offset 252: smooth motion blend, previous -> current arcade frame
     float uGround[3];        // 12 bytes, offset 256
     int32_t uAniso;          // 4 bytes, offset 268
     int32_t uFilterMode;     // 4 bytes, offset 272

@@ -1581,6 +1581,7 @@ struct OpenXrProgram : IOpenXrProgram {
             }
         }
         arcadexr::audio::LogStatsPeriodically();
+        arcadexr::audio::SetGain(arcadexr::profiles::GetFloat("audio.volume", 1.0f));
         arcadexr::config::Poll();
         {
             // "auto" (23/09, Guillaume): shown in the game's menus (the aim met no 3D and landed on the arcade

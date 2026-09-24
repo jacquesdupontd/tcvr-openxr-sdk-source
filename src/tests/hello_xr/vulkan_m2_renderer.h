@@ -81,7 +81,7 @@ public:
         // 1. Create Descriptor Pool
         std::array<VkDescriptorPoolSize, 5> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 96},   // + binding 16 (smooth motion) per set
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 80},
             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * M2RegionTextures::kMaxSlots + 16},
             {VK_DESCRIPTOR_TYPE_SAMPLER, 80}
@@ -112,6 +112,12 @@ public:
             ssboBind.stageFlags = (b == 1 || b == 2) ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                                           : VK_SHADER_STAGE_FRAGMENT_BIT;
             m2Bindings.push_back(ssboBind);
+        }
+        {   // Binding 16: previous positions of the vertices (smooth motion), vertex stage
+            VkDescriptorSetLayoutBinding pb{};
+            pb.binding = 16; pb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            pb.descriptorCount = 1; pb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            m2Bindings.push_back(pb);
         }
         // Bindings 8, 9: Sheet texture samplers
         for (uint32_t b = 8; b <= 11; ++b) {
@@ -535,6 +541,28 @@ public:
             }
             m_rawIdx.resize(io);
             GroundProbe(frame, mainCx, mainCy, mainB);
+            if (m_directColour) {
+                // Model 1 carries a stable id per quad (u) and the corner (v): match each vertex to the same corner
+                // of the same quad in the previous arcade frame.
+                // Open-addressed tables reused every frame (generation stamps, no allocation): the std::unordered_map
+                // version cost enough CPU to drop MAME from 57.5 to 51 fps (24/09).
+                const size_t nv = m_rawVerts.size() / 5;
+                m_prevPosCpu.assign(nv * 4, 0.0f);
+                MotionTable& last = m_motion[m_motionCur ^ 1];
+                MotionTable& cur = m_motion[m_motionCur];
+                cur.Begin();
+                for (size_t v = 0; v < nv; ++v) {
+                    const float* d = &m_rawVerts[v * 5];
+                    const uint32_t key = (uint32_t(d[3]) << 2) | (uint32_t(d[4]) & 3u);
+                    cur.Put(key, d);
+                    float* o = &m_prevPosCpu[v * 4];
+                    if (const float* q = last.Get(key)) { o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = 1.0f; }
+                }
+                m_motionCur ^= 1;
+                m_newGeometry = true;
+            } else {
+                m_prevPosCpu.clear();
+            }
             if (arcadexr::config::GetInt("m2.overlayDiag", 0) != 0 && (++m_overlayDiagTick % 60u) == 0u) {
                 // Which main-view polygons cover (nearly) the whole arcade frame? Camera-attached overlays (fades,
                 // hit flashes) float as panels in immersive.
@@ -623,6 +651,12 @@ public:
             if (!m_rawIdx.empty()) {
                 size_t idxBytes = std::min(m_rawIdx.size() * sizeof(uint32_t), m_iboSize);
                 memcpy(m_iboMappedF[m_fs], m_rawIdx.data(), idxBytes);
+            }
+            if (!m_prevPosCpu.empty()) {
+                size_t pb = std::min(m_prevPosCpu.size() * sizeof(float), m_prevSize);
+                memcpy(m_prevMappedF[m_fs], m_prevPosCpu.data(), pb);
+            } else if (m_prevMappedF[m_fs]) {
+                std::memset(m_prevMappedF[m_fs], 0, std::min(m_prevSize, size_t(16)));   // w = 0 on vertex 0: no blend
             }
             {   // always: the descriptor array must be fully valid (dummy image) before any draw
                 m_regions.Flush(cmd);
@@ -834,6 +868,7 @@ public:
             const bool popFade = m_directColour && !m_flatMode && !m_backNoTile && m_zMaxSmooth > 0.0f &&
                                  arcadexr::profiles::GetInt("immersive.popInFade", 1) != 0;
             ubo.uFogFar = popFade ? m_zMaxSmooth : 0.0f;
+            ubo.uInterp = (m_directColour && !m_prevPosCpu.empty()) ? m_interp : 1.0f;
             if (popFade) { ubo.uSky[0] = m_fogColour[0]; ubo.uSky[1] = m_fogColour[1]; ubo.uSky[2] = m_fogColour[2]; }
             else { ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2]; }
             ubo.uGround[0] = groundCol[0]; ubo.uGround[1] = groundCol[1]; ubo.uGround[2] = groundCol[2];
@@ -1628,6 +1663,7 @@ public:
 
         for (m_fs = 0; m_fs < kFrames; ++m_fs) {
         m_vboBufferF[m_fs].Reset(m_vkDevice);
+        m_prevBufferF[m_fs].Reset(m_vkDevice);
         m_primIndexBufferF[m_fs].Reset(m_vkDevice);
         m_iboBufferF[m_fs].Reset(m_vkDevice);
         m_primsBufferF[m_fs].Reset(m_vkDevice);
@@ -1968,6 +2004,11 @@ private:
         createMappedBuffer(m_primIndexBufferF[m_fs], m_primIndexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                            reinterpret_cast<void**>(&m_primIndexMappedF[m_fs]));
 
+        m_prevSize = 65536 * 4 * sizeof(float);
+        createMappedBuffer(m_prevBufferF[m_fs], m_prevSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           reinterpret_cast<void**>(&m_prevMappedF[m_fs]));
+        std::memset(m_prevMappedF[m_fs], 0, m_prevSize);
+
         m_iboSize = 131072 * sizeof(uint32_t); // 65k indices
         createMappedBuffer(m_iboBufferF[m_fs], m_iboSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                            reinterpret_cast<void**>(&m_iboMappedF[m_fs]));
@@ -2161,6 +2202,16 @@ private:
                 gamWrite.descriptorCount = 1;
                 gamWrite.pBufferInfo = &gamInfo;
                 writes.push_back(gamWrite);
+
+                // Binding 16: previous vertex positions (smooth motion)
+                VkDescriptorBufferInfo prevInfo{m_prevBufferF[m_fs].buf, 0, m_prevSize};
+                VkWriteDescriptorSet prevWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                prevWrite.dstSet = m_m2DescSetF[m_fs][e][p];
+                prevWrite.dstBinding = 16;
+                prevWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                prevWrite.descriptorCount = 1;
+                prevWrite.pBufferInfo = &prevInfo;
+                writes.push_back(prevWrite);
 
                 // Binding 6, 7: Dummy SSBOs
                 VkDescriptorBufferInfo dummyInfo{m_dummyBuffer.buf, 0, 256};
@@ -2529,6 +2580,38 @@ private:
     bool m_gammaFolded = false;
 
     BufferAndMemory m_vboBufferF[kFrames];
+    BufferAndMemory m_prevBufferF[kFrames];
+    float* m_prevMappedF[kFrames] = {};
+    size_t m_prevSize = 0;
+    std::vector<float> m_prevPosCpu;                         // per vertex: previous x, y, z, matched
+    struct MotionTable {   // (id << 2 | corner) -> position, open addressing, cleared by a generation stamp
+        static constexpr uint32_t kSize = 1u << 16;
+        std::vector<uint32_t> keys = std::vector<uint32_t>(kSize), gens = std::vector<uint32_t>(kSize);
+        std::vector<float> pos = std::vector<float>(kSize * 3);
+        uint32_t gen = 1;
+        void Begin() { if (++gen == 0) { std::fill(gens.begin(), gens.end(), 0u); gen = 1; } }
+        void Put(uint32_t key, const float* p) {
+            uint32_t h = (key * 2654435761u) & (kSize - 1);
+            for (uint32_t n = 0; n < 64; ++n, h = (h + 1) & (kSize - 1))
+                if (gens[h] != gen || keys[h] == key) { gens[h] = gen; keys[h] = key; pos[h * 3] = p[0]; pos[h * 3 + 1] = p[1]; pos[h * 3 + 2] = p[2]; return; }
+        }
+        const float* Get(uint32_t key) const {
+            uint32_t h = (key * 2654435761u) & (kSize - 1);
+            for (uint32_t n = 0; n < 64; ++n, h = (h + 1) & (kSize - 1)) {
+                if (gens[h] != gen) return nullptr;
+                if (keys[h] == key) return &pos[h * 3];
+            }
+            return nullptr;
+        }
+    };
+    MotionTable m_motion[2];
+    int m_motionCur = 0;
+    float m_interp = 1.0f;
+public:
+    // Smooth motion: blend of the previous and current arcade frames for this display refresh (1 = current).
+    void SetInterp(float a) { m_interp = std::max(0.0f, std::min(1.0f, a)); }
+    bool HasMotionIds() const { return m_directColour; }
+private:
     float* m_vboMappedF[kFrames] = {};
     size_t m_vboSize = 0;
 
@@ -2576,6 +2659,7 @@ private:
     bool m_frontFullscreen = false;
     bool m_backNoTile = false;
     bool m_directColour = false;
+    bool m_newGeometry = false;
     float m_zMaxSmooth = 0.0f;
     float m_fogColour[3] = {0.6f, 0.75f, 0.9f};
     unsigned m_pitchLogTick = 0;

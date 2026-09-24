@@ -41,6 +41,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uHorizonRow;
     float uOverlayK;        // screen overlays: enlargement of the arcade frame over the view (1 = flat)
     vec3 uSky;
+    float uInterp;          // smooth motion: 0 = previous arcade frame, 1 = current
     vec3 uGround;
     int uAniso;
     int uFilterMode;

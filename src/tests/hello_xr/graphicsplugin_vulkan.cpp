@@ -1209,6 +1209,19 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             } else if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
                 m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
                 if (m2Frame) m_lastM2Frame = m2Frame;
+                {   // Smooth motion clock: when did the current arcade frame arrive, how far apart do they come.
+                    const auto now = clk::now();
+                    if (m2Frame && m2Frame->sequence != m_smoothSeq) {
+                        if (m_smoothSeq != 0) {
+                            const float dt = std::chrono::duration<float>(now - m_smoothArrive).count();
+                            if (dt > 0.005f && dt < 0.1f) m_smoothPeriod += (dt - m_smoothPeriod) * 0.1f;
+                        }
+                        m_smoothSeq = m2Frame->sequence;
+                        m_smoothArrive = now;
+                    }
+                    const float a = std::chrono::duration<float>(now - m_smoothArrive).count() / std::max(0.008f, m_smoothPeriod);
+                    m_m2Renderer.SetInterp(m_smoothOn ? a : 1.0f);
+                }
                 if (m2Frame) {
                     const auto tp = clk::now();
                     m_m2Renderer.BuildFrame(*m2Frame);
@@ -1220,11 +1233,20 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             // second; at 90 Hz each stays up 1 then 2 refreshes, irregularly. 120 Hz + one draw per new arcade image
             // = 2 refreshes each (a 3rd about 5 times a second). Its own flag: never fights the System 22 one.
             {
-                const bool m2Cadence = m_lastM2Drawn && arcadexr::profiles::GetInt("immersive.cadence", 0) != 0;
-                if (m2Cadence != m_m2CadenceRequested) {
-                    arcadexr::xr::RequestRateForGame(m2Cadence ? 120.0f : 90.0f, m2Cadence ? "Model 2 chain: 2 refreshes per arcade frame" : "leaving Model 2 cadence");
-                    m_m2CadenceRequested = m2Cadence;
+                // Smooth motion (Model 1): draw every display refresh at 90 Hz, interpolated between arcade frames,
+                // instead of the 120 Hz cadence that shows each arcade frame twice.
+                m_smoothOn = m_lastM2Drawn && m_m2Renderer.HasMotionIds() &&
+                             arcadexr::profiles::GetInt("immersive.smoothMotion", 1) != 0;
+                const bool m2Cadence = m_lastM2Drawn && !m_smoothOn && arcadexr::profiles::GetInt("immersive.cadence", 0) != 0;
+                // 120 Hz for the cadence, 90 Hz for smooth motion (drawn every refresh), 90 when leaving either.
+                const int wantRate = m2Cadence ? 120 : (m_smoothOn ? 90 : 0);
+                if (wantRate != m_m2RateRequested) {
+                    if (wantRate > 0 || m_m2RateRequested > 0)
+                        arcadexr::xr::RequestRateForGame(wantRate > 0 ? float(wantRate) : 90.0f,
+                            m2Cadence ? "Model 2 chain: 2 refreshes per arcade frame" : (m_smoothOn ? "smooth motion: every refresh at 90 Hz" : "leaving Model 2 cadence"));
+                    m_m2RateRequested = wantRate;
                 }
+                m_m2CadenceRequested = m2Cadence;
                 m_m2CadenceActive = m2Cadence;
             }
         }
@@ -1927,6 +1949,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
     bool m_m2AimLive = false;
     bool m_m2CadenceRequested = false, m_m2CadenceActive = false;
+    bool m_smoothOn = false;
+    int m_m2RateRequested = 0;
+    uint64_t m_smoothSeq = 0;
+    std::chrono::steady_clock::time_point m_smoothArrive{};
+    float m_smoothPeriod = 1.0f / 57.5f;
     uint64_t m_lastM2RenderedSeq = 0;
 
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
