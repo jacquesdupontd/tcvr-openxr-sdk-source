@@ -1205,6 +1205,16 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 if (game != m_m2Game) { m_m2Game = game; ResetM2ForGameChange(); }
             }
             m_m2Renderer.SetFrameSlot(int(m_frameSlot));
+            ++m_paceHold;
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - m_paceAt >= std::chrono::seconds(1)) {
+                    if (m_paceNew > 0)
+                        Log::Write(Log::Level::Info, Fmt("TCVR_PACING arcade frames shown=%u never shown=%u | held 1 refresh=%u 2=%u 3=%u 4+=%u",
+                                                         m_paceNew, m_paceSkipped, m_paceHist[1], m_paceHist[2], m_paceHist[3], m_paceHist[4]));
+                    m_paceNew = m_paceSkipped = 0; for (auto& h : m_paceHist) h = 0; m_paceAt = now;
+                }
+            }
             if (!m_m2SceneRequested && M2SceneLive()) {
                 m_m2SceneRequested = true;
                 SetM2SceneMode(1);
@@ -1222,6 +1232,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     const auto tp = clk::now();
                     m_m2Renderer.BuildFrame(*m2Frame);
                     m_cpuPrepMs += std::chrono::duration<float, std::milli>(clk::now() - tp).count();
+                    // Arcade frame pacing (25/09): frames the emulator published but no refresh ever showed (two
+                    // published between two refreshes: a jump in the motion), and how many refreshes each shown frame
+                    // stayed up. Logged once a second as TCVR_PACING.
+                    if (m2Frame->sequence != m_lastM2RenderedSeq) {
+                        if (m_lastM2RenderedSeq != 0 && m2Frame->sequence > m_lastM2RenderedSeq + 1)
+                            m_paceSkipped += uint32_t(m2Frame->sequence - m_lastM2RenderedSeq - 1);
+                        if (m_paceHold > 0) ++m_paceHist[std::min<uint32_t>(m_paceHold, 4u)];
+                        m_paceHold = 0; ++m_paceNew;
+                    }
                     m_lastM2RenderedSeq = m2Frame->sequence;
                 }
             }
@@ -1984,6 +2003,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         Log::Write(Log::Level::Info, "TCVR_SWITCH Model 2 module reset for " + m_m2Game);
     }
     std::string m_m2Game;
+    uint32_t m_paceNew = 0, m_paceSkipped = 0, m_paceHold = 0, m_paceHist[5] = {};
+    std::chrono::steady_clock::time_point m_paceAt{};
 
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
         if (m_m2RendererInitialized) return;
