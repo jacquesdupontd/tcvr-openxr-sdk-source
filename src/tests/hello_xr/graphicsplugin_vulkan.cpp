@@ -2199,7 +2199,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         std::sort(v.begin(), v.end());
         const float p75 = v[(v.size() * 3) / 4];
         const float hz = arcadexr::xr::State().current > 1.0f ? arcadexr::xr::State().current : 90.0f;
-        const float target = (1000.0f / hz) * std::max(0.5f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresBudget", 0.85f)));
+        // Arcade cadence (one draw per new arcade frame, shown on two refreshes): a draw has two refresh periods, not
+        // one (25/09: Top Skater at 120 Hz was held at 0.58 against a 7 ms budget it did not have to meet).
+        const float period = (1000.0f / hz) * (m_m2CadenceActive ? 2.0f : 1.0f);
+        const float target = period * std::max(0.5f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresBudget", 0.85f)));
         const float lo = std::max(0.3f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresMin", 0.5f)));
         // GPU time is roughly fixed + area; area goes with scale squared.
         float want = m_m2DynScale * std::sqrt(target / std::max(0.5f, p75));
@@ -2208,8 +2211,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         else if (p75 < target * 0.80f) next = std::min(want, m_m2DynScale + 0.03f);    // clear room: creep up
         next = std::max(lo, std::min(1.0f, next));
         if (std::fabs(next - m_m2DynScale) >= 0.01f) {
-            Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES gpu p75=%.2f ms target=%.2f (%.0f Hz) scale %.2f -> %.2f",
-                                             p75, target, hz, m_m2DynScale, next));
+            Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES gpu p75=%.2f ms target=%.2f (%.0f Hz%s) scale %.2f -> %.2f",
+                                             p75, target, hz, m_m2CadenceActive ? ", cadence" : "", m_m2DynScale, next));
             m_m2DynScale = next;
         }
     }
