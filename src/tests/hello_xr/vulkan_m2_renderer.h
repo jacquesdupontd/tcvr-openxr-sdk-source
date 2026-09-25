@@ -663,7 +663,7 @@ public:
             // Smooth motion for a Model 2 game (25/09, profile immersive.smoothMotion2: Sega Rally first): polygons carry
             // their identity in the prim (object address, rank, copy) instead of Model 1's u/v.
             m_m2Smooth = !m_directColour && !m_flatMode &&
-                         arcadexr::profiles::GetInt("immersive.smoothMotion2", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
+                         arcadexr::profiles::GetInt("immersive.smoothMotion2", 0) != 0;   // off by default until the flashes are understood (25/09)
             if (m_directColour || m_m2Smooth) {
                 // Smooth motion (Model 1). Virtua Racing computes its 3D every OTHER arcade frame (30 Hz; measured
                 // 24/09) and the same frame is rebuilt for several refreshes: the blend runs between the last two
