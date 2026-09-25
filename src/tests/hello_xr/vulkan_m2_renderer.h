@@ -3301,55 +3301,31 @@ private:
             }
             const float ownLen = std::sqrt(meanOwn[0] * meanOwn[0] + meanOwn[1] * meanOwn[1]);
             if (m_m2Smooth && fitOk) {
-                // Model 2 (25/09): one motion per OBJECT, never per polygon. Per-polygon partners gave neighbours
-                // slightly different motions: cracks where the sky showed (blue lines) and decals sliding under the
-                // body (textures flickering on the cars). Still in the world (own motion under 1.5 px, or no partner at
-                // all): the camera motion, identical for the whole scene. Moving (a car): an affine map cur -> prev
-                // fitted on the object's matched corners, applied to all its vertices.
-                float F[12]; bool ok = false;
-                if (nm > 0 && ownLen >= 1.5f) {
-                    double N[4][4] = {}, B[4][3] = {};
-                    int pts = 0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        if (!bqs[i]) continue;
-                        const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
-                        for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
-                            const float* d = &m_rawVerts[size_t(v) * 5];
-                            const float* pv = bqs[i]->p[std::min<uint32_t>(v - cq.v0, 3u)];
-                            const double x[4] = {d[0], d[1], d[2], 1.0};
-                            for (int r = 0; r < 4; ++r) {
-                                for (int c = 0; c < 4; ++c) N[r][c] += x[r] * x[c];
-                                for (int c = 0; c < 3; ++c) B[r][c] += x[r] * pv[c];
-                            }
-                            ++pts;
-                        }
-                    }
-                    if (pts >= 6) {   // Gauss-Jordan on [N | B]
-                        double M[4][7];
-                        for (int r = 0; r < 4; ++r) { for (int c = 0; c < 4; ++c) M[r][c] = N[r][c]; for (int c = 0; c < 3; ++c) M[r][4 + c] = B[r][c]; }
-                        ok = true;
-                        for (int col = 0; col < 4 && ok; ++col) {
-                            int piv = col;
-                            for (int r = col + 1; r < 4; ++r) if (std::fabs(M[r][col]) > std::fabs(M[piv][col])) piv = r;
-                            if (std::fabs(M[piv][col]) < 1e-9) { ok = false; break; }
-                            if (piv != col) for (int c = 0; c < 7; ++c) std::swap(M[piv][c], M[col][c]);
-                            const double inv = 1.0 / M[col][col];
-                            for (int c = 0; c < 7; ++c) M[col][c] *= inv;
-                            for (int r = 0; r < 4; ++r) if (r != col) { const double f = M[r][col]; for (int c = 0; c < 7; ++c) M[r][c] -= f * M[col][c]; }
-                        }
-                        if (ok) for (int oc = 0; oc < 3; ++oc) for (int r = 0; r < 4; ++r) F[oc * 4 + r] = float(M[r][4 + oc]);
-                    }
-                }
-                const float* map = ok ? F : Ai;
+                // Model 2 (25/09): one motion per OBJECT, never per polygon -- and no deforming fit. Still objects
+                // (the road pieces, the scenery) follow the camera motion, identical for the whole scene; moving
+                // objects (cars) follow the camera plus one translation (their mean own motion), Model 1's proven
+                // rigid rule. The class keeps a margin and remembers itself from frame to frame (by object identity):
+                // an object flipping between classes jumped, and two neighbours in different classes opened a crack
+                // where the sky showed (the thin blue line across at wheel level).
+                const MotionQuad& first = m_curQuads[curOrder[curObjs[o].first]];
+                const uint32_t objId = first.obj;
+                bool moving = false;
+                auto itc = m_objMoving.find(objId);
+                const bool was = itc != m_objMoving.end() && itc->second;
+                if (nm > 0) moving = was ? (ownLen > 3.0f) : (ownLen > 8.0f);
+                else if (borrow) moving = true;
+                if (moving != was) ++m_classFlips;
+                m_objMovingNext[objId] = moving;
                 for (uint32_t i = 0; i < n; ++i) {
                     const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
                     for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
                         const float* d = &m_rawVerts[size_t(v) * 5];
+                        const float src[3] = {d[0] - (moving ? meanRaw[0] : 0.0f), d[1] - (moving ? meanRaw[1] : 0.0f), d[2] - (moving ? meanRaw[2] : 0.0f)};
                         float* o4 = &m_prevPosCpu[size_t(v) * 4];
-                        for (int r = 0; r < 3; ++r) o4[r] = map[r * 4] * d[0] + map[r * 4 + 1] * d[1] + map[r * 4 + 2] * d[2] + map[r * 4 + 3];
+                        for (int r = 0; r < 3; ++r) o4[r] = Ai[r * 4] * src[0] + Ai[r * 4 + 1] * src[1] + Ai[r * 4 + 2] * src[2] + Ai[r * 4 + 3];
                         o4[3] = 1.0f;
                     }
-                    if (ok) { ++rigidQuads; ++matchedQuads; } else { ++staticQuads; if (nm > 0) ++matchedQuads; }   // a still object that found itself counts as matched (camera-cut test below)
+                    if (moving) { ++rigidQuads; ++matchedQuads; } else { ++staticQuads; if (nm > 0) ++matchedQuads; }
                 }
                 continue;
             }
@@ -3390,6 +3366,12 @@ private:
         // the car in green shards, 24/09 -- a per-vertex guard did that). Crossing z = 0 is fine: the GPU clips in
         // homogeneous space. A matched quad whose own motion (camera removed) exceeds 64 screen pixels is a bad
         // match: it follows the camera instead, as static scenery.
+        if (m_m2Smooth) {
+            m_objMoving.swap(m_objMovingNext); m_objMovingNext.clear();
+            if (diag && (m_motionDiagTick % 8u) == 7u)
+                __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION", "class flips since last log=%u objects=%zu", m_classFlips, m_objMoving.size());
+            if (diag && (m_motionDiagTick % 8u) == 7u) m_classFlips = 0;
+        }
         size_t guarded = 0;
         for (const MotionQuad& cq : m_curQuads) {
             bool all = true;
@@ -3437,6 +3419,8 @@ public:
     // Smooth motion: blend of the previous and current arcade frames for this display refresh (1 = current).
     void SetSmooth(bool on) { m_smooth = on; }
     bool HasMotionIds() const { return m_directColour || m_m2Smooth; }
+    std::unordered_map<uint32_t, bool> m_objMoving, m_objMovingNext;   // Model 2 smooth motion: class per object
+    uint32_t m_classFlips = 0;
     bool m_m2Smooth = false;
 private:
     float* m_vboMappedF[kFrames] = {};
