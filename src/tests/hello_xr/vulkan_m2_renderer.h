@@ -3060,9 +3060,18 @@ private:
     void MatchMotionMatrices(const tcvr_m2_frame& frame, size_t nv) {
         m_prevPosCpu.assign(nv * 4, 0.0f);
         m_curMats.clear();
-        auto objKey = [](const tcvr_m2_prim& p) {
+        // The VIEW is part of an object's identity (26/09): the car-select screen draws a car in each box, each box
+        // its own view centred on its car -- the same model in two boxes sits at the same camera-space place, and
+        // pairing across views made the cars flash. View = window + projection centre + clip rectangle.
+        auto viewKey = [](const tcvr_m2_prim& p) {
             uint32_t h = 2166136261u;
-            for (uint32_t w : {p.motion_addr, p.motion_serial, p.window}) { h ^= w; h *= 16777619u; }
+            for (uint32_t w : {p.window, uint32_t(p.center_x), uint32_t(p.center_y), uint32_t(p.clip_l), uint32_t(p.clip_t),
+                               uint32_t(p.clip_r), uint32_t(p.clip_b)}) { h ^= w; h *= 16777619u; }
+            return h;
+        };
+        auto objKey = [&viewKey](const tcvr_m2_prim& p) {
+            uint32_t h = viewKey(p);
+            for (uint32_t w : {p.motion_addr, p.motion_serial}) { h ^= w; h *= 16777619u; }
             return h;
         };
         if (!frame.raw_motion) { m_prevMats.clear(); m_prevCopies.clear(); return; }
@@ -3077,7 +3086,7 @@ private:
             const tcvr_m2_prim& rp = m_rawPrims[k];
             ObjMat om; for (int i = 0; i < 14; ++i) om.m[i] = mo[i];
             if (m_curMats.emplace(objKey(rp), om).second)
-                groups[(uint64_t(rp.motion_addr) << 8) | (rp.window & 0xffu)].push_back({objKey(rp), om});
+                groups[(uint64_t(rp.motion_addr) << 32) | viewKey(rp)].push_back({objKey(rp), om});
         }
         // pair copies -> m_pairedPrev: current object key -> previous matrix
         std::unordered_map<uint32_t, ObjMat> pairedPrev;
@@ -3104,6 +3113,36 @@ private:
                 pairedPrev.emplace(g.second[c.ci].first, prevList[c.pi]);
             }
         }
+        // Everything on screen is drawn at the SAME instant (26/09): an object with no partner (a wheel -- the game
+        // swaps wheel models to spin them) left at its current position while its car, blended, sat up to a frame
+        // earlier: wheels off the body. An unpaired object borrows the frame-to-frame motion of the nearest paired
+        // object of its view (object origins in camera space): the wheel follows its car, a lone prop the scenery.
+        // Motion of a paired object n, as a map on camera space: prev = A_pn * A_cn^-1 * (x - b_cn) + b_pn.
+        std::unordered_map<uint32_t, std::pair<ObjMat, ObjMat>> borrowed;   // unpaired key -> (neighbour cur, neighbour prev)
+        {
+            std::unordered_map<uint32_t, std::vector<uint32_t>> pairedByView;   // view key -> paired object keys
+            std::unordered_map<uint32_t, uint32_t> viewOf;
+            for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
+                const uint32_t ok = objKey(m_rawPrims[k]);
+                if (viewOf.count(ok)) continue;
+                viewOf[ok] = viewKey(m_rawPrims[k]);
+                if (pairedPrev.count(ok) && m_curMats.count(ok)) pairedByView[viewOf[ok]].push_back(ok);
+            }
+            for (const auto& kv : m_curMats) {
+                if (pairedPrev.count(kv.first)) continue;
+                auto pv = pairedByView.find(viewOf[kv.first]);
+                if (pv == pairedByView.end()) continue;
+                const float* a = kv.second.m;
+                float bestD = 1e30f; uint32_t best = 0;
+                for (uint32_t nk : pv->second) {
+                    const float* b = m_curMats[nk].m;
+                    const float dx = a[9] - b[9], dy = a[10] - b[10], dz = a[11] - b[11];
+                    const float d = dx * dx + dy * dy + dz * dz;
+                    if (d < bestD) { bestD = d; best = nk; }
+                }
+                if (bestD < 1e29f) borrowed.emplace(kv.first, std::make_pair(m_curMats[best], pairedPrev[best]));
+            }
+        }
         std::unordered_map<uint64_t, std::vector<ObjMat>> copiesNow;
         for (auto& g : groups) { auto& v = copiesNow[g.first]; for (auto& c : g.second) v.push_back(c.second); }
         const bool blendable = m_haveMainView && !pairedPrev.empty();
@@ -3127,14 +3166,21 @@ private:
                 if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
                 const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
                 if (mo[14] < 0.5f) continue;
-                auto it = pairedPrev.find(objKey(m_rawPrims[k]));
-                if (it == pairedPrev.end()) continue;
-                const float* pm = it->second.m;
-                // unfocus, then object coordinates: A^-1 (o - b), A columns = (m0 m1 m2), (m3 m4 m5), (m6 m7 m8)
+                const uint32_t okey = objKey(m_rawPrims[k]);
+                const float* pm = nullptr;
+                const float* cm = mo;   // the matrix whose inverse brings the vertex to "object" space
+                auto it = pairedPrev.find(okey);
+                if (it != pairedPrev.end()) pm = it->second.m;
+                else {
+                    auto bo = borrowed.find(okey);
+                    if (bo == borrowed.end()) continue;
+                    cm = bo->second.first.m; pm = bo->second.second.m;   // the neighbour's own cur -> prev motion
+                }
+                // unfocus (this object's focus), then the neighbour-or-own object space: A^-1 (o - b)
                 const float* d = &m_rawVerts[v * 5];
                 if (std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
-                const float o[3] = {d[0] / mo[12] - mo[9], d[1] / mo[13] - mo[10], d[2] - mo[11]};
-                const float a = mo[0], b = mo[3], c = mo[6], e = mo[1], f = mo[4], g = mo[7], h = mo[2], i2 = mo[5], j = mo[8];
+                const float o[3] = {d[0] / mo[12] - cm[9], d[1] / mo[13] - cm[10], d[2] - cm[11]};
+                const float a = cm[0], b = cm[3], c = cm[6], e = cm[1], f = cm[4], g = cm[7], h = cm[2], i2 = cm[5], j = cm[8];
                 const float det = a * (f * j - g * i2) - b * (e * j - g * h) + c * (e * i2 - f * h);
                 if (std::fabs(det) < 1e-9f) continue;
                 const float id = 1.0f / det;
