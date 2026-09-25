@@ -1263,6 +1263,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 PrepareSystem22(cmd, swapchainData);
                 m_cpuPrepMs += std::chrono::duration<float, std::milli>(clk::now() - tp).count();
             }
+            // Model 1/2 immersive: dynamic resolution (sub-rectangle of the 2x supersampled swapchain, applied
+            // from the next frame; the compositor scales it for free). See UpdateM2DynamicScale.
+            if (!m_s22Active && m_lastM2Drawn && M2SceneLive()) {
+                const float fixed = arcadexr::config::GetFloat("m2.viewportScale", 0.0f);
+                m_viewportScale = fixed > 0.0f ? std::max(0.3f, std::min(1.0f, fixed)) : m_m2DynScale;   // 1.0 unless dynres on
+            }
             // SCREEN presentation of a Model 2 game: the GPU draws it in the board's projection (MAME can
             // stop rasterising, like in immersive). Falls back to MAME's framebuffer when it cannot.
             m_flatDrawn = false;
@@ -1965,6 +1971,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_lastM2Frame = nullptr;
         m_lastM2Drawn = false;
         m_lastM2RenderedSeq = 0;
+        m_m2DynScale = 1.0f;
         m_flatBoundView = VK_NULL_HANDLE;
         m_m2SceneRequested = false;
         if (m_m2SceneMode > 0 && !arcadexr::profiles::IsSystem22()) arcadexr::hardware::sega_model2::EnableScene(0);
@@ -2129,6 +2136,47 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (vkCreateQueryPool(m_vkDevice, &qi, nullptr, &m_gpuQueryPool) != VK_SUCCESS) m_gpuQueryPool = VK_NULL_HANDLE;
     }
 
+    // Dynamic resolution for Model 1/2 immersive (25/09). The demo ran at 120 fps, a real race did not: Sega Rally
+    // 58/90 with the GPU at 17 ms for both eyes, Super GT 3-34 missed frames a second at 13 ms for an 8.3 ms
+    // budget. A frozen race scene measured 7 ms with NO polygon at all: the cost is the fill of the 3360x3520
+    // eye (2x the runtime's recommended size, 2.6x the native pixels), not a setting. So the rendered area
+    // follows the measured GPU time: down fast when a refresh would be missed, up slowly when there is room.
+    // Never below m2.dynresMin (0.5 = the recommended size, i.e. no supersampling). m2.dynres=0 turns it off,
+    // m2.viewportScale forces a fixed scale for A/B. Logged as TCVR_DYNRES when it moves.
+    void UpdateM2DynamicScale(float gpuMs) {
+        // Sega Rally is the validated GOLD (23/09, judged perfect in the headset by Guillaume): never touched.
+        const bool on = arcadexr::config::GetInt("m2.dynres", 1) != 0 &&
+                        arcadexr::profiles::GetInt("immersive.dynres", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
+        if (!on || !m_lastM2Drawn || m_s22Active) {
+            m_m2DynScale = 1.0f; m_dynSamples.clear(); return;
+        }
+        m_dynSamples.push_back(gpuMs);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_dynAt < std::chrono::milliseconds(400) || m_dynSamples.size() < 8) return;
+        m_dynAt = now;
+        std::vector<float> v = m_dynSamples;
+        m_dynSamples.clear();
+        std::sort(v.begin(), v.end());
+        const float p75 = v[(v.size() * 3) / 4];
+        const float hz = arcadexr::xr::State().current > 1.0f ? arcadexr::xr::State().current : 90.0f;
+        const float target = (1000.0f / hz) * std::max(0.5f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresBudget", 0.85f)));
+        const float lo = std::max(0.3f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresMin", 0.5f)));
+        // GPU time is roughly fixed + area; area goes with scale squared.
+        float want = m_m2DynScale * std::sqrt(target / std::max(0.5f, p75));
+        float next = m_m2DynScale;
+        if (p75 > target) next = std::max(want, m_m2DynScale - 0.10f);                 // over budget: act now
+        else if (p75 < target * 0.80f) next = std::min(want, m_m2DynScale + 0.03f);    // clear room: creep up
+        next = std::max(lo, std::min(1.0f, next));
+        if (std::fabs(next - m_m2DynScale) >= 0.01f) {
+            Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES gpu p75=%.2f ms target=%.2f (%.0f Hz) scale %.2f -> %.2f",
+                                             p75, target, hz, m_m2DynScale, next));
+            m_m2DynScale = next;
+        }
+    }
+    float m_m2DynScale{1.0f};
+    std::vector<float> m_dynSamples;
+    std::chrono::steady_clock::time_point m_dynAt{};
+
     void ReadGpuTimestamps() {
         const uint32_t s0 = m_frameSlot * 2;   // the slot just fenced: its two eyes' queries
         if (m_gpuQueryPool == VK_NULL_HANDLE || !m_gpuQueryWritten[s0] || !m_gpuQueryWritten[s0 + 1]) return;
@@ -2138,6 +2186,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             return;
         const double ms = (double(ts[1] - ts[0]) + double(ts[3] - ts[2])) * m_timestampPeriodNs * 1e-6;
         m_gpuSamples.push_back(float(ms));
+        UpdateM2DynamicScale(float(ms));
         const auto now = std::chrono::steady_clock::now();
         if (now - m_gpuLogAt >= std::chrono::seconds(1) && !m_gpuSamples.empty()) {
             std::vector<float> s = m_gpuSamples;
