@@ -1295,6 +1295,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 const std::string pres = arcadexr::profiles::GetString("presentation", "immersive");
                 const bool wantFlat = pres != "immersive" && M2SceneLive() &&
                                       arcadexr::config::GetInt("m2.vkFlat", 1) != 0;
+                {   // why flat (25/09: Top Skater showed flat with its profile saying immersive)
+                    static std::string s_lastPresLog;
+                    const std::string key = pres + "|" + arcadexr::profiles::CurrentGame() + "|" + (wantFlat ? "1" : "0");
+                    if (key != s_lastPresLog) {
+                        s_lastPresLog = key;
+                        Log::Write(Log::Level::Info, Fmt("TCVR_PRES game=%s presentation=%s wantFlat=%d m2Live=%d",
+                            arcadexr::profiles::CurrentGame().c_str(), pres.c_str(), int(wantFlat), int(M2SceneLive())));
+                    }
+                }
                 if (wantFlat) {
                     EnsureM2Renderer(swapchainData);
                     if (m_m2Renderer.HasGeometry() && m_m2Renderer.RenderFlat(cmd)) {

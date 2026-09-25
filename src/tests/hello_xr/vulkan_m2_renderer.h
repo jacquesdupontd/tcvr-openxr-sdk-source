@@ -392,6 +392,8 @@ public:
             m_primDiagX = float(arcadexr::config::GetInt("m2.primDiagX", 248));
             m_primDiagY = float(arcadexr::config::GetInt("m2.primDiagY", 330));
             __android_log_print(ANDROID_LOG_INFO, "TCVR_PRIM", "---- pixel (%.0f, %.0f) seq=%llu", m_primDiagX, m_primDiagY, (unsigned long long)frame.sequence);
+            m_clN = 0; m_clNotMain = 0; m_clBox[0] = m_clBox[2] = 1e9f; m_clBox[1] = m_clBox[3] = -1e9f;
+            m_clBk[0] = 0xffffffffu; m_clBk[1] = 0u; for (auto& b : m_clBand) b = 0; for (auto& b : m_clPass) b = 0;
         }
         if (frame.raw_prim_count > 0 && frame.raw_vertex_count > 0) {
             const std::uint32_t n = std::min<std::uint32_t>(frame.raw_prim_count, 0xffffu);
@@ -517,7 +519,31 @@ public:
                 const bool invisible = q.textured == 0u && q.translucent != 0u;
                 // Discard-free: opaque, no stipple, main camera (secondary views need the clip test).
                 const bool fast = !isGlass && isMain && (q.translucent == 0u || !RegionHasHoles(q));
-                if (m_primDiagOn && vc >= 3) {
+                if (m_primDiagOn && vc >= 3 && arcadexr::config::GetInt("m2.primDiag", 0) == 2) {
+                    // debug.tcvr.m2_primDiag=2 (25/09, Top Skater): a summary of every polygon whose first vertex lies
+                    // between m2.clusterZ0 and m2.clusterZ1 (the skater, a car...): count, screen box, buckets, passes,
+                    // and how many cover each 16-pixel band of screen rows. Logged once after the loop.
+                    const tcvr_m2_raw_vertex& r0 = frame.raw_vertices[p.first_vertex];
+                    const float z0c = float(arcadexr::config::GetInt("m2.clusterZ0", 10)), z1c = float(arcadexr::config::GetInt("m2.clusterZ1", 40));
+                    if (r0.z >= z0c && r0.z <= z1c) {
+                        ++m_clN;
+                        for (std::uint32_t v = 0; v < vc && v < 8; v++) {
+                            const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                            if (rv.z <= 0.0f) continue;
+                            const float sxv = float(frame.crtc_xoffset + q.center_x) + rv.x / rv.z;
+                            const float syv = float((384 - q.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
+                            m_clBox[0] = std::min(m_clBox[0], sxv); m_clBox[1] = std::max(m_clBox[1], sxv);
+                            m_clBox[2] = std::min(m_clBox[2], syv); m_clBox[3] = std::max(m_clBox[3], syv);
+                            const int band = std::max(0, std::min(23, int(syv) / 16));
+                            ++m_clBand[band];
+                        }
+                        const uint32_t bk = m_rawKeys[k] >> 16;
+                        m_clBk[0] = std::min(m_clBk[0], bk); m_clBk[1] = std::max(m_clBk[1], bk);
+                        if (invisible) ++m_clPass[0]; else if (!isGlass && !isMain) ++m_clPass[1]; else if (!isGlass && !fast) ++m_clPass[2]; else if (isGlass) ++m_clPass[3]; else ++m_clPass[4];
+                        if (!isMain) ++m_clNotMain;
+                    }
+                }
+                if (m_primDiagOn && vc >= 3 && arcadexr::config::GetInt("m2.primDiag", 0) != 2) {
                     // debug.tcvr.m2_primDiag=1: every polygon covering arcade pixel (m2.primDiagX, m2.primDiagY), with
                     // its draw rank, bucket, attributes and the pass that draws it (24/09, House of the Dead floor).
                     float sx[8], sy[8]; bool ok = true;
@@ -618,6 +644,15 @@ public:
                 m_rawIdx[io++] = idx;
             }
             m_rawIdx.resize(io);
+            if (m_primDiagOn && arcadexr::config::GetInt("m2.primDiag", 0) == 2) {
+                char bands[256]; int o = 0;
+                for (int b = 0; b < 24; ++b) o += std::snprintf(bands + o, sizeof bands - size_t(o), "%u ", m_clBand[b]);
+                __android_log_print(ANDROID_LOG_INFO, "TCVR_PRIM",
+                    "cluster z %d..%d: %u prims (not main %u) box x %.0f..%.0f y %.0f..%.0f buckets %u..%u passes none=%u sec=%u cut=%u glass=%u fast=%u | vertices per 16-row band: %s",
+                    arcadexr::config::GetInt("m2.clusterZ0", 10), arcadexr::config::GetInt("m2.clusterZ1", 40), m_clN, m_clNotMain,
+                    m_clBox[0], m_clBox[1], m_clBox[2], m_clBox[3], m_clBk[0], m_clBk[1],
+                    m_clPass[0], m_clPass[1], m_clPass[2], m_clPass[3], m_clPass[4], bands);
+            }
             GroundProbe(frame, mainCx, mainCy, mainB);
             SceneDepthProbe(frame, mainCx, mainCy);
             if (m_directColour) {
@@ -3378,6 +3413,7 @@ private:
     // Geometry unpack state
     std::vector<std::uint32_t> m_rawKeys;
     bool m_primDiagOn = false; uint32_t m_primDiagTick = 0; float m_primDiagX = 0, m_primDiagY = 0;
+    uint32_t m_clN = 0, m_clNotMain = 0, m_clBk[2] = {}, m_clBand[24] = {}, m_clPass[5] = {}; float m_clBox[4] = {};
     std::vector<tcvr_m2_prim> m_rawPrims;
     std::vector<float> m_rawVerts;
     std::vector<std::uint32_t> m_rawPrimOfVertex;
