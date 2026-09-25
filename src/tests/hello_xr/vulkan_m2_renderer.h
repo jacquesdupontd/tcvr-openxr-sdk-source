@@ -619,6 +619,7 @@ public:
             }
             m_rawIdx.resize(io);
             GroundProbe(frame, mainCx, mainCy, mainB);
+            SceneDepthProbe(frame, mainCx, mainCy);
             if (m_directColour) {
                 // Smooth motion (Model 1). Virtua Racing computes its 3D every OTHER arcade frame (30 Hz; measured
                 // 24/09) and the same frame is rebuilt for several refreshes: the blend runs between the last two
@@ -798,6 +799,11 @@ public:
         const bool autoScale = arcadexr::profiles::GetInt("immersive.autoScale", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
         const float eyeHeight = arcadexr::profiles::GetFloat("immersive.eyeHeight", 1.65f);
         float baseScale = distance / depthUnits;
+        // ISO scale (25/09): Sega Rally's units are metres (the Lancia measured on the PC MAME: 1.9 x 4.0 units for
+        // 1.77 x 3.90 m). immersive.metresPerUnit > 0 sets the world scale directly; 0 = the old screen-based one.
+        const float metresPerUnit = arcadexr::profiles::GetFloat("immersive.metresPerUnit",
+            arcadexr::profiles::CurrentGame() == "srallyc" ? 1.0f : 0.0f);
+        if (metresPerUnit > 0.0f) baseScale = metresPerUnit;
         if (autoScale && m_camHeightUnits > 1e-3f) baseScale = std::max(0.005f, std::min(5.0f, eyeHeight / m_camHeightUnits));
         const float worldScale = baseScale * std::max(0.1f, std::min(10.0f, arcadexr::profiles::GetFloat("immersive.worldScaleMul", 1.0f)));
         const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance,
@@ -884,6 +890,24 @@ public:
         hudToWorld.m[4] = screen.up.x * screen.height * hudK;   hudToWorld.m[5] = screen.up.y * screen.height * hudK;   hudToWorld.m[6] = screen.up.z * screen.height * hudK;
         hudToWorld.m[8] = screen.normal.x; hudToWorld.m[9] = screen.normal.y; hudToWorld.m[10] = screen.normal.z;
         hudToWorld.m[12] = hudCenter.x; hudToWorld.m[13] = hudCenter.y; hudToWorld.m[14] = hudCenter.z; hudToWorld.m[15] = 1.0f;
+        // HUD ISO (25/09): each HUD pixel on the board camera's ray through that pixel, at the depth the player
+        // looks at (SceneDepthProbe), through the same arcade-to-world transform as the 3D (scale, pitch). It covers
+        // exactly what it covers on the cabinet (0 px), whatever the depth. Profile immersive.hudIso, Sega Rally only.
+        const bool hudIso = !m_flatMode && m_haveMainView && m_sceneDepth > 0.0f &&
+            arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
+        if (hudIso) {
+            const float zh = std::max(1.0f, m_sceneDepth);
+            const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
+            XrMatrix4x4f H{};
+            H.m[0] = 496.0f / focusX * zh;
+            H.m[5] = 384.0f / focusY * zh;
+            H.m[10] = 1.0f;
+            H.m[12] = (248.0f - fcx) / focusX * zh;
+            H.m[13] = (fcy - 192.0f) / focusY * zh;
+            H.m[14] = zh;
+            H.m[15] = 1.0f;
+            XrMatrix4x4f_Multiply(&hudToWorld, &arcadeToWorld, &H);
+        }
         XrMatrix4x4f hudMvp;
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
         if (!m_flatMode && viewIndex == 0) {
@@ -1391,6 +1415,56 @@ public:
     // layer showed through (a flat plum area in the desert stage). The ground there takes the colour of the
     // floor the ARCADE shows at the bottom centre of its screen: the frontmost main-view polygon under that pixel,
     // averaged through the Model 2 colour chain on the CPU (texel -> lumaram -> palette -> colorxlat -> gamma).
+    // Scene depth where the player looks (25/09, HUD ISO): rays from the board camera through a grid of pixels in the
+    // centre / lower centre of the main view (the car in a chase view, the road ahead), tested against the drawn
+    // triangles exactly like GroundProbe; the median of the nearest hits, smoothed, in board units along the view
+    // axis. The HUD is then laid at that depth ON the board camera's rays: it covers exactly what it covers on the
+    // cabinet, and the eyes converge where they already look instead of on a plane 2 m away.
+    void SceneDepthProbe(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy) {
+        if (!m_haveMainView || (++m_depthProbeTick & 3u) != 0u) return;
+        const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
+        const float ffx = (m_m2FocusX > 1.0f) ? m_m2FocusX : 512.0f, ffy = (m_m2FocusY > 1.0f) ? m_m2FocusY : 512.0f;
+        const size_t end = std::min<size_t>(m_secIndexStart, m_rawIdx.size());
+        float hits[45]; int nh = 0;
+        for (int gy = 0; gy < 5; ++gy)
+            for (int gx = 0; gx < 9; ++gx) {
+                const float px = 150.0f + 24.5f * float(gx), py = 170.0f + 40.0f * float(gy);
+                const float d[3] = {(px - fx) / ffx, (fy - py) / ffy, 1.0f};
+                float best = 1e30f;
+                for (size_t i = 0; i + 2 < end; i += 3) {
+                    const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
+                    if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+                    const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
+                    const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
+                    const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
+                    const float A[3] = {a[0] / ffx, a[1] / ffy, a[2]};
+                    const float e1[3] = {b[0] / ffx - A[0], b[1] / ffy - A[1], b[2] - A[2]};
+                    const float e2[3] = {c[0] / ffx - A[0], c[1] / ffy - A[1], c[2] - A[2]};
+                    const float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+                    const float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+                    if (std::fabs(det) < 1e-12f) continue;
+                    const float inv = 1.0f / det;
+                    const float tv[3] = {-A[0], -A[1], -A[2]};
+                    const float u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+                    if (u < 0.0f || u > 1.0f) continue;
+                    const float qv[3] = {tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+                    const float v = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+                    if (v < 0.0f || u + v > 1.0f) continue;
+                    const float t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+                    if (t > 0.05f && t < best) best = t;
+                }
+                if (best < 1e29f) hits[nh++] = best;
+            }
+        if (nh < 5) return;
+        std::nth_element(hits, hits + nh / 2, hits + nh);
+        const float med = hits[nh / 2];
+        m_sceneDepth = (m_sceneDepth > 0.0f) ? m_sceneDepth + (med - m_sceneDepth) * 0.1f : med;
+        if ((++m_depthLogTick % 60u) == 0u)
+            Log::Write(Log::Level::Info, Fmt("TCVR_DEPTH scene median %.2f units (smoothed %.2f), %d/45 rays hit", med, m_sceneDepth, nh));
+    }
+    float m_sceneDepth = 0.0f;
+    uint32_t m_depthProbeTick = 0, m_depthLogTick = 0;
+
     void GroundProbe(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy, int32_t mainB) {
         if (!m_haveMainView || !frame.palram || !frame.colorxlat || !frame.lumaram || !frame.gamma) return;
         const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
