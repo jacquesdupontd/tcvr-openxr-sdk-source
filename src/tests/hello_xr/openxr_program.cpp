@@ -1429,6 +1429,17 @@ struct OpenXrProgram : IOpenXrProgram {
                 XrActionStateBoolean tglState{XR_TYPE_ACTION_STATE_BOOLEAN};
                 if (XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &tgl, &tglState)) && tglState.isActive && tglState.changedSinceLastSync && tglState.currentState) menu.Toggle();
             }
+            {   // bench: debug.tcvr.switch_game=<driver> changes game exactly like the selector (StopGame, then the new
+                // game in the same process), once per new value -- the path the player uses, never tested before 25/09
+                static std::string s_lastSwitch;
+                const std::string sw = arcadexr::config::GetString("switch_game", "");
+                if (!sw.empty() && sw != s_lastSwitch) {
+                    s_lastSwitch = sw;
+                    arcadexr::config::Set("game", sw.c_str());
+                    arcadexr::mame::StartGame(sw);
+                    Log::Write(Log::Level::Info, Fmt("TCVR_SWITCH bench switch to %s", sw.c_str()));
+                } else if (sw.empty()) s_lastSwitch.clear();
+            }
             {   // bench: debug.tcvr.menu_toggle=<n> toggles the menu once per new value (tests without a controller)
                 static int s_lastMenuToggle = 0;
                 const int mt = arcadexr::config::GetInt("menu.toggle", 0);

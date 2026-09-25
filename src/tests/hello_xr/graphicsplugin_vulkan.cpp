@@ -38,6 +38,7 @@
 #include "scene_bridge.h"
 #include "settings.h"
 #include "game_profile.h"
+#include <new>
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_renderer.h"
 #include "vulkan_overlay.h"
@@ -1196,8 +1197,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             ReadGpuTimestamps();
             if (m_dumpState == 1 && m_cmdBuffer[m_dumpCb].state != CmdBuffer::CmdBufferState::Executing) WriteDump();
             FlushOracle();
+            // Game switched in the same process (headset selector, debug.tcvr.switch_game): the Model 2 module
+            // still held the previous game's geometry, textures and last frame, and HaveSceneSource() stays true
+            // for every game once the Model 2 library is loaded -> Time Crisis II showed Virtua Racing frozen.
+            {
+                const std::string game = arcadexr::profiles::CurrentGame();
+                if (game != m_m2Game) { m_m2Game = game; ResetM2ForGameChange(); }
+            }
             m_m2Renderer.SetFrameSlot(int(m_frameSlot));
-            if (!m_m2SceneRequested && arcadexr::hardware::sega_model2::HaveSceneSource()) {
+            if (!m_m2SceneRequested && M2SceneLive()) {
                 m_m2SceneRequested = true;
                 SetM2SceneMode(1);
             }
@@ -1206,7 +1214,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             const bool freeze = arcadexr::config::GetInt("m2.freeze", 0) != 0 && m_lastM2Frame != nullptr;
             if (freeze) {
                 m2Frame = m_lastM2Frame;
-            } else if (arcadexr::hardware::sega_model2::HaveSceneSource()) {
+            } else if (M2SceneLive()) {
                 m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
                 if (m2Frame) m_lastM2Frame = m2Frame;
                 m_m2Renderer.SetSmooth(m_smoothOn);
@@ -1260,7 +1268,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_flatDrawn = false;
             {
                 const std::string pres = arcadexr::profiles::GetString("presentation", "immersive");
-                const bool wantFlat = pres != "immersive" && arcadexr::hardware::sega_model2::HaveSceneSource() &&
+                const bool wantFlat = pres != "immersive" && M2SceneLive() &&
                                       arcadexr::config::GetInt("m2.vkFlat", 1) != 0;
                 if (wantFlat) {
                     EnsureM2Renderer(swapchainData);
@@ -1385,7 +1393,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             s22Drawn = RenderSystem22Eye(cmd, viewIndex, layerView, swapchainData, imageIndex, renderArea);
             m2ImmersiveDrawn = s22Drawn;   // the eye image is written: skip the other paths
         }
-        if (immersiveAllowed && !s22Drawn) {
+        if (immersiveAllowed && !s22Drawn && M2SceneLive()) {
             EnsureM2Renderer(swapchainData);
             if (m_m2Renderer.HasGeometry()) {
                 const float clear[4] = {m_clearColor[0], m_clearColor[1], m_clearColor[2], 1.0f};
@@ -1940,6 +1948,30 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool m_smoothOn = false;
     int m_m2RateRequested = 0;
     uint64_t m_lastM2RenderedSeq = 0;
+
+    // The Model 1/2 scene path is only for a Model 1/2 game: the library's scene source outlives the game.
+    static bool M2SceneLive() {
+        return (arcadexr::profiles::IsModel2() || arcadexr::profiles::IsModel1()) &&
+               arcadexr::hardware::sega_model2::HaveSceneSource();
+    }
+
+    // Everything the Model 2 module learnt about the previous game goes: a fresh object (built geometry,
+    // texture shadows, regions, motion ids), no last frame, scene recording re-requested for the new game.
+    void ResetM2ForGameChange() {
+        if (m_vkDevice != VK_NULL_HANDLE) vkDeviceWaitIdle(m_vkDevice);
+        m_m2Renderer.~VulkanModel2Renderer();
+        new (&m_m2Renderer) arcadexr::vulkan::VulkanModel2Renderer();
+        m_m2RendererInitialized = false;
+        m_lastM2Frame = nullptr;
+        m_lastM2Drawn = false;
+        m_lastM2RenderedSeq = 0;
+        m_flatBoundView = VK_NULL_HANDLE;
+        m_m2SceneRequested = false;
+        if (m_m2SceneMode > 0 && !arcadexr::profiles::IsSystem22()) arcadexr::hardware::sega_model2::EnableScene(0);
+        m_m2SceneMode = -1;
+        Log::Write(Log::Level::Info, "TCVR_SWITCH Model 2 module reset for " + m_m2Game);
+    }
+    std::string m_m2Game;
 
     void EnsureM2Renderer(VulkanSwapchainImageData* swapchainData) {
         if (m_m2RendererInitialized) return;
