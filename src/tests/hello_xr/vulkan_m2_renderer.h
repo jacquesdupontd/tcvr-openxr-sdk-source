@@ -3300,6 +3300,59 @@ private:
                                         curObjs[o].second - curObjs[o].first, objC[o * 3], objC[o * 3 + 1], objC[o * 3 + 2], bestD);
             }
             const float ownLen = std::sqrt(meanOwn[0] * meanOwn[0] + meanOwn[1] * meanOwn[1]);
+            if (m_m2Smooth && fitOk) {
+                // Model 2 (25/09): one motion per OBJECT, never per polygon. Per-polygon partners gave neighbours
+                // slightly different motions: cracks where the sky showed (blue lines) and decals sliding under the
+                // body (textures flickering on the cars). Still in the world (own motion under 1.5 px, or no partner at
+                // all): the camera motion, identical for the whole scene. Moving (a car): an affine map cur -> prev
+                // fitted on the object's matched corners, applied to all its vertices.
+                float F[12]; bool ok = false;
+                if (nm > 0 && ownLen >= 1.5f) {
+                    double N[4][4] = {}, B[4][3] = {};
+                    int pts = 0;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        if (!bqs[i]) continue;
+                        const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
+                        for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
+                            const float* d = &m_rawVerts[size_t(v) * 5];
+                            const float* pv = bqs[i]->p[std::min<uint32_t>(v - cq.v0, 3u)];
+                            const double x[4] = {d[0], d[1], d[2], 1.0};
+                            for (int r = 0; r < 4; ++r) {
+                                for (int c = 0; c < 4; ++c) N[r][c] += x[r] * x[c];
+                                for (int c = 0; c < 3; ++c) B[r][c] += x[r] * pv[c];
+                            }
+                            ++pts;
+                        }
+                    }
+                    if (pts >= 6) {   // Gauss-Jordan on [N | B]
+                        double M[4][7];
+                        for (int r = 0; r < 4; ++r) { for (int c = 0; c < 4; ++c) M[r][c] = N[r][c]; for (int c = 0; c < 3; ++c) M[r][4 + c] = B[r][c]; }
+                        ok = true;
+                        for (int col = 0; col < 4 && ok; ++col) {
+                            int piv = col;
+                            for (int r = col + 1; r < 4; ++r) if (std::fabs(M[r][col]) > std::fabs(M[piv][col])) piv = r;
+                            if (std::fabs(M[piv][col]) < 1e-9) { ok = false; break; }
+                            if (piv != col) for (int c = 0; c < 7; ++c) std::swap(M[piv][c], M[col][c]);
+                            const double inv = 1.0 / M[col][col];
+                            for (int c = 0; c < 7; ++c) M[col][c] *= inv;
+                            for (int r = 0; r < 4; ++r) if (r != col) { const double f = M[r][col]; for (int c = 0; c < 7; ++c) M[r][c] -= f * M[col][c]; }
+                        }
+                        if (ok) for (int oc = 0; oc < 3; ++oc) for (int r = 0; r < 4; ++r) F[oc * 4 + r] = float(M[r][4 + oc]);
+                    }
+                }
+                const float* map = ok ? F : Ai;
+                for (uint32_t i = 0; i < n; ++i) {
+                    const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
+                    for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
+                        const float* d = &m_rawVerts[size_t(v) * 5];
+                        float* o4 = &m_prevPosCpu[size_t(v) * 4];
+                        for (int r = 0; r < 3; ++r) o4[r] = map[r * 4] * d[0] + map[r * 4 + 1] * d[1] + map[r * 4 + 2] * d[2] + map[r * 4 + 3];
+                        o4[3] = 1.0f;
+                    }
+                    if (ok) { ++rigidQuads; ++matchedQuads; } else { ++staticQuads; if (nm > 0) ++matchedQuads; }   // a still object that found itself counts as matched (camera-cut test below)
+                }
+                continue;
+            }
             for (uint32_t i = 0; i < n; ++i) {
                 const MotionQuad& cq = m_curQuads[curOrder[curObjs[o].first + i]];
                 const MotionQuad* bq = bqs[i];
