@@ -479,6 +479,8 @@ public:
                     }
                 }
                 m_rawPrims[k] = q;
+                if (m_rawPrimSrc.size() < m_rawPrims.size()) m_rawPrimSrc.resize(m_rawPrims.size());
+                m_rawPrimSrc[k] = 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu);   // capture index: its motion matrix
                 {
                     uint32_t slot = M2RegionTextures::kNone, micro = M2RegionTextures::kNone;
                     if (m_useRegions && q.textured != 0u) {
@@ -683,7 +685,7 @@ public:
                     m_newestPos.resize(nv * 3);
                     for (size_t v = 0; v < nv; ++v)
                         for (int c = 0; c < 3; ++c) m_newestPos[v * 3 + c] = m_rawVerts[v * 5 + c];
-                    MatchMotion(nv);
+                    if (m_directColour) MatchMotion(nv); else MatchMotionMatrices(frame, nv);
                 }
                 m_newGeometry = true;
             } else {
@@ -3046,6 +3048,82 @@ private:
     // one key (road sections, trackside objects): estimate the game camera's rigid motion on the keys seen exactly
     // once in both frames, then give each quad the copy that lands nearest once moved by it. An occurrence number
     // in MAME did not work: it shifts by one whenever a copy leaves the view (24/09, half the scene mismatched).
+    // Model 2 smooth motion by the GAME's matrices (25/09). Each raw vertex is focus(M * object vertex), M the object
+    // matrix the geometriser used (captured per prim). One frame earlier the same object (address + copy) had M_prev:
+    // prev = focus_prev(M_prev * M^-1 * unfocus(vertex)). Exact motion, nothing estimated: no cracks (the whole
+    // scenery shares the camera part of its matrices), no class to decide, nothing on a menu (no main view), and an
+    // object absent from the previous frame (a wheel model swapped to spin it) simply is not blended.
+    struct ObjMat { float m[14]; };
+    std::unordered_map<uint32_t, ObjMat> m_prevMats, m_curMats;
+    std::vector<uint32_t> m_rawPrimSrc;
+    uint32_t m_matCuts = 0;
+    void MatchMotionMatrices(const tcvr_m2_frame& frame, size_t nv) {
+        m_prevPosCpu.assign(nv * 4, 0.0f);
+        m_curMats.clear();
+        auto objKey = [](const tcvr_m2_prim& p) {
+            uint32_t h = 2166136261u;
+            for (uint32_t w : {p.motion_addr, p.motion_serial, p.window}) { h ^= w; h *= 16777619u; }
+            return h;
+        };
+        if (!frame.raw_motion) { m_prevMats.clear(); return; }
+        for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
+            const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
+            if (mo[14] < 0.5f) continue;
+            ObjMat om; for (int i = 0; i < 14; ++i) om.m[i] = mo[i];
+            m_curMats.emplace(objKey(m_rawPrims[k]), om);
+        }
+        const bool blendable = m_haveMainView && !m_prevMats.empty();
+        // Camera cut: most objects' origins jump by more than a third of their distance -> no blend this step.
+        size_t objs = 0, jumped = 0;
+        if (blendable)
+            for (const auto& kv : m_curMats) {
+                auto it = m_prevMats.find(kv.first);
+                if (it == m_prevMats.end()) continue;
+                const float* a = kv.second.m; const float* b = it->second.m;
+                const float dx = a[9] - b[9], dy = a[10] - b[10], dz = a[11] - b[11];
+                const float d = std::sqrt(a[9] * a[9] + a[10] * a[10] + a[11] * a[11]);
+                ++objs;
+                if (std::sqrt(dx * dx + dy * dy + dz * dz) > 0.33f * std::max(d, 1.0f)) ++jumped;
+            }
+        const bool cut = objs > 4 && jumped * 2 > objs;
+        if (cut) ++m_matCuts;
+        if (blendable && !cut) {
+            for (size_t v = 0; v < nv; ++v) {
+                const uint32_t k = m_rawPrimOfVertex[v];
+                if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
+                const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
+                if (mo[14] < 0.5f) continue;
+                auto it = m_prevMats.find(objKey(m_rawPrims[k]));
+                if (it == m_prevMats.end()) continue;
+                const float* pm = it->second.m;
+                // unfocus, then object coordinates: A^-1 (o - b), A columns = (m0 m1 m2), (m3 m4 m5), (m6 m7 m8)
+                const float* d = &m_rawVerts[v * 5];
+                if (std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
+                const float o[3] = {d[0] / mo[12] - mo[9], d[1] / mo[13] - mo[10], d[2] - mo[11]};
+                const float a = mo[0], b = mo[3], c = mo[6], e = mo[1], f = mo[4], g = mo[7], h = mo[2], i2 = mo[5], j = mo[8];
+                const float det = a * (f * j - g * i2) - b * (e * j - g * h) + c * (e * i2 - f * h);
+                if (std::fabs(det) < 1e-9f) continue;
+                const float id = 1.0f / det;
+                const float ob[3] = {
+                    ((f * j - g * i2) * o[0] + (c * i2 - b * j) * o[1] + (b * g - c * f) * o[2]) * id,
+                    ((g * h - e * j) * o[0] + (a * j - c * h) * o[1] + (c * e - a * g) * o[2]) * id,
+                    ((e * i2 - f * h) * o[0] + (b * h - a * i2) * o[1] + (a * f - b * e) * o[2]) * id};
+                const float px = ob[0] * pm[0] + ob[1] * pm[3] + ob[2] * pm[6] + pm[9];
+                const float py = ob[0] * pm[1] + ob[1] * pm[4] + ob[2] * pm[7] + pm[10];
+                const float pz = ob[0] * pm[2] + ob[1] * pm[5] + ob[2] * pm[8] + pm[11];
+                float* o4 = &m_prevPosCpu[v * 4];
+                o4[0] = px * pm[12]; o4[1] = py * pm[13]; o4[2] = pz; o4[3] = 1.0f;
+            }
+        }
+        if (arcadexr::config::GetInt("m2.motionDiag", 0) != 0 && (++m_motionDiagTick % 60u) == 0u) {
+            size_t blended = 0;
+            for (size_t v = 0; v < nv; ++v) blended += m_prevPosCpu[v * 4 + 3] > 0.5f ? 1u : 0u;
+            __android_log_print(ANDROID_LOG_INFO, "TCVR_MOTION", "matrices: objects=%zu with previous=%zu jumped=%zu cuts=%u | vertices %zu/%zu blended | main=%d",
+                                m_curMats.size(), objs, jumped, m_matCuts, blended, nv, int(m_haveMainView));
+        }
+        m_prevMats.swap(m_curMats);
+    }
+
     void MatchMotion(size_t nv) {
         m_curQuads.clear();
         for (size_t v = 0; v < nv;) {
