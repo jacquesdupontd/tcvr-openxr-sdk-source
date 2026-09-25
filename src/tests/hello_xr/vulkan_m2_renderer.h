@@ -1140,7 +1140,64 @@ public:
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[0], 0, nullptr);
             vkCmdPushConstants(cmd, m_planePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(frontPc), &frontPc);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
+            // Only the tiles holding HUD texels (see UploadLayers), each run scissored to its projected rectangle.
+            // Any corner behind the eye, a full-screen layer, or m2.hudTiles=0: the whole plane as before.
+            bool tiled = !m_frontFullscreen && !m_flatMode && !m_frontRuns.empty() && m_frontRunsW > 0 &&
+                         arcadexr::config::GetInt("m2.hudTiles", 1) != 0;
+            std::vector<VkRect2D> rects;
+            if (tiled) {
+                const float* M = frontPc.uHudMvp;
+                for (const FrontRun& r : m_frontRuns) {
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (int c = 0; c < 4; ++c) {
+                        // three arcade texels of margin: the HUD filter reads up to 2 texels around (measured: 1.5 lost pixels)
+                        const float px = (c & 1) ? float(r.x1) + 3.0f : float(r.x0) - 3.0f;
+                        const float py = (c & 2) ? float(r.y1) + 3.0f : float(r.y0) - 3.0f;
+                        const float u = px / float(m_frontRunsW) - 0.5f, v = 0.5f - py / float(m_frontRunsH);
+                        const float cx = M[0] * u + M[4] * v + M[12], cy = M[1] * u + M[5] * v + M[13], cw = M[3] * u + M[7] * v + M[15];
+                        if (cw <= 1e-4f) { tiled = false; break; }
+                        const float sx = (cx / cw * 0.5f + 0.5f) * outW, sy = (cy / cw * 0.5f + 0.5f) * outH;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                    }
+                    if (!tiled) break;
+                    const int ix0 = std::max(0, int(x0) - 2), iy0 = std::max(0, int(y0) - 2);
+                    const int ix1 = std::min(int(outW), int(x1) + 3), iy1 = std::min(int(outH), int(y1) + 3);
+                    if (ix1 > ix0 && iy1 > iy0) rects.push_back({{ix0, iy0}, {uint32_t(ix1 - ix0), uint32_t(iy1 - iy0)}});
+                }
+            }
+            if (tiled) {
+                // The expanded rectangles overlap (neighbouring rows, margins): a pixel drawn twice would blend its
+                // anti-aliased HUD edge twice (measured: 4-7 k pixels off by up to 40). Snap them to a grid of
+                // disjoint 32 px cells of the eye image and draw each marked row run once.
+                const int cs = 32, gw = (int(outW) + cs - 1) / cs, gh = (int(outH) + cs - 1) / cs;
+                m_hudCells.assign(size_t(gw) * size_t(gh), 0u);
+                for (const VkRect2D& rc : rects) {
+                    const int cx0 = rc.offset.x / cs, cy0 = rc.offset.y / cs;
+                    const int cx1 = std::min(gw - 1, (rc.offset.x + int(rc.extent.width) - 1) / cs);
+                    const int cy1 = std::min(gh - 1, (rc.offset.y + int(rc.extent.height) - 1) / cs);
+                    for (int cy = cy0; cy <= cy1; ++cy)
+                        for (int cx = cx0; cx <= cx1; ++cx) m_hudCells[size_t(cy) * size_t(gw) + size_t(cx)] = 1u;
+                }
+                for (int cy = 0; cy < gh; ++cy) {
+                    int run = -1;
+                    for (int cx = 0; cx <= gw; ++cx) {
+                        const bool on = cx < gw && m_hudCells[size_t(cy) * size_t(gw) + size_t(cx)] != 0u;
+                        if (on && run < 0) run = cx;
+                        if (!on && run >= 0) {
+                            const int x0 = run * cs, y0 = cy * cs;
+                            const int x1 = std::min(int(outW), cx * cs), y1 = std::min(int(outH), (cy + 1) * cs);
+                            const VkRect2D rc{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+                            vkCmdSetScissor(cmd, 0, 1, &rc);
+                            vkCmdDraw(cmd, 3, 1, 0, 0);
+                            run = -1;
+                        }
+                    }
+                }
+                const VkRect2D full{{0, 0}, {uint32_t(outW), uint32_t(outH)}};
+                vkCmdSetScissor(cmd, 0, 1, &full);
+            } else {
+                vkCmdDraw(cmd, 3, 1, 0, 0);
+            }
         }
 
         static unsigned s_immFrames = 0;
@@ -1463,6 +1520,10 @@ public:
             Log::Write(Log::Level::Info, Fmt("TCVR_DEPTH scene median %.2f units (smoothed %.2f), %d/45 rays hit", med, m_sceneDepth, nh));
     }
     float m_sceneDepth = 0.0f;
+    struct FrontRun { uint16_t x0, y0, x1, y1; };
+    std::vector<FrontRun> m_frontRuns;
+    std::vector<uint8_t> m_hudCells;
+    uint32_t m_frontRunsW = 0, m_frontRunsH = 0;
     uint32_t m_depthProbeTick = 0, m_depthLogTick = 0;
 
     void GroundProbe(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy, int32_t mainB) {
@@ -2732,6 +2793,23 @@ private:
                     }
                 // the flash only: nearly all of the screen, nearly all white (a title page on black is not enlarged)
                 m_frontFullscreen = total > 0 && opaque * 10u >= total * 8u && white * 10u >= total * 8u;
+                // Tiles that hold HUD texels (25/09): the front pass is a full-view plane whose fragments cost even where
+                // the layer is transparent -- most of it. Only 16x16 tiles with an opaque texel are drawn (runs per row,
+                // scissored), same pixels, a fraction of the fragments.
+                m_frontRuns.clear();
+                for (uint32_t ty = 0; ty * 16u < copyH; ++ty) {
+                    int runStart = -1;
+                    for (uint32_t tx = 0; tx * 16u <= copyW; ++tx) {
+                        bool any = false;
+                        if (tx * 16u < copyW)
+                            for (uint32_t y = ty * 16u; y < std::min(copyH, ty * 16u + 16u) && !any; ++y)
+                                for (uint32_t x = tx * 16u; x < std::min(copyW, tx * 16u + 16u); ++x)
+                                    if (pixels[y * stride + x] != 0u) { any = true; break; }
+                        if (any && runStart < 0) runStart = int(tx);
+                        if (!any && runStart >= 0) { m_frontRuns.push_back({uint16_t(runStart * 16), uint16_t(ty * 16u), uint16_t(std::min(copyW, tx * 16u)), uint16_t(std::min(copyH, ty * 16u + 16u))}); runStart = -1; }
+                    }
+                }
+                m_frontRunsW = copyW; m_frontRunsH = copyH;
                 static unsigned s_ffLog = 0;
                 if (m_frontFullscreen && (s_ffLog++ % 30u) == 0u)
                     Log::Write(Log::Level::Info, Fmt("TCVR_M2VK front layer full-screen (%u/%u opaque): drawn over the whole view", opaque, total));
