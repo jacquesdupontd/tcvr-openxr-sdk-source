@@ -954,12 +954,15 @@ public:
         // HUD ISO (25/09): each HUD pixel on the board camera's ray through that pixel, at the depth the player
         // looks at (SceneDepthProbe), through the same arcade-to-world transform as the 3D (scale, pitch). It covers
         // exactly what it covers on the cabinet (0 px), whatever the depth. Profile immersive.hudIso, Sega Rally only.
-        // Not on a menu screen (26/09): a menu is ONE screen, its "3D" boxes flattened with the page on the back plane;
-        // posted at the scene depth instead, they floated in front of the page (parallax).
-        const bool hudIso = !m_flatMode && m_haveMainView && !m_isMenuM1 && m_sceneDepth > 0.0f &&
+        // A menu screen (26/09) is ONE flat screen: all of it -- boxes, texts AND the 2D page behind, see hudMvpBack -- on
+        // the rays at the depth the game draws its 3D (deepest main-view vertex: 28 units in Sega Rally's menus, i.e.
+        // far and large as on 25/09). Brought to the 2 m HUD plane it sat "right in front of the eyes"; boxes at the
+        // game depth with the page left at 2 m, it was a parallax.
+        const bool menuIso = m_isMenuM1 && m_mainZMax > 0.0f;
+        const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? menuIso : m_sceneDepth > 0.0f) &&
             arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
         if (hudIso) {
-            const float zh = std::max(1.0f, m_sceneDepth);
+            const float zh = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);
             const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
             XrMatrix4x4f H{};
             H.m[0] = 496.0f / focusX * zh;
@@ -1004,6 +1007,7 @@ public:
         hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
         XrMatrix4x4f hudMvpBack;
         XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
+        if (hudIso && menuScreen) hudMvpBack = hudMvp;   // the page on the plane of its boxes (see hudIso)
         if (m_flatMode) {
             // FLAT: the board's own projection into the flat target (see RenderFlat), every view on the
             // screen plane mapped 1:1 onto it (plane (u,v) in -0.5..0.5 -> NDC (2u, -2v), Vulkan y down).
