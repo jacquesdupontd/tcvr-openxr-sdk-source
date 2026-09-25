@@ -76,6 +76,9 @@ struct IGraphicsPlugin {
     // Fraction of each view swapchain the app renders into (subImage.imageRect). The runtime compositor
     // scales that rectangle to the display as part of its reprojection, at no cost to the app.
     virtual float ViewportScale() const { return 1.0f; }
+    // Whether the last RenderView wrote the view's DEPTH swapchain image. A depth layer is only submitted for a
+    // view that did: a stale depth image makes the compositor reproject the image at a wrong distance.
+    virtual bool ViewWroteDepth() const { return true; }
     // Arcade cadence: false = nothing new to draw this refresh; the previous projection layer is submitted
     // again and the runtime reprojects it to the current head pose.
     virtual bool RenderThisFrame() { return true; }

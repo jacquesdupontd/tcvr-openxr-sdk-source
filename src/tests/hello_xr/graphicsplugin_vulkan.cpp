@@ -1418,6 +1418,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 vkCmdEndRenderPass(cmd);
             }
         }
+        // The Model 2 / System 22 modules draw with their own transient depth: the depth swapchain image of this
+        // view is not written, and must not be submitted (25/09: the car-select menu slid when the head moved).
+        m_viewWroteDepth = !m2ImmersiveDrawn;
         if (!m2ImmersiveDrawn) {
         SetViewportAndScissor(cmd, renderArea);
 
@@ -1631,6 +1634,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     bool WantsFoveationFdm() const override { return m_fdmEnabled; }
     float ViewportScale() const override { return m_viewportScale; }
+    bool ViewWroteDepth() const override { return m_viewWroteDepth; }
+    bool m_viewWroteDepth = true;
     // Arcade cadence (s22.cadence, default on): System 22 runs at 60 Hz. The display is set to 120 Hz and a
     // frame is drawn only when the game produced a new one, so every arcade frame is shown exactly twice
     // (no 2-1-2-1 judder on 90 Hz, and an alternating 30 Hz effect stays regular) and each drawn frame has

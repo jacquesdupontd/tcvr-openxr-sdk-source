@@ -2025,7 +2025,6 @@ struct OpenXrProgram : IOpenXrProgram {
             // depth swapchain twice). The space-warp struct is chained below,
             // after the view is rendered.
             if (m_supportsDepthLayer && !m_appswActive) {
-                projectionLayerViews[i].next = &depthInfos[i];
                 depthInfos[i].type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR;
                 depthInfos[i].subImage.swapchain = m_depthSwapchains[i].handle;
                 depthInfos[i].subImage.imageRect.offset = {0, 0};
@@ -2042,6 +2041,10 @@ struct OpenXrProgram : IOpenXrProgram {
             // graphics backend. FOV asymmetry is not an eye identifier: on a
             // symmetric headset it can select the same eye texture twice.
             m_graphicsPlugin->RenderView(i, projectionLayerViews[i], swapchainImage, m_colorSwapchainFormat, cubes);
+            // Depth layer only for a view whose depth image was really written this frame (see ViewWroteDepth):
+            // otherwise the compositor reprojects the image with a depth that is not the image's.
+            if (m_supportsDepthLayer && !m_appswActive && m_graphicsPlugin->ViewWroteDepth())
+                projectionLayerViews[i].next = &depthInfos[i];
 
             XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             CHECK_XRCMD(xrReleaseSwapchainImage(viewSwapchain.handle, &releaseInfo));
