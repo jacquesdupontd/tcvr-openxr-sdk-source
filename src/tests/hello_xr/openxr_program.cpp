@@ -5,6 +5,7 @@
 #include <chrono>
 #include "openxr/openxr.h"
 #include "pch.h"
+#include <ctime>
 #include "common.h"
 #include "platformdata.h"
 #include "platformplugin.h"
@@ -1438,6 +1439,9 @@ struct OpenXrProgram : IOpenXrProgram {
                     arcadexr::config::Set("game", sw.c_str());
                     arcadexr::mame::StartGame(sw);
                     Log::Write(Log::Level::Info, Fmt("TCVR_SWITCH bench switch to %s", sw.c_str()));
+                    // Like choosing a game in the selector: the menu closes (25/09: a bench switch left the selector
+                    // open over the game, the oracle never saw a frame).
+                    if (arcadexr::ui::Menu::Get().IsOpen()) arcadexr::ui::Menu::Get().Close();
                 } else if (sw.empty()) s_lastSwitch.clear();
             }
             {   // bench: debug.tcvr.menu_toggle=<n> toggles the menu once per new value (tests without a controller)
@@ -1497,8 +1501,10 @@ struct OpenXrProgram : IOpenXrProgram {
             m_bugPaused = !m_bugPaused;
             arcadexr::input::SetDigital("bug_pause", m_bugPaused);
             if (m_bugPaused) {
+                // A tag never used before (a counter restarting at 1 each launch collided with the "dump" value kept in
+                // the settings file: no capture, 25/09).
                 char tag[48];
-                std::snprintf(tag, sizeof tag, "bug%u", ++m_bugCount);
+                std::snprintf(tag, sizeof tag, "bug%lld", (long long)std::time(nullptr));
                 arcadexr::config::Set("dump", tag);
                 Log::Write(Log::Level::Info, Fmt("TCVR_BUG capture %s game=%s: emulation paused, left eye dumped as dump-%s-vkL.ppm",
                                                  tag, arcadexr::profiles::CurrentGame().c_str(), tag));

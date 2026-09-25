@@ -1599,6 +1599,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
                 m_dumpState = 1; m_dumpTag = tag; m_dumpW = w; m_dumpH = h; m_dumpCb = uint32_t(v);
+                // Only what the compositor shows: the sub-rectangle of a dynamic-resolution frame (25/09: the rest of
+                // the swapchain holds older frames at other scales -- nested frames Guillaume never saw).
+                m_dumpVisW = std::max(1u, std::min(w, uint32_t(float(renderArea.extent.width))));
+                m_dumpVisH = std::max(1u, std::min(h, uint32_t(float(renderArea.extent.height))));
             }
         }
         if (m_gpuQueryPool != VK_NULL_HANDLE) {
@@ -2035,11 +2039,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                                  "/dump-" + m_dumpTag + "-vkL.ppm";
         FILE* f = std::fopen(path.c_str(), "wb");
         if (f) {
-            std::fprintf(f, "P6\n%u %u\n255\n", m_dumpW, m_dumpH);
+            const uint32_t outW = m_dumpVisW ? m_dumpVisW : m_dumpW, outH = m_dumpVisH ? m_dumpVisH : m_dumpH;
+            std::fprintf(f, "P6\n%u %u\n255\n", outW, outH);
             const uint8_t* px = static_cast<const uint8_t*>(p);
-            std::vector<uint8_t> row(size_t(m_dumpW) * 3);
-            for (uint32_t y = 0; y < m_dumpH; ++y) {
-                for (uint32_t x = 0; x < m_dumpW; ++x) {
+            std::vector<uint8_t> row(size_t(outW) * 3);
+            for (uint32_t y = 0; y < outH; ++y) {
+                for (uint32_t x = 0; x < outW; ++x) {
                     const uint8_t* s = px + (size_t(y) * m_dumpW + x) * 4;
                     // swapchain may be BGRA or RGBA sRGB: written raw, channel order logged
                     row[x * 3 + 0] = s[0]; row[x * 3 + 1] = s[1]; row[x * 3 + 2] = s[2];
@@ -2049,7 +2054,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             std::fclose(f);
         }
         vkUnmapMemory(m_vkDevice, m_dumpMem);
-        Log::Write(Log::Level::Info, Fmt("TCVR_DUMP wrote %s (%ux%u) %s", path.c_str(), m_dumpW, m_dumpH, f ? "ok" : "FAILED"));
+        Log::Write(Log::Level::Info, Fmt("TCVR_DUMP wrote %s (%ux%u shown of %ux%u) %s", path.c_str(), m_dumpVisW, m_dumpVisH, m_dumpW, m_dumpH, f ? "ok" : "FAILED"));
     }
 
     // ---- Oracle capture (debug.tcvr.oracle=<tag>), for scripts/port_oracle.py ------------------------
@@ -2369,6 +2374,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool m_menuFramePoseValid{false};
     int m_dumpState{0};
     std::string m_dumpTag, m_dumpDoneTag;
+    uint32_t m_dumpVisW = 0, m_dumpVisH = 0;
     uint32_t m_dumpW{0}, m_dumpH{0}, m_dumpCb{0};
     VkBuffer m_dumpBuf{VK_NULL_HANDLE};
     VkDeviceMemory m_dumpMem{VK_NULL_HANDLE};

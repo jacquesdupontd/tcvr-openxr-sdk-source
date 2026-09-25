@@ -398,8 +398,13 @@ public:
         if (frame.raw_prim_count > 0 && frame.raw_vertex_count > 0) {
             const std::uint32_t n = std::min<std::uint32_t>(frame.raw_prim_count, 0xffffu);
             m_rawKeys.resize(n);
-            for (std::uint32_t i = 0; i < n; i++)
-                m_rawKeys[i] = (std::uint32_t(frame.raw_prims[i].zsort & 0xffffu) << 16) | (0xffffu - i);
+            for (std::uint32_t i = 0; i < n; i++) {
+                // The board's own order (model2_3d_frame_end): windows from the last to the first, then depth buckets
+                // near to far, then within a bucket the last polygon pushed first; the first written on a pixel stays.
+                // The window was ignored until 25/09: Top Skater's ramp covered the skater the cabinet draws in front.
+                const std::uint64_t win = std::min<std::uint32_t>(frame.raw_prims[i].window, 0xffu);
+                m_rawKeys[i] = ((0xffull - win) << 32) | (std::uint64_t(frame.raw_prims[i].zsort & 0xffffu) << 16) | (0xffffu - i);
+            }
             std::sort(m_rawKeys.begin(), m_rawKeys.end());
 
             m_rawPrims.resize(n);
@@ -407,7 +412,7 @@ public:
             m_primLayer.assign(n, 0xffffffffu);
             std::size_t vcount = 0, icount = 0;
             for (std::uint32_t k = 0; k < n; k++) {
-                const tcvr_m2_prim& p = frame.raw_prims[0xffffu - (m_rawKeys[k] & 0xffffu)];
+                const tcvr_m2_prim& p = frame.raw_prims[0xffffu - uint32_t(m_rawKeys[k] & 0xffffu)];
                 const std::uint32_t vc = std::min<std::uint32_t>(p.vertex_count, frame.raw_vertex_count - std::min(p.first_vertex, frame.raw_vertex_count));
                 vcount += vc; if (vc >= 3) icount += (vc - 2) * 3;
             }
@@ -427,14 +432,14 @@ public:
             std::uint32_t intra_bucket_rank = 0;
 
             for (std::uint32_t k = 0; k < n; k++) {
-                const std::uint32_t cur_zsort = m_rawKeys[k] >> 16;
+                const std::uint32_t cur_zsort = std::uint32_t((m_rawKeys[k] >> 16) & 0xffffu);
                 if (cur_zsort == last_zsort) {
                     intra_bucket_rank++;
                 } else {
                     last_zsort = cur_zsort;
                     intra_bucket_rank = 0;
                 }
-                const tcvr_m2_prim& p = frame.raw_prims[0xffffu - (m_rawKeys[k] & 0xffffu)];
+                const tcvr_m2_prim& p = frame.raw_prims[0xffffu - uint32_t(m_rawKeys[k] & 0xffffu)];
                 tcvr_m2_prim q = p;
                 q.first_vertex = std::uint32_t(vo);
                 const std::uint32_t vc = std::min<std::uint32_t>(p.vertex_count, frame.raw_vertex_count - std::min(p.first_vertex, frame.raw_vertex_count));
@@ -537,7 +542,7 @@ public:
                             const int band = std::max(0, std::min(23, int(syv) / 16));
                             ++m_clBand[band];
                         }
-                        const uint32_t bk = m_rawKeys[k] >> 16;
+                        const uint32_t bk = uint32_t((m_rawKeys[k] >> 16) & 0xffffu);
                         m_clBk[0] = std::min(m_clBk[0], bk); m_clBk[1] = std::max(m_clBk[1], bk);
                         if (invisible) ++m_clPass[0]; else if (!isGlass && !isMain) ++m_clPass[1]; else if (!isGlass && !fast) ++m_clPass[2]; else if (isGlass) ++m_clPass[3]; else ++m_clPass[4];
                         if (!isMain) ++m_clNotMain;
@@ -562,7 +567,7 @@ public:
                     if (inside)
                         __android_log_print(ANDROID_LOG_INFO, "TCVR_PRIM",
                             "rank=%u src=%u bucket=%u pass=%s tex=%u transl=%u checker=%u main=%d sheet=%u tx=%u ty=%u w=%u h=%u utex=%u luma=%u lumabase=%u colorbase=%u texlod=%d z0=%.1f",
-                            k, 0xffffu - (m_rawKeys[k] & 0xffffu), m_rawKeys[k] >> 16,
+                            k, 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu), uint32_t((m_rawKeys[k] >> 16) & 0xffffu),
                             invisible ? "none" : (!isGlass && !isMain) ? "sec" : (!isGlass && !fast) ? "cut" : isGlass ? "glass" : "fast",
                             q.textured, q.translucent, q.checker, int(isMain), q.texsheet, q.texx, q.texy, q.texwidth, q.texheight, q.utex,
                             q.luma, q.lumabase, q.colorbase, q.texlod, frame.raw_vertices[p.first_vertex].z);
@@ -3411,7 +3416,7 @@ private:
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
     // Geometry unpack state
-    std::vector<std::uint32_t> m_rawKeys;
+    std::vector<std::uint64_t> m_rawKeys;
     bool m_primDiagOn = false; uint32_t m_primDiagTick = 0; float m_primDiagX = 0, m_primDiagY = 0;
     uint32_t m_clN = 0, m_clNotMain = 0, m_clBk[2] = {}, m_clBand[24] = {}, m_clPass[5] = {}; float m_clBox[4] = {};
     std::vector<tcvr_m2_prim> m_rawPrims;
