@@ -1042,6 +1042,7 @@ public:
             // neutral by default now; contrast/bright props remain for A/B.
             ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.0f);
             ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", 0.0f);
+            ubo.uLift = LiftExponent();
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
             ubo.uOverlayK = m_flatMode ? 1.0f : std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 8.0f));
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
@@ -1114,6 +1115,7 @@ public:
             float invMvp[16];
             if (!(skip & 1) && !m_flatMode && InvertMatrix4x4(mvp.m, invMvp)) {
                 VoidPushConstants voidPc{};
+                voidPc.uLift = LiftExponent();
                 memcpy(voidPc.uInvMvp, invMvp, sizeof(invMvp));
                 voidPc.uSky[0] = m_voidColor[0]; voidPc.uSky[1] = m_voidColor[1]; voidPc.uSky[2] = m_voidColor[2]; voidPc.uSky[3] = 1.0f;
                 voidPc.uGround[0] = groundCol[0]; voidPc.uGround[1] = groundCol[1]; voidPc.uGround[2] = groundCol[2]; voidPc.uGround[3] = 1.0f;
@@ -1127,6 +1129,7 @@ public:
             // 2. DrawPlaneLayer (Back 2D)
             if (m_haveLayer[1] && !(skip & 2)) {
                 PlanePushConstants backPc{};
+                backPc.uLift = LiftExponent();
                 memcpy(backPc.uHudMvp, hudMvpBack.m, sizeof(hudMvpBack.m));
                 backPc.uOutSize[0] = outW; backPc.uOutSize[1] = outH;
                 backPc.uKeyZero = 0;
@@ -1165,6 +1168,7 @@ public:
         // 4. DrawPlaneLayer (Front 2D HUD)
         if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0 && !(skip & 32)) {
             PlanePushConstants frontPc{};
+            frontPc.uLift = LiftExponent();
             memcpy(frontPc.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
             if (m_frontFullscreen && !m_flatMode) {
                 // full-screen front layer (flash): the arcade plane enlarged over the whole view
@@ -1584,6 +1588,13 @@ public:
                                              med, m_sceneDepth, nh, m_probeWorstMs, end / 3));
             m_probeWorstMs = 0.0f;
         }
+    }
+    // Menu LUMINOSITE (profile immersive.lift, a display gamma >= 1): the shaders raise colours to 1/gamma. The
+    // flat oracle target keeps the exact colours.
+    float LiftExponent() const {
+        if (m_flatMode) return 1.0f;
+        const float g = std::max(1.0f, std::min(2.0f, arcadexr::profiles::GetFloat("immersive.lift", 1.0f)));
+        return 1.0f / g;
     }
     float m_sceneDepth = 0.0f;
     float m_probeWorstMs = 0.0f;

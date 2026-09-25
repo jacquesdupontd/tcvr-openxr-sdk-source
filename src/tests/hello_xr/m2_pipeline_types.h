@@ -48,6 +48,7 @@ struct M2UniformBufferObject {
     int32_t uCountOverdraw;  // 4 bytes, offset 296
     int32_t padEnd[3];       // 12 bytes, offset 300
     int32_t uBoardLod;       // 4 bytes, offset 312: 1 = the board's mip level (-texlod + log2 z) in the exact path
+    float uLift;             // 4 bytes, offset 316: brightness curve exponent (1 = exact colours, < 1 = lighter)
 };
 
 struct VoidPushConstants {
@@ -55,7 +56,8 @@ struct VoidPushConstants {
     float uSky[4];
     float uGround[4];
     float uOutSize[2];
-    float pad[2];
+    float uLift;       // brightness curve exponent, as M2UniformBufferObject::uLift
+    float pad;
 };
 
 struct PlanePushConstants {
@@ -65,6 +67,7 @@ struct PlanePushConstants {
     float uUvScaleX;   // content width / texture width: the 2D image is 496 wide in a 512-wide texture
     float uClipRow;    // > 0: the back layer is not drawn below this board row (ground fill, gun games)
     float uNoTile;     // 1: the back layer is a menu page -- only inside the arcade frame, not repeated
+    float uLift;       // brightness curve exponent, as M2UniformBufferObject::uLift
 };
 
 }  // namespace arcadexr::vulkan

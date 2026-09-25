@@ -55,6 +55,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     int uGammaFolded;   // 1 = colorxlat already holds gamma(colorxlat): skip gamma8()
     int uTexImplicit;   // bit 0: texture() with implicit derivatives; bit 1: use the texture array
     int uBoardLod;      // 1: the board's mip level in the exact path (m2.boardLod)
+    float uLift;        // brightness curve exponent (1 = the game's exact colours, < 1 = lighter; menu LUMINOSITE)
 };
 
 struct Prim {
@@ -772,5 +773,6 @@ void main() {
         oColor.rgb = mix(oColor.rgb, uSky, f);
     }
     vec3 d = clamp(oColor.rgb, 0.0, 1.0);
+    if (uLift > 0.0 && uLift != 1.0) d = pow(d, vec3(uLift));   // menu LUMINOSITE (25/09)
     oColorOut = vec4(d * (d * (d * (d * -0.23012586 + 0.73328061) + 0.44219034) + 0.05115943), oColor.a);   // sRGB->linear, 4 FMA, <= 1.2/255 after re-encoding (fitted 23/09)
 }

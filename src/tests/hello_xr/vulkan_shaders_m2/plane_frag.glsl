@@ -12,6 +12,7 @@ layout(push_constant) uniform PlanePushConstants {
     float uUvScaleX;   // 496/512: only the arcade's columns (the texture's last 16 are empty; they drew black bands, 23/09)
     float uClipRow;    // > 0: back layer cut below this board row, the ground colour shows there (gun games)
     float uNoTile;     // 1: a menu page: inside the arcade frame only
+    float uLift;       // brightness curve exponent (menu LUMINOSITE)
 };
 
 void main_body() {
@@ -50,5 +51,6 @@ void main_body() {
 void main() {
     main_body();
     vec3 d = clamp(oColor.rgb, 0.0, 1.0);
+    if (uLift > 0.0 && uLift != 1.0) d = pow(d, vec3(uLift));   // menu LUMINOSITE (25/09)
     oColorOut = vec4(d * (d * (d * (d * -0.23012586 + 0.73328061) + 0.44219034) + 0.05115943), oColor.a);   // sRGB->linear, 4 FMA, <= 1.2/255 after re-encoding (fitted 23/09)
 }
