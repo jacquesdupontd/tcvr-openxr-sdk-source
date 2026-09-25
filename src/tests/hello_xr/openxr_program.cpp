@@ -1954,6 +1954,20 @@ struct OpenXrProgram : IOpenXrProgram {
                 buttonA && arcadexr::profiles::GetInt("driving.aGas", 0) ? 1.0f : 0.0f);
             arcadexr::input::SetAnalog("gas", gas);
             arcadexr::input::SetAnalog("brake", readTrigger(Side::LEFT));
+            // Raw controller for games that are not a car (Top Skater's deck, wired by field name in MAME):
+            // sticks 0..1 full travel, triggers 0..1 -- no driving range, deadzone only.
+            {
+                XrActionStateGetInfo rInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.driveShiftAction, XR_NULL_PATH};
+                XrActionStateVector2f rs{XR_TYPE_ACTION_STATE_VECTOR2F};
+                float rsx = 0.0f;
+                if (!menuOpen && XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &rInfo, &rs)) && rs.isActive == XR_TRUE)
+                    rsx = rs.currentState.x;
+                auto dz = [](float x) { return std::fabs(x) < 0.08f ? 0.0f : std::copysign((std::fabs(x) - 0.08f) / 0.92f, x); };
+                arcadexr::input::SetAnalog("lx", 0.5f + 0.5f * dz(stickX));
+                arcadexr::input::SetAnalog("rx", 0.5f + 0.5f * dz(rsx));
+                arcadexr::input::SetAnalog("lt", readTrigger(Side::LEFT));
+                arcadexr::input::SetAnalog("rt", rightTrigger);
+            }
             const bool confirming = gas > 0.5f;
             if (wheelSelection && m_driveSelectionMode && confirming && !m_driveConfirmHeld) {
                 ++m_driveConfirmCount;
