@@ -314,6 +314,7 @@ public:
         if (!m_haveMainView) { mainL = mainT = mainR = mainB = -1; mainCx = mainCy = -100000; }
 
         m_horizonGeo = -1.0f;
+        m_haveHorizon = false;
         m_crtc[0] = float(frame.crtc_xoffset); m_crtc[1] = float(frame.crtc_yoffset);
         // The geometry engine's real focal length (the GLES renderer reads it; the first Vulkan port kept 512).
         if (frame.focus_x > 1.0f && frame.focus_y > 1.0f) {
@@ -354,6 +355,7 @@ public:
                 }
             }
             std::vector<float> farRows;
+            m_mainZMax = 0.0f;
             for (std::uint32_t i = 0; i < kn; i++) {
                 const tcvr_m2_prim& p = kp[i];
                 if (p.clip_l != mainL || p.clip_t != mainT || p.clip_r != mainR || p.clip_b != mainB ||
@@ -363,6 +365,7 @@ public:
                     if (frame.raw_prim_count) {
                         if (index >= frame.raw_vertex_count) break;
                         const tcvr_m2_raw_vertex& rv = frame.raw_vertices[index];
+                        if (rv.z > m_mainZMax) m_mainZMax = rv.z;
                         if (rv.z >= farZ) farRows.push_back((384.0f - float(p.center_y)) + float(frame.crtc_yoffset) - rv.y / rv.z);
                     }
                 }
@@ -370,12 +373,16 @@ public:
             if (farRows.size() >= (m_directColour ? 8u : 32u)) {
                 std::nth_element(farRows.begin(), farRows.begin() + farRows.size() / 2, farRows.end());
                 m_horizonGeo = farRows[farRows.size() / 2];
+                m_haveHorizon = true;
             }
         }
 
         {   // Model 1 menu screen: no horizon AND few polygons (a course select has a few 3D icons, a race thousands);
             // held for half a second either way -- a race that loses its horizon for a moment is not a menu.
-            const bool looksMenu = m_directColour && m_horizonGeo < 0.0f && kn < 400u;
+            // Model 2 too (26/09, Sega Rally's car select: a full-screen centred view made it a "scene": its 2D page
+            // tiled to infinity as a sky and the boxes floated in front). A horizon row can be negative in a race
+            // (-23.7 measured): "no horizon" is the flag, never the sign.
+            const bool looksMenu = !m_haveHorizon && (m_directColour ? kn < 400u : true);
             m_menuFrames = looksMenu ? std::min(m_menuFrames + 1, 1000) : std::max(m_menuFrames - 1, -1000);
             if (m_menuFrames >= 30) m_isMenuM1 = true;
             if (m_menuFrames <= -30) m_isMenuM1 = false;
@@ -888,7 +895,7 @@ public:
         pitchTarget += arcadexr::config::GetFloat("m2.immersivePitchOffset", 0.0f);
         if (viewIndex == 0) m_m2Pitch += (pitchTarget - m_m2Pitch) * 0.1f;
         if (viewIndex == 0 && !m_flatMode && (++m_pitchLogTick % 30u) == 0u)
-            Log::Write(Log::Level::Info, Fmt("TCVR_PITCH horizon=%.1f target=%.4f applied=%.4f menu=%d", m_horizonGeo, pitchTarget, m_m2Pitch, m_backNoTile ? 1 : 0));
+            Log::Write(Log::Level::Info, Fmt("TCVR_PITCH hz=%d horizon=%.1f target=%.4f applied=%.4f menu=%d zmax=%.0f prims=%zu", m_haveHorizon ? 1 : 0, m_horizonGeo, pitchTarget, m_m2Pitch, m_backNoTile ? 1 : 0, m_mainZMax, m_rawPrims.size()));
 
         const float cp = ::cosf(m_m2Pitch), sp = ::sinf(m_m2Pitch);
         const arcadexr::gun::Vec3 upP{cp * screen.up.x - sp * screen.normal.x, cp * screen.up.y - sp * screen.normal.y, cp * screen.up.z - sp * screen.normal.z};
@@ -968,7 +975,7 @@ public:
         // A menu of the game (no main 3D view): its 2D back layer is part of the screen, not a sky -- same plane as the
         // HUD, level, not repeated (the course select showed ten copies of a course, and the selection frame of the
         // front layer did not sit on the course of the back one).
-        const bool menuScreen = !m_flatMode && (!m_haveMainView || (m_directColour && m_isMenuM1));
+        const bool menuScreen = !m_flatMode && (!m_haveMainView || m_isMenuM1);
         m_backNoTile = menuScreen;
         const bool skyAnchor = !menuScreen && !m_flatMode && m_horizonGeo >= 0.0f &&
             arcadexr::profiles::GetInt("immersive.skyAnchor", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;   // GOLD (Sega Rally) unchanged by default
@@ -3145,7 +3152,7 @@ private:
         }
         std::unordered_map<uint64_t, std::vector<ObjMat>> copiesNow;
         for (auto& g : groups) { auto& v = copiesNow[g.first]; for (auto& c : g.second) v.push_back(c.second); }
-        const bool blendable = m_haveMainView && !pairedPrev.empty();
+        const bool blendable = m_haveMainView && !m_isMenuM1 && !pairedPrev.empty();
         // Camera cut: most objects' origins jump by more than a third of their distance -> no blend this step.
         size_t objs = 0, jumped = 0;
         if (blendable)
@@ -3659,6 +3666,8 @@ private:
     int32_t m_mainCenter[2] = {-100000, -100000};
     bool m_haveMainView = false;
     float m_horizonGeo = -1.0f;
+    bool m_haveHorizon = false;
+    float m_mainZMax = 0.0f;   // deepest main-view vertex (menu or scene?)
     float m_crtc[2] = {0.0f, 0.0f};
     struct AimTransform { bool valid; arcadexr::gun::Vec3 cam, R, U, N; float s, nearM; };
     AimTransform m_aimXf{false, {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1.0f, 0.25f};
