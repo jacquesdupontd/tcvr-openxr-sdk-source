@@ -3065,20 +3065,54 @@ private:
             for (uint32_t w : {p.motion_addr, p.motion_serial, p.window}) { h ^= w; h *= 16777619u; }
             return h;
         };
-        if (!frame.raw_motion) { m_prevMats.clear(); return; }
+        if (!frame.raw_motion) { m_prevMats.clear(); m_prevCopies.clear(); return; }
+        // Copies of one model (the crowd: the same spectator many times) are numbered in drawing order, and that
+        // order changes when the game drops one out of view: "copy 5" was another spectator one frame earlier, which
+        // flew across the road (Guillaume, 26/09). Copies are paired with the NEAREST copy of the previous frame
+        // (object origin in camera space), within a third of its distance; unpaired copies are not blended.
+        std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, ObjMat>>> groups;   // (addr, window) -> copies
         for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
             const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
             if (mo[14] < 0.5f) continue;
+            const tcvr_m2_prim& rp = m_rawPrims[k];
             ObjMat om; for (int i = 0; i < 14; ++i) om.m[i] = mo[i];
-            m_curMats.emplace(objKey(m_rawPrims[k]), om);
+            if (m_curMats.emplace(objKey(rp), om).second)
+                groups[(uint64_t(rp.motion_addr) << 8) | (rp.window & 0xffu)].push_back({objKey(rp), om});
         }
-        const bool blendable = m_haveMainView && !m_prevMats.empty();
+        // pair copies -> m_pairedPrev: current object key -> previous matrix
+        std::unordered_map<uint32_t, ObjMat> pairedPrev;
+        for (auto& g : groups) {
+            auto pg = m_prevCopies.find(g.first);
+            if (pg == m_prevCopies.end()) continue;
+            std::vector<ObjMat> prevList = pg->second;
+            std::vector<char> used(prevList.size(), 0);
+            struct Cand { float d; uint32_t ci, pi; };
+            std::vector<Cand> cands;
+            for (uint32_t ci = 0; ci < g.second.size(); ++ci)
+                for (uint32_t pi = 0; pi < prevList.size(); ++pi) {
+                    const float* a = g.second[ci].second.m; const float* b = prevList[pi].m;
+                    const float dx = a[9] - b[9], dy = a[10] - b[10], dz = a[11] - b[11];
+                    const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const float r = std::sqrt(a[9] * a[9] + a[10] * a[10] + a[11] * a[11]);
+                    if (d <= 0.33f * std::max(r, 1.0f)) cands.push_back({d, ci, pi});
+                }
+            std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) { return x.d < y.d; });
+            std::vector<char> cdone(g.second.size(), 0);
+            for (const Cand& c : cands) {
+                if (cdone[c.ci] || used[c.pi]) continue;
+                cdone[c.ci] = 1; used[c.pi] = 1;
+                pairedPrev.emplace(g.second[c.ci].first, prevList[c.pi]);
+            }
+        }
+        std::unordered_map<uint64_t, std::vector<ObjMat>> copiesNow;
+        for (auto& g : groups) { auto& v = copiesNow[g.first]; for (auto& c : g.second) v.push_back(c.second); }
+        const bool blendable = m_haveMainView && !pairedPrev.empty();
         // Camera cut: most objects' origins jump by more than a third of their distance -> no blend this step.
         size_t objs = 0, jumped = 0;
         if (blendable)
             for (const auto& kv : m_curMats) {
-                auto it = m_prevMats.find(kv.first);
-                if (it == m_prevMats.end()) continue;
+                auto it = pairedPrev.find(kv.first);
+                if (it == pairedPrev.end()) continue;
                 const float* a = kv.second.m; const float* b = it->second.m;
                 const float dx = a[9] - b[9], dy = a[10] - b[10], dz = a[11] - b[11];
                 const float d = std::sqrt(a[9] * a[9] + a[10] * a[10] + a[11] * a[11]);
@@ -3093,8 +3127,8 @@ private:
                 if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
                 const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
                 if (mo[14] < 0.5f) continue;
-                auto it = m_prevMats.find(objKey(m_rawPrims[k]));
-                if (it == m_prevMats.end()) continue;
+                auto it = pairedPrev.find(objKey(m_rawPrims[k]));
+                if (it == pairedPrev.end()) continue;
                 const float* pm = it->second.m;
                 // unfocus, then object coordinates: A^-1 (o - b), A columns = (m0 m1 m2), (m3 m4 m5), (m6 m7 m8)
                 const float* d = &m_rawVerts[v * 5];
@@ -3122,7 +3156,9 @@ private:
                                 m_curMats.size(), objs, jumped, m_matCuts, blended, nv, int(m_haveMainView));
         }
         m_prevMats.swap(m_curMats);
+        m_prevCopies.swap(copiesNow);
     }
+    std::unordered_map<uint64_t, std::vector<ObjMat>> m_prevCopies;
 
     void MatchMotion(size_t nv) {
         m_curQuads.clear();
