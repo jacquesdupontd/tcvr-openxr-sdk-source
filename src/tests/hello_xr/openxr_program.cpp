@@ -1483,10 +1483,41 @@ struct OpenXrProgram : IOpenXrProgram {
         XrActionStateBoolean clickState{XR_TYPE_ACTION_STATE_BOOLEAN};
         const bool leftStickClick = XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &clickInfo, &clickState)) &&
                                     clickState.isActive == XR_TRUE && clickState.currentState == XR_TRUE;
+        // Bug button (25/09): both thumbsticks clicked together pause the emulation and capture the left eye, so the
+        // exact frame Guillaume sees a bug on can be analysed (polygons under a pixel, order, depth, MAME's image).
+        // The same combo resumes. Logged as TCVR_BUG.
+        bool rightStickClick = false;
+        {
+            XrActionStateGetInfo qInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.quitAction, XR_NULL_PATH};
+            XrActionStateBoolean q{XR_TYPE_ACTION_STATE_BOOLEAN};
+            rightStickClick = XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &qInfo, &q)) && q.isActive == XR_TRUE && q.currentState == XR_TRUE;
+        }
+        const bool bugCombo = leftStickClick && rightStickClick;
+        if (bugCombo && !m_bugComboHeld) {
+            m_bugPaused = !m_bugPaused;
+            arcadexr::input::SetDigital("bug_pause", m_bugPaused);
+            if (m_bugPaused) {
+                char tag[48];
+                std::snprintf(tag, sizeof tag, "bug%u", ++m_bugCount);
+                arcadexr::config::Set("dump", tag);
+                Log::Write(Log::Level::Info, Fmt("TCVR_BUG capture %s game=%s: emulation paused, left eye dumped as dump-%s-vkL.ppm",
+                                                 tag, arcadexr::profiles::CurrentGame().c_str(), tag));
+            } else {
+                Log::Write(Log::Level::Info, "TCVR_BUG resumed");
+            }
+            XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
+            vib.amplitude = 0.6f; vib.duration = XrDuration(60) * 1000000; vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+            for (int hand : {Side::LEFT, Side::RIGHT}) {
+                XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
+                hi.action = m_input.vibrateAction; hi.subactionPath = m_input.handSubactionPath[hand];
+                xrApplyHapticFeedback(m_session, &hi, reinterpret_cast<XrHapticBaseHeader*>(&vib));
+            }
+        }
+        m_bugComboHeld = bugCombo;
         const bool faceA = readButton(m_input.pedalAction, Side::RIGHT);
         reportDigital("pedal", (!driving || arcadexr::profiles::GetInt("driving.handBrakeOnA", 0)) &&
                                faceA && !menuOpen, m_input.lastPedal);
-        reportDigital("start", (faceB || (driving && leftStickClick)) && !menuOpen, m_input.lastStart);
+        reportDigital("start", (faceB || (driving && leftStickClick && !rightStickClick)) && !menuOpen, m_input.lastStart);
         reportDigital("view", driving && (faceB || faceA) && !menuOpen, m_input.lastView);
         reportDigital("coin", readButton(m_input.coinAction, Side::LEFT), m_input.lastCoin);
 
@@ -1494,7 +1525,7 @@ struct OpenXrProgram : IOpenXrProgram {
         XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.quitAction, XR_NULL_PATH};
         XrActionStateBoolean quitValue{XR_TYPE_ACTION_STATE_BOOLEAN};
         CHECK_XRCMD(xrGetActionStateBoolean(m_session, &getInfo, &quitValue));
-        if (!driving && (quitValue.isActive == XR_TRUE) && (quitValue.changedSinceLastSync == XR_TRUE) && (quitValue.currentState == XR_TRUE)) {
+        if (!driving && !leftStickClick && (quitValue.isActive == XR_TRUE) && (quitValue.changedSinceLastSync == XR_TRUE) && (quitValue.currentState == XR_TRUE)) {
             m_calibrating = !m_calibrating;
             // Calibrating the gun used to reset the screen as well. Those are
             // two different intentions and now have two different buttons.
@@ -2128,6 +2159,8 @@ struct OpenXrProgram : IOpenXrProgram {
 
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
+    bool m_bugComboHeld{false}, m_bugPaused{false};
+    unsigned m_bugCount{0};
     bool m_supportsDisplayRefreshRate{false};
     bool m_supportsFoveation{false};
     bool m_supportsFoveationVulkan{false};
