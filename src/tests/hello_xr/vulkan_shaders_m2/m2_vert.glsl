@@ -61,6 +61,7 @@ struct Prim {
     uint zsort;
     uint rgb;                 // tcvr_m2_prim::rgb: bit 24 = direct colour 0xRRGGBB (Model 1)
     uint window;              // tcvr_m2_prim::window: the board draws the last window first (25/09)
+    uint motion_addr, motion_poly, motion_serial;   // tcvr_m2_prim: smooth motion identity (CPU only, keeps the layout)
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Prims { Prim prims[]; };
