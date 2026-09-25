@@ -1047,7 +1047,8 @@ public:
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
             ubo.padEnd[2] = arcadexr::config::GetInt("m2.texImplicit", 1) | (arcadexr::config::GetInt("m2.texArray", 1) != 0 ? 2 : 0);   // = uTexImplicit | 2: texture array
             ubo.padEnd[0] = arcadexr::config::GetInt("m2.hwAnisoOn", 1) != 0 ? 0 : 4;   // = uSmpBase (live A/B)
-            ubo.uBoardLod = arcadexr::config::GetInt("m2.boardLod", 1) != 0 ? 1 : 0;
+            ubo.uBoardLod = (arcadexr::config::GetInt("m2.boardLod", 1) != 0 &&
+                             arcadexr::profiles::GetInt("immersive.boardLod", 0) != 0) ? 1 : 0;
             ubo.uCountOverdraw = (m_useRegions && arcadexr::config::GetInt("m2.regions", 1) != 0) ? 1 : 0;  // = uUseRegions
         }
 
