@@ -660,7 +660,11 @@ public:
             }
             GroundProbe(frame, mainCx, mainCy, mainB);
             SceneDepthProbe(frame, mainCx, mainCy);
-            if (m_directColour) {
+            // Smooth motion for a Model 2 game (25/09, profile immersive.smoothMotion2: Sega Rally first): polygons carry
+            // their identity in the prim (object address, rank, copy) instead of Model 1's u/v.
+            m_m2Smooth = !m_directColour && !m_flatMode &&
+                         arcadexr::profiles::GetInt("immersive.smoothMotion2", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
+            if (m_directColour || m_m2Smooth) {
                 // Smooth motion (Model 1). Virtua Racing computes its 3D every OTHER arcade frame (30 Hz; measured
                 // 24/09) and the same frame is rebuilt for several refreshes: the blend runs between the last two
                 // frames that really changed. The match is done once per change, in MatchMotion().
@@ -1024,7 +1028,7 @@ public:
             const bool popFade = m_directColour && !m_flatMode && !m_backNoTile && m_zMaxSmooth > 0.0f &&
                                  arcadexr::profiles::GetInt("immersive.popInFade", 1) != 0;
             ubo.uFogFar = popFade ? m_zMaxSmooth : 0.0f;
-            if (m_smooth && m_directColour && !m_prevPosCpu.empty()) {
+            if (m_smooth && (m_directColour || m_m2Smooth) && !m_prevPosCpu.empty()) {
                 // Blend at THIS refresh: time since the newest moving frame over the measured step interval.
                 const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_stepTime).count();
                 ubo.uInterp = std::max(0.0f, std::min(1.0f, t / std::max(0.008f, m_stepPeriod)));
@@ -3049,12 +3053,23 @@ private:
             size_t e = v + 1;
             while (e < nv && m_rawPrimOfVertex[e] == k) ++e;
             MotionQuad q{};
-            q.key = uint32_t(m_rawVerts[v * 5 + 3]);
-            q.obj = uint32_t(m_rawVerts[v * 5 + 4]) >> 2;   // which push_object call of the frame
+            if (m_directColour) {
+                q.key = uint32_t(m_rawVerts[v * 5 + 3]);
+                q.obj = uint32_t(m_rawVerts[v * 5 + 4]) >> 2;   // which push_object call of the frame
+            } else {
+                // Model 2: identity from the prim -- object address, rank in the object, copy of the object in the frame.
+                const tcvr_m2_prim& mp = m_rawPrims[k];
+                uint32_t h = 2166136261u;
+                for (uint32_t w : {mp.motion_addr, mp.motion_poly, mp.motion_serial}) { h ^= w; h *= 16777619u; }
+                q.key = h;
+                uint32_t o = 2166136261u;
+                for (uint32_t w : {mp.motion_addr, mp.motion_serial}) { o ^= w; o *= 16777619u; }
+                q.obj = o;
+            }
             q.v0 = uint32_t(v); q.n = uint32_t(e - v);
             for (size_t i = v; i < e; ++i) {
                 const float* d = &m_rawVerts[i * 5];
-                const uint32_t corner = uint32_t(d[4]) & 3u;
+                const uint32_t corner = m_directColour ? (uint32_t(d[4]) & 3u) : uint32_t(std::min<size_t>(i - v, 3));
                 for (int c = 0; c < 3; ++c) { q.p[corner][c] = d[c]; q.c[c] += d[c] / float(e - v); }
             }
             m_curQuads.push_back(q);
@@ -3297,7 +3312,10 @@ private:
                 if (bq && !rigid) {
                     ++matchedQuads;
                     for (uint32_t v = cq.v0; v < cq.v0 + cq.n; ++v) {
-                        const uint32_t corner = uint32_t(m_rawVerts[size_t(v) * 5 + 4]) & 3u;
+                        // Model 1 carries the corner in v; a Model 2 quad's corners are its vertices in order (its v is
+                        // a texture coordinate -- read as a corner it smeared polygons into streaks, 25/09).
+                        const uint32_t corner = m_directColour ? (uint32_t(m_rawVerts[size_t(v) * 5 + 4]) & 3u)
+                                                               : std::min<uint32_t>(v - cq.v0, 3u);
                         float* o4 = &m_prevPosCpu[size_t(v) * 4];
                         o4[0] = bq->p[corner][0]; o4[1] = bq->p[corner][1]; o4[2] = bq->p[corner][2]; o4[3] = 1.0f;
                     }
@@ -3365,7 +3383,8 @@ private:
 public:
     // Smooth motion: blend of the previous and current arcade frames for this display refresh (1 = current).
     void SetSmooth(bool on) { m_smooth = on; }
-    bool HasMotionIds() const { return m_directColour; }
+    bool HasMotionIds() const { return m_directColour || m_m2Smooth; }
+    bool m_m2Smooth = false;
 private:
     float* m_vboMappedF[kFrames] = {};
     size_t m_vboSize = 0;
