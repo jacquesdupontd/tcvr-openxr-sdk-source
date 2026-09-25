@@ -1569,9 +1569,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // Debug dump of the LEFT eye as rendered (debug.tcvr.dump=<tag>): copied into a host buffer,
         // written as files/dump-<tag>-vkL.ppm after the fence. The compositor screencap is black
         // while the headset is worn; this is the image the app really produced.
-        if (viewIndex == 0 && m_dumpState == 0) {
+        // A tag ending in "_R" dumps the RIGHT eye (dump-<tag>-vkR.ppm): with the left one, the disparity between two
+        // planes -- a parallax -- becomes measurable (26/09: one eye alone showed a menu "glued" that was not).
+        if (m_dumpState == 0) {
             const std::string tag = arcadexr::config::GetString("dump", "0");
-            if (!tag.empty() && tag != "0" && tag != m_dumpDoneTag) {
+            const bool rightEye = tag.size() > 2 && tag.compare(tag.size() - 2, 2, "_R") == 0;
+            if (viewIndex == (rightEye ? 1u : 0u) && !tag.empty() && tag != "0" && tag != m_dumpDoneTag) {
                 const VkImage img = swapchainData->GetTypedImage(imageIndex).image;
                 const uint32_t w = swapchainData->Width(), h = swapchainData->Height();
                 const VkDeviceSize bytes = VkDeviceSize(w) * h * 4;
@@ -2036,7 +2039,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (vkMapMemory(m_vkDevice, m_dumpMem, 0, m_dumpSize, 0, &p) != VK_SUCCESS) return;
         const std::string dir = arcadexr::config::ExternalDirectory();
         const std::string path = (dir.empty() ? std::string("/sdcard/Android/data/io.tcvr2.prototype.vulkan/files") : dir) +
-                                 "/dump-" + m_dumpTag + "-vkL.ppm";
+                                 "/dump-" + m_dumpTag + (m_dumpTag.size() > 2 && m_dumpTag.compare(m_dumpTag.size() - 2, 2, "_R") == 0 ? "-vkR.ppm" : "-vkL.ppm");
         FILE* f = std::fopen(path.c_str(), "wb");
         if (f) {
             const uint32_t outW = m_dumpVisW ? m_dumpVisW : m_dumpW, outH = m_dumpVisH ? m_dumpVisH : m_dumpH;

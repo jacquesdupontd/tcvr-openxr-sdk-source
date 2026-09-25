@@ -386,6 +386,10 @@ public:
             m_menuFrames = looksMenu ? std::min(m_menuFrames + 1, 1000) : std::max(m_menuFrames - 1, -1000);
             if (m_menuFrames >= 30) m_isMenuM1 = true;
             if (m_menuFrames <= -30) m_isMenuM1 = false;
+            // Model 2: a horizon is proof of a scene (every menu measured has none: depth 28 against 200000 in a race),
+            // so leave at once -- held 30 arcade frames, the start of a race stayed flat for 2 s while the course
+            // loaded (few frames published, 26/09).
+            if (!m_directColour && m_haveHorizon) { m_isMenuM1 = false; m_menuFrames = 0; }
             if (!looksMenu && m_menuFrames > 0) m_menuFrames = 0;
             if (looksMenu && m_menuFrames < 0) m_menuFrames = 0;
         }
@@ -526,7 +530,11 @@ public:
                             break;
                         }
                 const bool isGlass = (q.checker != 0u);
-                const bool isMain = q.center_x == mainCx && q.center_y == mainCy &&
+                // A menu screen is drawn flat by the vertex shader (uMenuFlat: every view on the screen plane, secondary
+                // parameters): its polygons must be routed as secondary here too. Routed as main, the cut-outs went to
+                // the lean shader, which reads main-view texture parameters: every image with transparent texels
+                // vanished (Sega Rally, 26/09: "CAR SELECT", AT/MT labels, the checker of the chosen box, mode images).
+                const bool isMain = !m_isMenuM1 && q.center_x == mainCx && q.center_y == mainCy &&
                                     std::abs(q.clip_l - mainL) <= 2 && std::abs(q.clip_t - mainT) <= 2 &&
                                     std::abs(q.clip_r - mainR) <= 2 && std::abs(q.clip_b - mainB) <= 2;
                 // Untextured + translucent draws NOTHING on the board (draw_scanline_solid returns).
@@ -946,7 +954,9 @@ public:
         // HUD ISO (25/09): each HUD pixel on the board camera's ray through that pixel, at the depth the player
         // looks at (SceneDepthProbe), through the same arcade-to-world transform as the 3D (scale, pitch). It covers
         // exactly what it covers on the cabinet (0 px), whatever the depth. Profile immersive.hudIso, Sega Rally only.
-        const bool hudIso = !m_flatMode && m_haveMainView && m_sceneDepth > 0.0f &&
+        // Not on a menu screen (26/09): a menu is ONE screen, its "3D" boxes flattened with the page on the back plane;
+        // posted at the scene depth instead, they floated in front of the page (parallax).
+        const bool hudIso = !m_flatMode && m_haveMainView && !m_isMenuM1 && m_sceneDepth > 0.0f &&
             arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
         if (hudIso) {
             const float zh = std::max(1.0f, m_sceneDepth);
