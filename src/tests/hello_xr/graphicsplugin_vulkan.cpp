@@ -698,6 +698,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             else vkGetPhysicalDeviceFeatures(m_vkPhysicalDevice, &f2.features);
             features.samplerAnisotropy = f2.features.samplerAnisotropy;
             features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;  // debug overdraw counters
+            features.shaderClipDistance = f2.features.shaderClipDistance;  // secondary views cut at their window (m2_vert)
+            Log::Write(Log::Level::Info, Fmt("TCVR_VKFEAT shaderClipDistance=%d", int(f2.features.shaderClipDistance)));
             if (haveIndexing && q.shaderSampledImageArrayNonUniformIndexing) {
                 deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
                 indexing.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;

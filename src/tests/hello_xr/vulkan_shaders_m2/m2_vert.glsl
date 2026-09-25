@@ -1,6 +1,7 @@
 #version 450
 // The cut-out colour pass tests depth EQUAL against its own pre-pass: positions must be bit-identical.
 invariant gl_Position;
+out float gl_ClipDistance[4];
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec3 aParam;
 layout(location = 2) in uint aPrim;
@@ -84,6 +85,7 @@ layout(location = 8) flat out uint vColor; // the polygon's palette entry (palra
 layout(location = 9) flat out uint vLayer; // texture-array layers: main | microtexture << 16 (0xffff = none)
 
 void main() {
+    gl_ClipDistance[0] = 1.0; gl_ClipDistance[1] = 1.0; gl_ClipDistance[2] = 1.0; gl_ClipDistance[3] = 1.0;
     vPrim = aPrim;
     {
         Prim q = prims[aPrim];
@@ -132,6 +134,13 @@ void main() {
             abs(p.clip_l - uMainClip.x) > 2 || abs(p.clip_t - uMainClip.y) > 2 ||
             abs(p.clip_r - uMainClip.z) > 2 || abs(p.clip_b - uMainClip.w) > 2) {
             vSecondary = 1u;
+            // Cut by the geometry at the view's clip rectangle (26/09): a rear-view mirror's polygons extend far beyond
+            // its small window and were shaded in full, then discarded pixel by pixel -- 12 ms of GPU in a race. The
+            // fragment test stays (exact at the edges: kept pixels are clip_l <= floor(x) <= clip_r).
+            gl_ClipDistance[0] = xs.x - float(p.clip_l);
+            gl_ClipDistance[1] = float(p.clip_r) + 1.0 - xs.x;
+            gl_ClipDistance[2] = xs.y - float(p.clip_t);
+            gl_ClipDistance[3] = float(p.clip_b) + 1.0 - xs.y;
             vec2 plane = vec2(xs.x / uViewport.x - 0.5, 0.5 - xs.y / uViewport.y);
             gl_Position = uHudMvp * vec4(plane, 0.0, 1.0);
             gl_Position.z += uDepthBias * 5.0 * float(aPrim) * gl_Position.w;

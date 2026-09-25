@@ -530,11 +530,11 @@ public:
                             break;
                         }
                 const bool isGlass = (q.checker != 0u);
-                // A menu screen is drawn flat by the vertex shader (uMenuFlat: every view on the screen plane, secondary
-                // parameters): its polygons must be routed as secondary here too. Routed as main, the cut-outs went to
-                // the lean shader, which reads main-view texture parameters: every image with transparent texels
-                // vanished (Sega Rally, 26/09: "CAR SELECT", AT/MT labels, the checker of the chosen box, mode images).
-                const bool isMain = !m_isMenuM1 && q.center_x == mainCx && q.center_y == mainCy &&
+                // A menu drawn flat by the vertex shader (uMenuFlat: every view on the screen plane, secondary
+                // parameters) must be routed as secondary here too -- SAME decision, same function (MenuFlat). Routed as
+                // main, the cut-outs went to the lean shader, which reads main-view texture parameters: every image with
+                // transparent texels vanished (Sega Rally, 26/09: "CAR SELECT", AT/MT labels, checker, mode images).
+                const bool isMain = !MenuFlat() && q.center_x == mainCx && q.center_y == mainCy &&
                                     std::abs(q.clip_l - mainL) <= 2 && std::abs(q.clip_t - mainT) <= 2 &&
                                     std::abs(q.clip_r - mainR) <= 2 && std::abs(q.clip_b - mainB) <= 2;
                 // Untextured + translucent draws NOTHING on the board (draw_scanline_solid returns).
@@ -958,9 +958,7 @@ public:
         // the rays at the depth the game draws its 3D (deepest main-view vertex: 28 units in Sega Rally's menus, i.e.
         // far and large as on 25/09). Brought to the 2 m HUD plane it sat "right in front of the eyes"; boxes at the
         // game depth with the page left at 2 m, it was a parallax.
-        const bool menuIso = m_isMenuM1 && m_mainZMax > 0.0f;
-        const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? menuIso : m_sceneDepth > 0.0f) &&
-            arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
+        const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f) && HudIsoProfile();
         if (hudIso) {
             const float zh = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);
             const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
@@ -1031,7 +1029,7 @@ public:
             ubo.uCrtc[0] = m_crtc[0]; ubo.uCrtc[1] = m_crtc[1];
             // Menu screen (Virtua Racing course select): its small 3D objects (wheel, pedal, cursor) belong to the
             // 2D page; drawn in perspective with the game camera's angle they did not sit on the page (24/09).
-            ubo.uMenuFlat = m_backNoTile ? 1 : 0;
+            ubo.uMenuFlat = (m_backNoTile && (!m_haveMainView || MenuFlat())) ? 1 : 0;
             ubo.uMainClip[0] = m_mainClip[0]; ubo.uMainClip[1] = m_mainClip[1];
             ubo.uMainClip[2] = m_mainClip[2]; ubo.uMainClip[3] = m_mainClip[3];
             ubo.uMainCenter[0] = m_mainCenter[0]; ubo.uMainCenter[1] = m_mainCenter[1];
@@ -3127,9 +3125,18 @@ private:
                     if (d <= 0.33f * std::max(r, 1.0f)) cands.push_back({d, ci, pi});
                 }
             std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) { return x.d < y.d; });
+            // No guessing (26/09): a pair is kept only if nothing else is nearly as close, on EITHER side. Gravel grains
+            // of one model a few centimetres apart were paired with a neighbour's grain: long vertical streaks. An
+            // ambiguous copy is left unpaired and borrows the motion of a sure neighbour (below).
+            std::vector<float> c1(g.second.size(), 1e30f), c2(g.second.size(), 1e30f), p1(prevList.size(), 1e30f), p2(prevList.size(), 1e30f);
+            for (const Cand& c : cands) {
+                if (c.d < c1[c.ci]) { c2[c.ci] = c1[c.ci]; c1[c.ci] = c.d; } else if (c.d < c2[c.ci]) c2[c.ci] = c.d;
+                if (c.d < p1[c.pi]) { p2[c.pi] = p1[c.pi]; p1[c.pi] = c.d; } else if (c.d < p2[c.pi]) p2[c.pi] = c.d;
+            }
             std::vector<char> cdone(g.second.size(), 0);
             for (const Cand& c : cands) {
                 if (cdone[c.ci] || used[c.pi]) continue;
+                if (c.d * 2.0f > c2[c.ci] || c.d * 2.0f > p2[c.pi]) continue;
                 cdone[c.ci] = 1; used[c.pi] = 1;
                 pairedPrev.emplace(g.second[c.ci].first, prevList[c.pi]);
             }
@@ -3140,10 +3147,11 @@ private:
         // object of its view (object origins in camera space): the wheel follows its car, a lone prop the scenery.
         // Motion of a paired object n, as a map on camera space: prev = A_pn * A_cn^-1 * (x - b_cn) + b_pn.
         std::unordered_map<uint32_t, std::pair<ObjMat, ObjMat>> borrowed;   // unpaired key -> (neighbour cur, neighbour prev)
+        std::unordered_map<uint32_t, std::vector<uint32_t>> pairedByView;   // view key -> paired object keys
         {
-            std::unordered_map<uint32_t, std::vector<uint32_t>> pairedByView;   // view key -> paired object keys
             std::unordered_map<uint32_t, uint32_t> viewOf;
             for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
+                if (frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16 + 14] < 0.5f) continue;   // no object matrix
                 const uint32_t ok = objKey(m_rawPrims[k]);
                 if (viewOf.count(ok)) continue;
                 viewOf[ok] = viewKey(m_rawPrims[k]);
@@ -3181,22 +3189,47 @@ private:
             }
         const bool cut = objs > 4 && jumped * 2 > objs;
         if (cut) ++m_matCuts;
+        // SAME INSTANT FOR EVERYTHING (26/09): a polygon left at its current position while the rest is drawn up to a
+        // frame earlier is a picture that exists in neither of the game's frames -- the flashes of the wheels and of the
+        // gravel. Every polygon of a view with a paired object therefore gets a motion: its own pair, else the nearest
+        // sure neighbour's. Polygons with no object matrix (direct polygons: particles, gravel; Top Skater's skinned
+        // meshes) pick the neighbour nearest to their centroid in camera space.
+        std::vector<std::pair<const float*, const float*>> primSrc(m_rawPrims.size(), {nullptr, nullptr});
         if (blendable && !cut) {
+            for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
+                const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
+                const tcvr_m2_prim& rp = m_rawPrims[k];
+                if (mo[14] >= 0.5f) {
+                    const uint32_t okey = objKey(rp);
+                    auto it = pairedPrev.find(okey);
+                    if (it != pairedPrev.end()) { primSrc[k] = {mo, it->second.m}; continue; }
+                    auto bo = borrowed.find(okey);
+                    if (bo != borrowed.end()) primSrc[k] = {bo->second.first.m, bo->second.second.m};
+                    continue;
+                }
+                auto pv = pairedByView.find(viewKey(rp));
+                if (pv == pairedByView.end() || rp.vertex_count == 0u || std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
+                float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                for (uint32_t vi = 0; vi < rp.vertex_count; ++vi) {
+                    const float* d = &m_rawVerts[size_t(rp.first_vertex + vi) * 5];
+                    cx += d[0] / mo[12]; cy += d[1] / mo[13]; cz += d[2];
+                }
+                cx /= float(rp.vertex_count); cy /= float(rp.vertex_count); cz /= float(rp.vertex_count);
+                float bestD = 1e30f; uint32_t best = 0;
+                for (uint32_t nk : pv->second) {
+                    const float* b = m_curMats[nk].m;
+                    const float d = (cx - b[9]) * (cx - b[9]) + (cy - b[10]) * (cy - b[10]) + (cz - b[11]) * (cz - b[11]);
+                    if (d < bestD) { bestD = d; best = nk; }
+                }
+                if (bestD < 1e29f) primSrc[k] = {m_curMats[best].m, pairedPrev[best].m};
+            }
             for (size_t v = 0; v < nv; ++v) {
                 const uint32_t k = m_rawPrimOfVertex[v];
                 if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
                 const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
-                if (mo[14] < 0.5f) continue;
-                const uint32_t okey = objKey(m_rawPrims[k]);
-                const float* pm = nullptr;
-                const float* cm = mo;   // the matrix whose inverse brings the vertex to "object" space
-                auto it = pairedPrev.find(okey);
-                if (it != pairedPrev.end()) pm = it->second.m;
-                else {
-                    auto bo = borrowed.find(okey);
-                    if (bo == borrowed.end()) continue;
-                    cm = bo->second.first.m; pm = bo->second.second.m;   // the neighbour's own cur -> prev motion
-                }
+                const float* cm = primSrc[k].first;    // the matrix whose inverse brings the vertex to "object" space
+                const float* pm = primSrc[k].second;   // ... and the one that brings it to the previous frame
+                if (!cm || !pm) continue;
                 // unfocus (this object's focus), then the neighbour-or-own object space: A^-1 (o - b)
                 const float* d = &m_rawVerts[v * 5];
                 if (std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
@@ -3661,6 +3694,16 @@ private:
     unsigned m_pitchLogTick = 0;
     int m_menuFrames = 0;
     bool m_isMenuM1 = false;
+    static bool HudIsoProfile() {
+        return arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
+    }
+    // A menu in ISO (26/09): its 2D page on the game camera's rays at the depth of its 3D, and its 3D (the cars in their
+    // boxes) left in 3D at its true depth -- on the page's plane within 0.05 degree of disparity, with its depth test.
+    // Flattened, the cars were painted face by face with no depth test: 17 ms of GPU in the car select.
+    bool MenuIso() const { return m_isMenuM1 && m_mainZMax > 0.0f && HudIsoProfile(); }
+    // Otherwise a menu is drawn flat on the screen plane: the vertex shader (uMenuFlat) and the pass routing (isMain)
+    // both read THIS.
+    bool MenuFlat() const { return m_isMenuM1 && !MenuIso(); }
     float m_lastPitchTarget = 0.0f;
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
