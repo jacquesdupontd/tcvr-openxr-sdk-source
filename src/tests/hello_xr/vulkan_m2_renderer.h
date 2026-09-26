@@ -1446,7 +1446,7 @@ public:
     // Lets MAME stop rasterising (scene mode 2) in screen mode too. Record outside any render pass.
     bool RenderFlat(VkCommandBuffer cmd) {
         if (!m_initialized || m_opaqueIndexCount == 0) return false;
-        const int k = std::max(1, std::min(8, arcadexr::config::GetInt("m2.gpuRaster", 4)));
+        const int k = std::max(1, std::min(std::max(1, m_flatScaleCap), std::min(8, arcadexr::config::GetInt("m2.gpuRaster", 4))));
         const uint32_t W = 496u * uint32_t(k), H = 384u * uint32_t(k);
         if (m_flat.w != W || m_flat.h != H) {
             vkDeviceWaitIdle(m_vkDevice);
@@ -1984,6 +1984,8 @@ public:
     struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; VkImageView fdmView = VK_NULL_HANDLE;
                      VkImage depthImage = VK_NULL_HANDLE; VkImageView depthResolveView = VK_NULL_HANDLE; };
     bool m_depthResolveWanted = false, m_depthResolveOn = false;
+    int m_flatScaleCap = 8;   // flat target scale ceiling, lowered by the plugin when the GPU is over budget (26/09)
+    void SetFlatScaleCap(int k) { m_flatScaleCap = k; }
 
     // ---- AppSW motion vectors (26/09) -------------------------------------------------------------------------------
     // The headset shows each 60 Hz frame twice at 120 Hz: an object moving on screen (the player's car turning in the

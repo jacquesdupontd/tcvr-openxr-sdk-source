@@ -1180,13 +1180,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
         std::tie(swapchainData, imageIndex) = m_swapchainImageDataMap.GetDataAndIndexFromBasePointer(swapchainImage);
 
-        if (viewIndex == 0) {
-            m_frameSlot ^= 1u;
-            const auto nowDraw = std::chrono::steady_clock::now();
-            const float dt = std::chrono::duration<float, std::milli>(nowDraw - m_lastDrawAt).count();
-            if (dt > 4.0f && dt < 40.0f) m_drawPeriodMs = (m_drawPeriodMs > 0.0f) ? m_drawPeriodMs + (dt - m_drawPeriodMs) * 0.05f : dt;
-            m_lastDrawAt = nowDraw;
-        }
+        if (viewIndex == 0) m_frameSlot ^= 1u;
         const size_t v = m_frameSlot * 2 + (viewIndex % 2);   // command buffer of (frame slot, eye)
 
         // Double-buffered command execution:
@@ -2423,7 +2417,40 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const bool appsw = m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 && arcadexr::profiles::GetInt("appsw", 1) != 0;
         const bool on = arcadexr::config::GetInt("m2.dynres", 1) != 0 &&
                         arcadexr::profiles::GetInt("immersive.dynres", (arcadexr::profiles::CurrentGame() == "srallyc" && !appsw) ? 0 : 1) != 0;
+        // FLAT (26/09, Virtua Cop in the screen mode: 4-18 ms, 43/90 in dense scenes): the flat target's scale steps down
+        // one notch (min x2) when over budget, back up after 5 s of room (max m2.gpuRaster). Each step recreates the
+        // target (a short hitch): rare by design.
+        if (m_flatDrawn && !m_lastM2Drawn && arcadexr::config::GetInt("m2.flatDynres", 1) != 0) {
+            m_dynSamples.push_back(gpuMs);
+            const auto nowF = std::chrono::steady_clock::now();
+            if (nowF - m_dynAt < std::chrono::milliseconds(500) || m_dynSamples.size() < 8) return;
+            m_dynAt = nowF;
+            std::vector<float> v = m_dynSamples; m_dynSamples.clear();
+            std::sort(v.begin(), v.end());
+            const float p75 = v[(v.size() * 3) / 4];
+            const float hzF = arcadexr::xr::State().current > 1.0f ? arcadexr::xr::State().current : 90.0f;
+            const float targetF = (1000.0f / hzF) * ((m_cadenceActive || m_m2CadenceActive) ? 2.0f : 1.0f) * 0.85f;
+            const int maxK = std::max(1, std::min(8, arcadexr::config::GetInt("m2.gpuRaster", 4)));
+            if (m_flatK <= 0 || m_flatK > maxK) m_flatK = maxK;
+            int nextK = m_flatK;
+            if (p75 > targetF && m_flatK > 2) { nextK = m_flatK - 1; m_flatRoomSince = nowF; }
+            else if (p75 < 0.5f * targetF && m_flatK < maxK) { if (nowF - m_flatRoomSince > std::chrono::seconds(5)) { nextK = m_flatK + 1; m_flatRoomSince = nowF; } }
+            else m_flatRoomSince = nowF;
+            if (nextK != m_flatK) {
+                Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES flat gpu p75=%.2f ms target=%.2f scale x%d -> x%d", p75, targetF, m_flatK, nextK));
+                m_flatK = nextK;
+                m_m2Renderer.SetFlatScaleCap(m_flatK);
+            }
+            return;
+        }
         if (!on || !m_lastM2Drawn) {
+            static std::chrono::steady_clock::time_point s_offLog{};
+            if (std::chrono::steady_clock::now() - s_offLog > std::chrono::seconds(5)) {
+                s_offLog = std::chrono::steady_clock::now();
+                Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES off: m2.dynres=%d immersive.dynres=%d lastDrawn=%d game=%s",
+                    arcadexr::config::GetInt("m2.dynres", 1), arcadexr::profiles::GetInt("immersive.dynres", -1), int(m_lastM2Drawn),
+                    arcadexr::profiles::CurrentGame().c_str()));
+            }
             m_m2DynScale = 1.0f; m_dynSamples.clear(); return;
         }
         m_dynSamples.push_back(gpuMs);
@@ -2437,10 +2464,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const float hz = arcadexr::xr::State().current > 1.0f ? arcadexr::xr::State().current : 90.0f;
         // Arcade cadence (one draw per new arcade frame, shown on two refreshes): a draw has two refresh periods, not
         // one (25/09: Top Skater at 120 Hz was held at 0.58 against a 7 ms budget it did not have to meet).
-        // The budget is the MEASURED interval between two frames the app draws (26/09): one per refresh, one per two
-        // (cadence, AppSW) -- whatever the mode, no guess. The System 22 path (Dirt Dash: 23 ms against 16.7) is included.
-        float period = (1000.0f / hz) * ((m_m2CadenceActive || appsw) ? 2.0f : 1.0f);
-        if (m_drawPeriodMs > 4.0f && m_drawPeriodMs < 40.0f) period = m_drawPeriodMs;
+        // The budget is the INTENDED interval between two drawn frames: one refresh, or two with a cadence (Model 2,
+        // System 22 -- Dirt Dash, 23 ms against 16.7 -- or AppSW). Never the achieved one (26/09: measured, a game
+        // falling to 45 frames a second made its own budget 22 ms and the scale never moved -- Virtua Cop at 43/90).
+        const float period = (1000.0f / hz) * ((m_m2CadenceActive || m_cadenceActive || appsw) ? 2.0f : 1.0f);
         const float target = period * std::max(0.5f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresBudget", 0.85f)));
         const float lo = std::max(0.3f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresMin", 0.5f)));
         // GPU time is roughly fixed + area; area goes with scale squared.
@@ -2450,14 +2477,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         else if (p75 < target * 0.80f) next = std::min(want, m_m2DynScale + 0.03f);    // clear room: creep up
         next = std::max(lo, std::min(1.0f, next));
         if (std::fabs(next - m_m2DynScale) >= 0.01f) {
-            Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES gpu p75=%.2f ms target=%.2f (drawn every %.1f ms, %.0f Hz%s) scale %.2f -> %.2f",
+            Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES gpu p75=%.2f ms target=%.2f (a frame every %.1f ms, %.0f Hz%s) scale %.2f -> %.2f",
                                              p75, target, period, hz, appsw ? ", AppSW" : (m_m2CadenceActive ? ", cadence" : ""), m_m2DynScale, next));
             m_m2DynScale = next;
         }
     }
     float m_m2DynScale{1.0f};
-    float m_drawPeriodMs{0.0f};   // smoothed interval between two drawn frames (ms)
-    std::chrono::steady_clock::time_point m_lastDrawAt{};
+    int m_flatK{0};
+    std::chrono::steady_clock::time_point m_flatRoomSince{};
     std::vector<float> m_dynSamples;
     std::chrono::steady_clock::time_point m_dynAt{};
 

@@ -1548,6 +1548,9 @@ struct OpenXrProgram : IOpenXrProgram {
             } else {
                 m_bugPaused = false;
                 arcadexr::input::SetDigital("bug_pause", false);
+                // The burst's captures are done by now: the last tag must not stay in the saved settings, where it
+                // triggered a 47 MB capture at every start of the app (26/09).
+                arcadexr::config::Set("dump", "0");
                 Log::Write(Log::Level::Info, "TCVR_BUG resumed");
             }
             XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
