@@ -1999,7 +1999,7 @@ public:
     bool m_hudMvAll[2] = {false, false};
     bool m_mvWanted = false, m_mvFresh = false;
     std::unordered_map<uint32_t, MvMat> m_mvPrevMats;   // addr -> matrix of single-copy main-view objects, previous frame
-    uint32_t m_mvCertain = 0, m_mvBorrowed = 0, m_mvVerts = 0;
+    uint32_t m_mvCertain = 0, m_mvBorrowed = 0, m_mvVerts = 0, m_mvScenery = 0;
     VkRenderPass m_mvPass = VK_NULL_HANDLE;
     VkPipeline m_mvPipe = VK_NULL_HANDLE;
     VkPipelineLayout m_mvLayout = VK_NULL_HANDLE;   // the Model 2 set layout + a fragment push constant (scale)
@@ -2017,7 +2017,7 @@ public:
     void MotionPrevCertain(const tcvr_m2_frame& frame, size_t nv) {
         m_prevPosCpu.assign(nv * 4, 0.0f);
         m_mvFresh = true;
-        m_mvCertain = m_mvBorrowed = m_mvVerts = 0;
+        m_mvCertain = m_mvBorrowed = m_mvVerts = m_mvScenery = 0;
         if (!frame.raw_motion || !m_haveMainView || m_isMenuM1) { m_mvPrevMats.clear(); return; }
         std::unordered_map<uint32_t, MvMat> cur;
         std::unordered_map<uint32_t, uint32_t> copies;
@@ -2069,6 +2069,7 @@ public:
             if (found) { src.emplace(kv.first, src[best]); ++m_mvBorrowed; }
         }
         std::unordered_map<uint32_t, std::pair<const float*, const float*>> primBorrow;   // prim -> borrowed motion
+        const bool sceneryVectors = arcadexr::config::GetInt("appsw_mvScenery", 1) != 0;   // live A/B
         for (size_t v = 0; v < nv; ++v) {
             const uint32_t k = m_rawPrimOfVertex[v];
             if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
@@ -2077,9 +2078,21 @@ public:
             const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
             if (std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
             const float* cm = nullptr; const float* pm = nullptr;
+            // The scenery (26/09): every polygon with no motion of its own (not a moving certain object, not near one)
+            // moves like the camera -- the SAME measured delta for all of it, trees and road alike, so it stays whole.
+            // A vector for every pixel, as an engine gives AppSW; zero left the whole moving picture doubled at 120 Hz.
+            auto sceneryPrev = [&](const float* dd, float* o4) {
+                if (!sceneryVectors) return false;
+                const float o[3] = {dd[0] / mo[12], dd[1] / mo[13], dd[2]};
+                const float px = m_cdR[0] * o[0] + m_cdR[3] * o[1] + m_cdR[6] * o[2] + m_cdT[0];
+                const float py = m_cdR[1] * o[0] + m_cdR[4] * o[1] + m_cdR[7] * o[2] + m_cdT[1];
+                const float pz = m_cdR[2] * o[0] + m_cdR[5] * o[1] + m_cdR[8] * o[2] + m_cdT[2];
+                o4[0] = px * mo[12]; o4[1] = py * mo[13]; o4[2] = pz; o4[3] = 1.0f;
+                return true;
+            };
             if (mo[14] >= 0.5f) {
                 auto it = src.find(p.motion_addr);
-                if (it == src.end()) continue;
+                if (it == src.end()) { if (sceneryPrev(&m_rawVerts[v * 5], &m_prevPosCpu[v * 4])) ++m_mvScenery; continue; }
                 cm = it->second.first; pm = it->second.second;
             } else {
                 // No matrix (direct polygons: the car's shadow, its dust): the motion of the moving certain object
@@ -2106,7 +2119,7 @@ public:
                     pb = primBorrow.emplace(uint32_t(k), got).first;
                 }
                 cm = pb->second.first; pm = pb->second.second;
-                if (!cm || !pm) continue;
+                if (!cm || !pm) { if (sceneryPrev(&m_rawVerts[v * 5], &m_prevPosCpu[v * 4])) ++m_mvScenery; continue; }
             }
             const float* d = &m_rawVerts[v * 5];
             const float o[3] = {d[0] / mo[12] - cm[9], d[1] / mo[13] - cm[10], d[2] - cm[11]};
@@ -2248,7 +2261,7 @@ public:
         bi.clearValueCount = 2; bi.pClearValues = cv.data();
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
         eye &= 1u;
-        if (drawGeometry && m_mvFresh && m_opaqueIndexCount > 0 && m_mvVerts > 0) {
+        if (drawGeometry && m_mvFresh && m_opaqueIndexCount > 0 && (m_mvVerts + m_mvScenery) > 0) {
             VkViewport v{0.0f, 0.0f, float(ext.width), float(ext.height), 0.0f, 1.0f};
             VkRect2D sc{{0, 0}, ext};
             vkCmdSetViewport(cmd, 0, 1, &v);
@@ -2279,7 +2292,7 @@ public:
         return true;
     }
     void SetMotionVectorsWanted(bool on) { m_mvWanted = on; }
-    void MotionStats(uint32_t* certain, uint32_t* borrowed, uint32_t* verts) const { *certain = m_mvCertain; *borrowed = m_mvBorrowed; *verts = m_mvVerts; }
+    void MotionStats(uint32_t* certain, uint32_t* borrowed, uint32_t* verts) const { *certain = m_mvCertain; *borrowed = m_mvBorrowed; *verts = m_mvVerts + m_mvScenery; }
 
     // ---- AppSW depth pass (26/09) -----------------------------------------------------------------------------------
     // The real distance of the main view's polygons (opaque + cut-outs, index range [0, m_secIndexStart)) into the
