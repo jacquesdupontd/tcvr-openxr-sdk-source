@@ -1497,18 +1497,31 @@ struct OpenXrProgram : IOpenXrProgram {
             rightStickClick = XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &qInfo, &q)) && q.isActive == XR_TRUE && q.currentState == XR_TRUE;
         }
         const bool bugCombo = leftStickClick && rightStickClick;
-        if (bugCombo && !m_bugComboHeld) {
-            m_bugPaused = !m_bugPaused;
-            arcadexr::input::SetDigital("bug_pause", m_bugPaused);
-            if (m_bugPaused) {
+        // Burst (26/09): a defect that lives BETWEEN two game frames (smooth motion) vanished from the capture, taken
+        // after the pause had frozen the blend. The combo now dumps the next frames AS DISPLAYED, live, then pauses.
+        if (m_bugBurst > 0) {
+            char t[64];
+            std::snprintf(t, sizeof t, "%s_%02d", m_bugBurstTag.c_str(), 16 - m_bugBurst);
+            arcadexr::config::Set("dump", t);   // taken by the renderer whenever its dump buffer is free
+            if (--m_bugBurst == 0) {
+                m_bugPaused = true;
+                arcadexr::input::SetDigital("bug_pause", true);
+                Log::Write(Log::Level::Info, Fmt("TCVR_BUG burst %s done: emulation paused", m_bugBurstTag.c_str()));
+            }
+        }
+        if (bugCombo && !m_bugComboHeld && m_bugBurst == 0) {
+            if (!m_bugPaused) {
                 // A tag never used before (a counter restarting at 1 each launch collided with the "dump" value kept in
                 // the settings file: no capture, 25/09).
                 char tag[48];
                 std::snprintf(tag, sizeof tag, "bug%lld", (long long)std::time(nullptr));
-                arcadexr::config::Set("dump", tag);
-                Log::Write(Log::Level::Info, Fmt("TCVR_BUG capture %s game=%s: emulation paused, left eye dumped as dump-%s-vkL.ppm",
+                m_bugBurstTag = tag;
+                m_bugBurst = 16;
+                Log::Write(Log::Level::Info, Fmt("TCVR_BUG capture %s game=%s: live burst dump-%s_NN-vkL.ppm, then pause",
                                                  tag, arcadexr::profiles::CurrentGame().c_str(), tag));
             } else {
+                m_bugPaused = false;
+                arcadexr::input::SetDigital("bug_pause", false);
                 Log::Write(Log::Level::Info, "TCVR_BUG resumed");
             }
             XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
@@ -2166,6 +2179,8 @@ struct OpenXrProgram : IOpenXrProgram {
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
     bool m_bugComboHeld{false}, m_bugPaused{false};
+    int m_bugBurst{0};
+    std::string m_bugBurstTag;
     unsigned m_bugCount{0};
     bool m_supportsDisplayRefreshRate{false};
     bool m_supportsFoveation{false};

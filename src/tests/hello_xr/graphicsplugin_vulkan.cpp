@@ -1604,6 +1604,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
                 m_dumpState = 1; m_dumpTag = tag; m_dumpW = w; m_dumpH = h; m_dumpCb = uint32_t(v);
+                m_dumpInterp = m_m2Renderer.LastInterp();
                 // Only what the compositor shows: the sub-rectangle of a dynamic-resolution frame (25/09: the rest of
                 // the swapchain holds older frames at other scales -- nested frames Guillaume never saw).
                 m_dumpVisW = std::max(1u, std::min(w, uint32_t(float(renderArea.extent.width))));
@@ -2059,7 +2060,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             std::fclose(f);
         }
         vkUnmapMemory(m_vkDevice, m_dumpMem);
-        Log::Write(Log::Level::Info, Fmt("TCVR_DUMP wrote %s (%ux%u shown of %ux%u) %s", path.c_str(), m_dumpVisW, m_dumpVisH, m_dumpW, m_dumpH, f ? "ok" : "FAILED"));
+        Log::Write(Log::Level::Info, Fmt("TCVR_DUMP wrote %s (%ux%u shown of %ux%u) interp=%.3f %s", path.c_str(), m_dumpVisW, m_dumpVisH, m_dumpW, m_dumpH, m_dumpInterp, f ? "ok" : "FAILED"));
     }
 
     // ---- Oracle capture (debug.tcvr.oracle=<tag>), for scripts/port_oracle.py ------------------------
@@ -2383,6 +2384,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_dumpState{0};
     std::string m_dumpTag, m_dumpDoneTag;
     uint32_t m_dumpVisW = 0, m_dumpVisH = 0;
+    float m_dumpInterp = 1.0f;   // blend position of the dumped frame (smooth motion)
     uint32_t m_dumpW{0}, m_dumpH{0}, m_dumpCb{0};
     VkBuffer m_dumpBuf{VK_NULL_HANDLE};
     VkDeviceMemory m_dumpMem{VK_NULL_HANDLE};

@@ -1056,6 +1056,7 @@ public:
             } else {
                 ubo.uInterp = 1.0f;
             }
+            m_lastInterp = ubo.uInterp;
             if (popFade) { ubo.uSky[0] = m_fogColour[0]; ubo.uSky[1] = m_fogColour[1]; ubo.uSky[2] = m_fogColour[2]; }
             else { ubo.uSky[0] = m_voidColor[0]; ubo.uSky[1] = m_voidColor[1]; ubo.uSky[2] = m_voidColor[2]; }
             ubo.uGround[0] = groundCol[0]; ubo.uGround[1] = groundCol[1]; ubo.uGround[2] = groundCol[2];
@@ -3694,6 +3695,10 @@ private:
     unsigned m_pitchLogTick = 0;
     int m_menuFrames = 0;
     bool m_isMenuM1 = false;
+    float m_lastInterp = 1.0f;
+  public:
+    float LastInterp() const { return m_lastInterp; }
+  private:
     static bool HudIsoProfile() {
         return arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
     }
