@@ -1656,7 +1656,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (viewIndex < 2 && m_swDepthTarget[viewIndex].image != VK_NULL_HANDLE) {
             const SwDepthTarget t = m_swDepthTarget[viewIndex];
             m_swDepthTarget[viewIndex] = {};
-            m_viewWroteSwDepth = m_m2Renderer.RenderAppSwDepth(cmd, viewIndex, t.image, t.ext, t.format, m2ImmersiveDrawn && !s22Drawn);
+            // AppSW depth EMPTY by default (everything at infinity): with the real distances the headset's reprojection
+            // made the car and the HUD smear whenever the head moved; empty, no ghosting and the same smoothness
+            // (Guillaume, headset A/B, 26/09) -- as the first AppSW build. appsw_depthGeo 1 = real distances (live).
+            const bool geo = arcadexr::config::GetInt("appsw_depthGeo", 0) != 0;
+            m_viewWroteSwDepth = m_m2Renderer.RenderAppSwDepth(cmd, viewIndex, t.image, t.ext, t.format, geo && m2ImmersiveDrawn && !s22Drawn);
             // debug.tcvr.appsw_depthDiag=1: once a second, what the headset receives as depth (left eye), read back.
             if (viewIndex == 0 && m_viewWroteSwDepth && m_swDiagState == 0 && t.format == VK_FORMAT_D32_SFLOAT &&
                 arcadexr::config::GetInt("appsw_depthDiag", 0) != 0 && (++m_swDiagTick % 60u) == 0u) {
