@@ -681,7 +681,7 @@ public:
             // their identity in the prim (object address, rank, copy) instead of Model 1's u/v.
             m_m2Smooth = !m_directColour && !m_flatMode &&
                          arcadexr::profiles::GetInt("immersive.smoothMotion2", 0) != 0;   // off by default until the flashes are understood (25/09)
-            if (m_directColour || m_m2Smooth) {
+            if (m_directColour || m_m2Smooth || m_camDeltaWanted) {
                 // Smooth motion (Model 1). Virtua Racing computes its 3D every OTHER arcade frame (30 Hz; measured
                 // 24/09) and the same frame is rebuilt for several refreshes: the blend runs between the last two
                 // frames that really changed. The match is done once per change, in MatchMotion().
@@ -700,8 +700,10 @@ public:
                     m_newestPos.resize(nv * 3);
                     for (size_t v = 0; v < nv; ++v)
                         for (int c = 0; c < 3; ++c) m_newestPos[v * 3 + c] = m_rawVerts[v * 5 + c];
-                    if (m_directColour) MatchMotion(nv); else MatchMotionMatrices(frame, nv);
+                    if (m_directColour) MatchMotion(nv); else if (m_m2Smooth) MatchMotionMatrices(frame, nv);
+                    if (m_camDeltaWanted && !m_directColour) CameraDelta(frame);
                 }
+                if (!m_directColour && !m_m2Smooth) m_prevPosCpu.clear();   // camera delta only: no blend
                 m_newGeometry = true;
             } else {
                 m_prevPosCpu.clear();
@@ -922,6 +924,10 @@ public:
 
         const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
         const float nearMetres = std::max(0.002f, std::min(1.0f, arcadexr::config::GetFloat("m2.immersiveNear", 0.25f)));
+        if (viewIndex == 0 && !m_flatMode) {
+            m_a2wRight = screen.right; m_a2wUp = upP; m_a2wNormal = normalP; m_a2wCam = camera; m_a2wScale = worldScale;
+            m_a2wValid = true; m_depthNear = nearMetres; m_depthFar = farMetres;
+        }
 
         XrMatrix4x4f projection;
         XrMatrix4x4f_CreateProjectionFov(&projection, GRAPHICS_VULKAN, layerView.fov, nearMetres, farMetres);
@@ -3074,6 +3080,137 @@ private:
     // scenery shares the camera part of its matrices), no class to decide, nothing on a menu (no main view), and an
     // object absent from the previous frame (a wheel model swapped to spin it) simply is not blended.
     struct ObjMat { float m[14]; };
+
+    // ---- Camera delta for Application SpaceWarp (26/09) ------------------------------------------------------------
+    // ONE motion for the whole picture, the game camera's, so the headset reprojects every pixel alike (no per-object
+    // guess: no isolated flash is possible). Measured on the objects whose identity is certain (one copy of the model
+    // in both frames, main view): for every static object prev = C_prev W, cur = C_cur W, so prev * cur^-1 is the
+    // same camera delta D for all of them. The D the most objects agree on wins; too few agree -> no delta this frame.
+    bool m_camDeltaWanted = false;
+    std::unordered_map<uint32_t, ObjMat> m_cdPrev;   // object address -> matrix, previous changed frame
+    float m_cdR[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, m_cdT[3] = {0, 0, 0};   // p_prev = R p_cur + T (camera space, arcade units)
+    bool m_cdValid = false;
+    uint32_t m_cdSeq = 0, m_cdAgree = 0, m_cdPairs = 0;
+    arcadexr::gun::Vec3 m_a2wRight{}, m_a2wUp{}, m_a2wNormal{}, m_a2wCam{};
+    float m_a2wScale = 1.0f, m_depthNear = 0.25f, m_depthFar = 20000.0f;
+    bool m_a2wValid = false;
+
+    static bool Inverse3(const float* c, float* o) {   // column-major 3x3 (m0..m8)
+        const float a = c[0], b = c[3], cc = c[6], d = c[1], e = c[4], f = c[7], g = c[2], h = c[5], i = c[8];
+        const float det = a * (e * i - f * h) - b * (d * i - f * g) + cc * (d * h - e * g);
+        if (std::fabs(det) < 1e-12f) return false;
+        const float id = 1.0f / det;
+        o[0] = (e * i - f * h) * id; o[3] = (cc * h - b * i) * id; o[6] = (b * f - cc * e) * id;
+        o[1] = (f * g - d * i) * id; o[4] = (a * i - cc * g) * id; o[7] = (cc * d - a * f) * id;
+        o[2] = (d * h - e * g) * id; o[5] = (b * g - a * h) * id; o[8] = (a * e - b * d) * id;
+        return true;
+    }
+    static void Mul3(const float* x, const float* y, float* o) {   // o = x * y, column-major
+        for (int c = 0; c < 3; ++c)
+            for (int rr = 0; rr < 3; ++rr) o[c * 3 + rr] = x[rr] * y[c * 3] + x[3 + rr] * y[c * 3 + 1] + x[6 + rr] * y[c * 3 + 2];
+    }
+
+    void CameraDelta(const tcvr_m2_frame& frame) {
+        ++m_cdSeq;
+        m_cdValid = false;
+        std::unordered_map<uint32_t, ObjMat> cur;
+        std::unordered_map<uint32_t, uint32_t> serials;   // addr -> 1 + highest serial seen (copies)
+        if (!frame.raw_motion || !m_haveMainView) { m_cdPrev.clear(); return; }
+        for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
+            const tcvr_m2_prim& p = m_rawPrims[k];
+            if (p.center_x != m_mainCenter[0] || p.center_y != m_mainCenter[1] ||
+                std::abs(p.clip_l - m_mainClip[0]) > 2 || std::abs(p.clip_t - m_mainClip[1]) > 2 ||
+                std::abs(p.clip_r - m_mainClip[2]) > 2 || std::abs(p.clip_b - m_mainClip[3]) > 2) continue;
+            const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
+            if (mo[14] < 0.5f) continue;
+            uint32_t& n = serials[p.motion_addr];
+            n = std::max(n, p.motion_serial + 1u);
+            ObjMat om; for (int i = 0; i < 14; ++i) om.m[i] = mo[i];
+            cur.emplace(p.motion_addr, om);
+        }
+        struct Cand { float R[9], T[3]; };
+        std::vector<Cand> cands;
+        for (const auto& kv : cur) {
+            if (serials[kv.first] != 1u) continue;          // several copies: identity not certain
+            auto it = m_cdPrev.find(kv.first);
+            if (it == m_cdPrev.end()) continue;
+            const float* C = kv.second.m; const float* P = it->second.m;
+            float Ci[9];
+            if (!Inverse3(C, Ci)) continue;
+            Cand c;
+            Mul3(P, Ci, c.R);
+            for (int rr = 0; rr < 3; ++rr)
+                c.T[rr] = P[9 + rr] - (c.R[rr] * C[9] + c.R[3 + rr] * C[10] + c.R[6 + rr] * C[11]);
+            cands.push_back(c);
+        }
+        m_cdPrev.clear();
+        for (const auto& kv : cur) if (serials[kv.first] == 1u) m_cdPrev.emplace(kv.first, kv.second);
+        m_cdPairs = uint32_t(cands.size());
+        size_t best = 0, bestN = 0;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            size_t n = 0;
+            const float tol = 0.02f + 0.01f * std::sqrt(cands[i].T[0] * cands[i].T[0] + cands[i].T[1] * cands[i].T[1] + cands[i].T[2] * cands[i].T[2]);
+            for (size_t j = 0; j < cands.size(); ++j) {
+                float dr = 0.0f, dt = 0.0f;
+                for (int q = 0; q < 9; ++q) dr = std::max(dr, std::fabs(cands[i].R[q] - cands[j].R[q]));
+                for (int q = 0; q < 3; ++q) dt = std::max(dt, std::fabs(cands[i].T[q] - cands[j].T[q]));
+                if (dr < 0.002f && dt < tol) ++n;
+            }
+            if (n > bestN) { bestN = n; best = i; }
+        }
+        m_cdAgree = uint32_t(bestN);
+        if (bestN >= 6 && bestN * 10 >= cands.size() * 3) {
+            std::memcpy(m_cdR, cands[best].R, sizeof m_cdR);
+            std::memcpy(m_cdT, cands[best].T, sizeof m_cdT);
+            m_cdValid = true;
+        }
+    }
+  public:
+    void SetCameraDeltaWanted(bool on) { m_camDeltaWanted = on; }
+    void DepthRange(float* n, float* f) const { *n = m_depthNear; *f = m_depthFar; }
+    uint32_t CameraDeltaSeq() const { return m_cdSeq; }
+    // The camera delta as the headset's appSpaceDeltaPose: the transform taking CURRENT app-space coordinates of the
+    // (static) world to its PREVIOUS ones. With A = arcadeToWorld (rotation R_A = [right | up | -normal], scale s,
+    // origin c): q_prev = R_A D_R R_A^T (q - c) + c + s R_A D_T. False when no reliable delta.
+    bool AppSpaceDelta(XrPosef* pose, uint32_t* agree, uint32_t* pairs) const {
+        *agree = m_cdAgree; *pairs = m_cdPairs;
+        if (!m_cdValid || !m_a2wValid) return false;
+        const float RA[9] = {m_a2wRight.x, m_a2wRight.y, m_a2wRight.z, m_a2wUp.x, m_a2wUp.y, m_a2wUp.z,
+                             -m_a2wNormal.x, -m_a2wNormal.y, -m_a2wNormal.z};
+        const float RAt[9] = {RA[0], RA[3], RA[6], RA[1], RA[4], RA[7], RA[2], RA[5], RA[8]};
+        float tmp[9], RF[9];
+        Mul3(RA, m_cdR, tmp);
+        Mul3(tmp, RAt, RF);
+        const float c[3] = {m_a2wCam.x, m_a2wCam.y, m_a2wCam.z};
+        float pos[3];
+        for (int rr = 0; rr < 3; ++rr) {
+            const float rc = RF[rr] * c[0] + RF[3 + rr] * c[1] + RF[6 + rr] * c[2];
+            const float at = RA[rr] * m_cdT[0] + RA[3 + rr] * m_cdT[1] + RA[6 + rr] * m_cdT[2];
+            pos[rr] = c[rr] - rc + m_a2wScale * at;
+        }
+        // rotation matrix (column-major) -> quaternion
+        const float m00 = RF[0], m11 = RF[4], m22 = RF[8], tr = m00 + m11 + m22;
+        float qw, qx, qy, qz;
+        if (tr > 0.0f) {
+            const float S = std::sqrt(tr + 1.0f) * 2.0f;
+            qw = 0.25f * S; qx = (RF[5] - RF[7]) / S; qy = (RF[6] - RF[2]) / S; qz = (RF[1] - RF[3]) / S;
+        } else if (m00 > m11 && m00 > m22) {
+            const float S = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+            qw = (RF[5] - RF[7]) / S; qx = 0.25f * S; qy = (RF[3] + RF[1]) / S; qz = (RF[6] + RF[2]) / S;
+        } else if (m11 > m22) {
+            const float S = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+            qw = (RF[6] - RF[2]) / S; qx = (RF[3] + RF[1]) / S; qy = 0.25f * S; qz = (RF[7] + RF[5]) / S;
+        } else {
+            const float S = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+            qw = (RF[1] - RF[3]) / S; qx = (RF[6] + RF[2]) / S; qy = (RF[7] + RF[5]) / S; qz = 0.25f * S;
+        }
+        const float qn = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+        if (!(qn > 0.5f)) return false;
+        pose->orientation = {qx / qn, qy / qn, qz / qn, qw / qn};
+        pose->position = {pos[0], pos[1], pos[2]};
+        return true;
+    }
+  private:
     std::unordered_map<uint32_t, ObjMat> m_prevMats, m_curMats;
     std::vector<uint32_t> m_rawPrimSrc;
     uint32_t m_matCuts = 0;

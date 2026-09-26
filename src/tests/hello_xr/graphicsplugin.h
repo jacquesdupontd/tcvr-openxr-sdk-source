@@ -94,6 +94,11 @@ struct IGraphicsPlugin {
         (void)width;
         (void)height;
     }
+    // AppSW (26/09): the game camera's motion since the last submitted frame, as appSpaceDeltaPose (identity when the
+    // arcade frame did not change, false when no reliable delta), and the real depth range of the depth image.
+    virtual bool AppSwDelta(XrPosef* pose) { (void)pose; return false; }
+    virtual void AppSwDepthRange(float* nearZ, float* farZ) { *nearZ = 0.05f; *farZ = 100.0f; }
+    virtual void SetAppSwWanted(bool on) { (void)on; }
 };
 
 // Graphics API factories are forward declared here.

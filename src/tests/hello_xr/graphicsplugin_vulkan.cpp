@@ -1673,6 +1673,51 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool WantsFoveationFdm() const override { return m_fdmEnabled; }
     float ViewportScale() const override { return m_viewportScale; }
     bool ViewWroteDepth() const override { return m_viewWroteDepth; }
+    void SetAppSwWanted(bool on) override { m_m2Renderer.SetCameraDeltaWanted(on); }
+    void AppSwDepthRange(float* nearZ, float* farZ) override { m_m2Renderer.DepthRange(nearZ, farZ); }
+    bool AppSwDelta(XrPosef* pose) override {
+        *pose = XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+        const uint32_t seq = m_m2Renderer.CameraDeltaSeq();
+        uint32_t agree = 0, pairs = 0;
+        bool ok = true;
+        if (seq != m_appswSeq) {   // a new arcade frame since the last submission: its camera motion
+            ok = m_m2Renderer.AppSpaceDelta(pose, &agree, &pairs);
+            if (!ok) *pose = XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+            if ((++m_appswLogTick % 60u) == 0u)
+                Log::Write(Log::Level::Info, Fmt("TCVR_APPSW delta ok=%d agree=%u/%u pos=(%.3f,%.3f,%.3f) q=(%.4f,%.4f,%.4f,%.4f) skipped=%u",
+                    int(ok), agree, pairs, pose->position.x, pose->position.y, pose->position.z, pose->orientation.x,
+                    pose->orientation.y, pose->orientation.z, pose->orientation.w, seq - m_appswSeq - 1u));
+            m_appswSeq = seq;
+        }
+        return ok;
+    }
+    // Motion vectors all zero (every pixel's motion is the camera's, given as appSpaceDeltaPose): cleared once per
+    // swapchain image -- nothing ever writes them.
+    void ClearMotionVectorImage(const XrSwapchainImageBaseHeader* image, int width, int height) override {
+        (void)width; (void)height;
+        const VkImage img = reinterpret_cast<const XrSwapchainImageVulkanKHR*>(image)->image;
+        if (std::find(m_mvCleared.begin(), m_mvCleared.end(), img) != m_mvCleared.end()) return;
+        if (m_mvCmd.buf == VK_NULL_HANDLE && !m_mvCmd.Init(m_namer, m_vkDevice, m_queueFamilyIndex)) return;
+        m_mvCmd.Clear();
+        m_mvCmd.Begin();
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(m_mvCmd.buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkClearColorValue zero{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(m_mvCmd.buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        vkCmdPipelineBarrier(m_mvCmd.buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        m_mvCmd.End();
+        m_mvCmd.Exec(m_vkQueue);
+        m_mvCmd.Wait();
+        m_mvCleared.push_back(img);
+        Log::Write(Log::Level::Info, Fmt("TCVR_APPSW motion-vector image cleared (%zu)", m_mvCleared.size()));
+    }
     bool m_viewWroteDepth = true;
     // Arcade cadence (s22.cadence, default on): System 22 runs at 60 Hz. The display is set to 120 Hz and a
     // frame is drawn only when the game produced a new one, so every arcade frame is shown exactly twice
@@ -2325,6 +2370,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // still draws frame N (measured 22/09: waiting on the fence of the frame just submitted left
     // the GPU idle during the CPU preparation -> 12-14 ms periods at 90 Hz).
     CmdBuffer m_cmdBuffer[4]{};
+    CmdBuffer m_mvCmd{};
+    std::vector<VkImage> m_mvCleared;
+    uint32_t m_appswSeq = 0, m_appswLogTick = 0;
     uint32_t m_frameSlot{0};
     PipelineLayout m_pipelineLayout{};
     VertexBuffer<Geometry::Vertex> m_drawBuffer{};

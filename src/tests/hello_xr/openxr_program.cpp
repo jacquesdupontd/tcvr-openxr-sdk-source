@@ -929,7 +929,12 @@ struct OpenXrProgram : IOpenXrProgram {
             // Only enable AppSW if the runtime advertises it.
             if (m_supportsSpaceWarp) {
                 for (int64_t format : swapchainFormats) {
-                    if (format == 0x881A /* GL_RGBA16F */) { m_motionVectorSwapchainFormat = format; break; }
+                    // RGBA16F: GL_RGBA16F (0x881A) or VK_FORMAT_R16G16B16A16_SFLOAT (97) -- the Vulkan build never found
+                    // the GL code, so AppSW could never activate on it (26/09).
+                    if (format == 0x881A /* GL_RGBA16F */ || format == 97 /* VK_FORMAT_R16G16B16A16_SFLOAT */) {
+                        m_motionVectorSwapchainFormat = format;
+                        break;
+                    }
                 }
                 if (m_motionVectorSwapchainFormat == 0)
                     Log::Write(Log::Level::Warning, "TCVR_M16 AppSW: no RGBA16F swapchain format; AppSW disabled");
@@ -1131,6 +1136,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 !m_motionVectorSwapchains.empty()) {
                 m_appswActive = true;
                 Log::Write(Log::Level::Info, "TCVR_M16 AppSW ACTIVE: motion+depth submission enabled");
+                m_graphicsPlugin->SetAppSwWanted(true);   // the renderer measures the game camera's motion
             }
         }
     }
@@ -2088,7 +2094,11 @@ struct OpenXrProgram : IOpenXrProgram {
             // the plain depth layer is not chained (avoids referencing the same
             // depth swapchain twice). The space-warp struct is chained below,
             // after the view is rendered.
-            if (m_supportsDepthLayer && !m_appswActive) {
+            // AppSW can be unplugged live (debug.tcvr.appsw_on 0, or the menu): the frame is then submitted exactly as
+            // without AppSW (plain depth layer).
+            const bool swOn = m_appswActive && arcadexr::config::GetInt("appsw_on", 1) != 0 &&
+                              arcadexr::profiles::GetInt("appsw", 1) != 0;   // menu LISSAGE
+            if (m_supportsDepthLayer && !swOn) {
                 depthInfos[i].type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR;
                 depthInfos[i].subImage.swapchain = m_depthSwapchains[i].handle;
                 depthInfos[i].subImage.imageRect.offset = {0, 0};
@@ -2107,7 +2117,7 @@ struct OpenXrProgram : IOpenXrProgram {
             m_graphicsPlugin->RenderView(i, projectionLayerViews[i], swapchainImage, m_colorSwapchainFormat, cubes);
             // Depth layer only for a view whose depth image was really written this frame (see ViewWroteDepth):
             // otherwise the compositor reprojects the image with a depth that is not the image's.
-            if (m_supportsDepthLayer && !m_appswActive && m_graphicsPlugin->ViewWroteDepth())
+            if (m_supportsDepthLayer && !swOn && m_graphicsPlugin->ViewWroteDepth())
                 projectionLayerViews[i].next = &depthInfos[i];
 
             XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -2120,7 +2130,8 @@ struct OpenXrProgram : IOpenXrProgram {
             // rendered. The runtime then extrapolates the frames the app is too
             // slow to render (exactly the dense-section dips), instead of a plain
             // rotational reprojection.
-            if (m_appswActive && i < m_motionVectorSwapchains.size()) {
+            if (i == 0) m_swDeltaOk = m_graphicsPlugin->AppSwDelta(&m_swDelta);   // once per frame, after the render
+            if (swOn && i < m_motionVectorSwapchains.size() && m_graphicsPlugin->ViewWroteDepth()) {
                 const Swapchain mvSwapchain = m_motionVectorSwapchains[i];
                 XrSwapchainImageAcquireInfo mvAcquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 uint32_t mvIndex;
@@ -2142,15 +2153,22 @@ struct OpenXrProgram : IOpenXrProgram {
                 sw.motionVectorSubImage.imageRect.offset = {0, 0};
                 sw.motionVectorSubImage.imageRect.extent = {mvSwapchain.width, mvSwapchain.height};
                 sw.motionVectorSubImage.imageArrayIndex = 0;
-                sw.appSpaceDeltaPose = XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+                // The game camera's motion (one pose for the whole picture), motion vectors zero. appsw_invert=1
+                // sends the inverse (sign convention to check in the headset: wrong = the road stutters doubly).
+                XrPosef delta = m_swDelta;
+                if (arcadexr::config::GetInt("appsw_invert", 0) != 0) {
+                    XrPosef inv;
+                    XrPosef_Invert(&inv, &delta);
+                    delta = inv;
+                }
+                sw.appSpaceDeltaPose = (arcadexr::config::GetInt("appsw_delta", 1) != 0)
+                                           ? delta : XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
                 sw.depthSubImage.swapchain = m_depthSwapchains[i].handle;
-                sw.depthSubImage.imageRect.offset = {0, 0};
-                sw.depthSubImage.imageRect.extent = {m_depthSwapchains[i].width, m_depthSwapchains[i].height};
+                sw.depthSubImage.imageRect = projectionLayerViews[i].subImage.imageRect;   // the rendered rectangle
                 sw.depthSubImage.imageArrayIndex = 0;
                 sw.minDepth = 0.0f;
                 sw.maxDepth = 1.0f;
-                sw.nearZ = 0.05f;
-                sw.farZ = 100.0f;
+                m_graphicsPlugin->AppSwDepthRange(&sw.nearZ, &sw.farZ);   // the projection's real range (was 0.05..100)
                 projectionLayerViews[i].next = &sw;
             }
         }
@@ -2179,6 +2197,8 @@ struct OpenXrProgram : IOpenXrProgram {
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
     bool m_bugComboHeld{false}, m_bugPaused{false};
+    XrPosef m_swDelta{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+    bool m_swDeltaOk{false};
     int m_bugBurst{0};
     std::string m_bugBurstTag;
     unsigned m_bugCount{0};
