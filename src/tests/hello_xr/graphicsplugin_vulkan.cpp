@@ -678,8 +678,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &n, nullptr);
             std::vector<VkExtensionProperties> exts(n);
             vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &n, exts.data());
-            bool haveIndexing = false, haveFdm = false;
+            bool haveIndexing = false, haveFdm = false, haveRp2 = false, haveDsResolve = false;
             for (auto& e : exts) {
+                if (strcmp(e.extensionName, "VK_KHR_create_renderpass2") == 0) haveRp2 = true;
+                if (strcmp(e.extensionName, "VK_KHR_depth_stencil_resolve") == 0) haveDsResolve = true;
                 if (strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) haveIndexing = true;
                 if (strcmp(e.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) == 0) haveFdm = true;
             }
@@ -712,7 +714,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 m_fdmFeature.fragmentDensityMap = VK_TRUE;
                 m_fdmEnabled = true;
             }
-            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK device: fragment density map ext=%d feature=%d", int(haveFdm), int(qf.fragmentDensityMap)));
+            // AppSW needs the depth in the headset's depth image: the Model 2 pass resolves its MSAA depth into it (26/09).
+            if (haveRp2 && haveDsResolve) {
+                deviceExtensions.push_back("VK_KHR_create_renderpass2");
+                deviceExtensions.push_back("VK_KHR_depth_stencil_resolve");
+                m_haveDepthResolve = true;
+            }
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK device: fragment density map ext=%d feature=%d | depth resolve rp2=%d dsr=%d",
+                                             int(haveFdm), int(qf.fragmentDensityMap), int(haveRp2), int(haveDsResolve)));
             Log::Write(Log::Level::Info, Fmt("TCVR_M2VK device: descriptor indexing ext=%d nonUniformSampled=%d samplerAnisotropy=%d",
                                              int(haveIndexing), int(q.shaderSampledImageArrayNonUniformIndexing),
                                              int(f2.features.samplerAnisotropy)));
@@ -941,6 +950,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     // Select the preferred swapchain format from the list of available formats.
     int64_t SelectDepthSwapchainFormat(bool throwIfNotFound, span<const int64_t> imageFormatArray) const override {
+        // AppSW (26/09): the Model 2 pass resolves its D32F depth into the headset's depth image, which needs the same
+        // format -- the runtime lists D16 first. Only when AppSW is requested: otherwise the runtime's order, as before.
+        if (arcadexr::config::GetInt("appsw", 0) != 0)
+            for (int64_t f : imageFormatArray)
+                if (f == int64_t(VK_FORMAT_D32_SFLOAT)) return f;
         // List of supported depth swapchain formats.
         return SelectSwapchainFormat(  //
             throwIfNotFound, imageFormatArray,
@@ -986,6 +1000,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     inline ISwapchainImageData* AllocateSwapchainImageDataWithDepthSwapchain(
         size_t size, const XrSwapchainCreateInfo& colorSwapchainCreateInfo, XrSwapchain depthSwapchain,
         const XrSwapchainCreateInfo& depthSwapchainCreateInfo) override {
+        m_xrDepthFormat = int64_t(depthSwapchainCreateInfo.format);
         auto typedResult = std::make_unique<VulkanSwapchainImageData>(
             m_namer, uint32_t(size), RawColorCreateInfo(colorSwapchainCreateInfo), depthSwapchain, depthSwapchainCreateInfo, m_vkDevice,
             &m_memAllocator, m_pipelineLayout, m_computePipelineLayout, m_shaderProgram, m_computeShaderProgram,
@@ -1442,7 +1457,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     fdmExt = {fit->second[imageIndex].width, fit->second[imageIndex].height};
                 }
                 m_m2Renderer.BeginPass(cmd, viewIndex, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, clear,
-                                       fdmImage, fdmExt);
+                                       fdmImage, fdmExt,
+                                       m_m2Renderer.DepthResolveOn() ? swapchainData->GetDepthImageForColorIndex(imageIndex).image : VK_NULL_HANDLE);
                 SetViewportAndScissor(cmd, renderArea);
                 m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, cmd, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
                 vkCmdEndRenderPass(cmd);
@@ -1451,6 +1467,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // The Model 2 / System 22 modules draw with their own transient depth: the depth swapchain image of this
         // view is not written, and must not be submitted (25/09: the car-select menu slid when the head moved).
         m_viewWroteDepth = !m2ImmersiveDrawn;
+        m_viewWroteSwDepth = m_viewWroteDepth || (m2ImmersiveDrawn && !s22Drawn && m_m2Renderer.DepthResolveOn());
         if (!m2ImmersiveDrawn) {
         SetViewportAndScissor(cmd, renderArea);
 
@@ -1673,7 +1690,16 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool WantsFoveationFdm() const override { return m_fdmEnabled; }
     float ViewportScale() const override { return m_viewportScale; }
     bool ViewWroteDepth() const override { return m_viewWroteDepth; }
-    void SetAppSwWanted(bool on) override { m_m2Renderer.SetCameraDeltaWanted(on); }
+    void SetAppSwWanted(bool on) override {
+        m_appswWanted = on;   // kept here: the renderer is rebuilt at each game change (ResetM2ForGameChange)
+        m_m2Renderer.SetCameraDeltaWanted(on);
+        // resolve only into a depth image of the pass's own format (D32F); decided before the renderer's Initialize
+        const bool resolve = on && m_haveDepthResolve && m_xrDepthFormat == int64_t(VK_FORMAT_D32_SFLOAT);
+        m_m2Renderer.SetDepthResolveWanted(resolve);
+        Log::Write(Log::Level::Info, Fmt("TCVR_APPSW wanted=%d depth resolve=%d (ext=%d xrDepthFormat=%lld)", int(on), int(resolve),
+                                         int(m_haveDepthResolve), (long long)m_xrDepthFormat));
+    }
+    bool ViewWroteSwDepth() const override { return m_viewWroteSwDepth; }
     void AppSwDepthRange(float* nearZ, float* farZ) override { m_m2Renderer.DepthRange(nearZ, farZ); }
     bool AppSwDelta(XrPosef* pose) override {
         *pose = XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
@@ -2055,6 +2081,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (m_vkDevice != VK_NULL_HANDLE) vkDeviceWaitIdle(m_vkDevice);
         m_m2Renderer.~VulkanModel2Renderer();
         new (&m_m2Renderer) arcadexr::vulkan::VulkanModel2Renderer();
+        if (m_appswWanted) SetAppSwWanted(true);   // the fresh renderer must know it too (26/09)
         m_m2RendererInitialized = false;
         m_lastM2Frame = nullptr;
         m_lastM2Drawn = false;
@@ -2371,6 +2398,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // the GPU idle during the CPU preparation -> 12-14 ms periods at 90 Hz).
     CmdBuffer m_cmdBuffer[4]{};
     CmdBuffer m_mvCmd{};
+    bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
+    int64_t m_xrDepthFormat = -1;
     std::vector<VkImage> m_mvCleared;
     uint32_t m_appswSeq = 0, m_appswLogTick = 0;
     uint32_t m_frameSlot{0};

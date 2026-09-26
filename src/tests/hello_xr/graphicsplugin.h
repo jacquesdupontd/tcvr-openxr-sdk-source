@@ -79,6 +79,8 @@ struct IGraphicsPlugin {
     // Whether the last RenderView wrote the view's DEPTH swapchain image. A depth layer is only submitted for a
     // view that did: a stale depth image makes the compositor reproject the image at a wrong distance.
     virtual bool ViewWroteDepth() const { return true; }
+    // Depth for AppSW: also true when the Model 2 pass resolved its depth into the headset's depth image (26/09).
+    virtual bool ViewWroteSwDepth() const { return ViewWroteDepth(); }
     // Arcade cadence: false = nothing new to draw this refresh; the previous projection layer is submitted
     // again and the runtime reprojects it to the current head pose.
     virtual bool RenderThisFrame() { return true; }

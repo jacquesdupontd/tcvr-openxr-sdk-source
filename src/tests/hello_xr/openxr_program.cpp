@@ -2131,7 +2131,7 @@ struct OpenXrProgram : IOpenXrProgram {
             // slow to render (exactly the dense-section dips), instead of a plain
             // rotational reprojection.
             if (i == 0) m_swDeltaOk = m_graphicsPlugin->AppSwDelta(&m_swDelta);   // once per frame, after the render
-            if (swOn && i < m_motionVectorSwapchains.size() && m_graphicsPlugin->ViewWroteDepth()) {
+            if (swOn && i < m_motionVectorSwapchains.size() && m_graphicsPlugin->ViewWroteSwDepth()) {
                 const Swapchain mvSwapchain = m_motionVectorSwapchains[i];
                 XrSwapchainImageAcquireInfo mvAcquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 uint32_t mvIndex;

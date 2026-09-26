@@ -1783,23 +1783,32 @@ public:
 
     // Begin the immersive render pass on swapchain image `target` (eye `eye`).
     void BeginPass(VkCommandBuffer cmd, uint32_t eye, VkImage target, VkExtent2D ext, const VkRect2D& area, const float clear[4],
-                   VkImage fdmImage = VK_NULL_HANDLE, VkExtent2D fdmExt = {0, 0}) {
+                   VkImage fdmImage = VK_NULL_HANDLE, VkExtent2D fdmExt = {0, 0}, VkImage depthTarget = VK_NULL_HANDLE) {
         eye = eye < 3 ? eye : 0;
+        if (!m_depthResolveOn) depthTarget = VK_NULL_HANDLE;
         EyeTargets& et = m_eyeTargets[eye];
         if (et.ext.width != ext.width || et.ext.height != ext.height) DestroyEyeTargets(et), CreateEyeTargets(et, ext);
         VkFramebuffer fb = VK_NULL_HANDLE;
-        for (auto& f : m_fbs) if (f.image == target && f.eye == eye) fb = f.fb;
+        for (auto& f : m_fbs) if (f.image == target && f.eye == eye && f.depthImage == depthTarget) fb = f.fb;
         if (fb == VK_NULL_HANDLE) {
             FbEntry e{};
-            e.image = target; e.eye = eye;
+            e.image = target; e.eye = eye; e.depthImage = depthTarget;
             VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vi.image = target; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = m_colorFormat;
             vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &vi, nullptr, &e.view));
-            std::array<VkImageView, 4> att{};
+            std::array<VkImageView, 5> att{};
             uint32_t n = 0;
             if (IsMsaa()) { att[n++] = et.colorView; att[n++] = et.depthView; att[n++] = e.view; }
             else { att[n++] = e.view; att[n++] = et.depthView; }
+            if (m_depthResolveOn) {
+                // The headset's depth image: the MSAA depth resolved into it on-chip (sample 0), for AppSW (26/09).
+                VkImageViewCreateInfo dv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                dv.image = depthTarget; dv.viewType = VK_IMAGE_VIEW_TYPE_2D; dv.format = kDepthFormat;
+                dv.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+                XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &dv, nullptr, &e.depthResolveView));
+                att[n++] = e.depthResolveView;
+            }
             if (m_useFdm) {
                 // The runtime's density map for this image: the periphery is shaded at a lower rate.
                 VkImageViewCreateInfo fv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1831,7 +1840,74 @@ public:
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
     }
 
+    // AppSW (26/09): the same pass with the MSAA depth resolved into the headset's depth image (VK_KHR_depth_stencil_resolve
+    // through VK_KHR_create_renderpass2), only when AppSW is on: otherwise the pass is exactly the previous one.
+    bool CreateRenderPassDepthResolve() {
+        auto create2 = reinterpret_cast<PFN_vkCreateRenderPass2KHR>(vkGetDeviceProcAddr(m_vkDevice, "vkCreateRenderPass2KHR"));
+        if (!create2 || !IsMsaa()) {
+            Log::Write(Log::Level::Warning, Fmt("TCVR_M2VK depth resolve unavailable: vkCreateRenderPass2KHR=%p msaa=%d", (void*)create2, int(IsMsaa())));
+            return false;
+        }
+        std::array<VkAttachmentDescription2, 5> at{};
+        for (auto& a : at) { a.sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2; a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; }
+        at[0].format = m_colorFormat; at[0].samples = m_samples;
+        at[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        at[1].format = kDepthFormat; at[1].samples = m_samples;
+        at[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        at[2].format = m_colorFormat; at[2].samples = VK_SAMPLE_COUNT_1_BIT;
+        at[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        at[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[2].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        at[3].format = kDepthFormat; at[3].samples = VK_SAMPLE_COUNT_1_BIT;   // the headset's depth image
+        at[3].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[3].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        at[3].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[3].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        const uint32_t fdmIndex = 4u;
+        at[4].format = VK_FORMAT_R8G8_UNORM; at[4].samples = VK_SAMPLE_COUNT_1_BIT;
+        at[4].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[4].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[4].initialLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+        at[4].finalLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+        VkAttachmentReference2 colorRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT};
+        VkAttachmentReference2 depthRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT};
+        VkAttachmentReference2 resolveRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT};
+        VkAttachmentReference2 depthResolveRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT};
+        VkSubpassDescriptionDepthStencilResolve dsr{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE};
+        dsr.depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT; dsr.stencilResolveMode = VK_RESOLVE_MODE_NONE;
+        dsr.pDepthStencilResolveAttachment = &depthResolveRef;
+        VkSubpassDescription2 sp{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2};
+        sp.pNext = &dsr;
+        sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sp.colorAttachmentCount = 1; sp.pColorAttachments = &colorRef;
+        sp.pResolveAttachments = &resolveRef;
+        sp.pDepthStencilAttachment = &depthRef;
+        VkSubpassDependency2 dep{VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        VkRenderPassFragmentDensityMapCreateInfoEXT fdmInfo{VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT};
+        fdmInfo.fragmentDensityMapAttachment = {fdmIndex, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT};
+        VkRenderPassCreateInfo2 ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2};
+        ri.attachmentCount = 4u + (m_useFdm ? 1u : 0u); ri.pAttachments = at.data();
+        if (m_useFdm) ri.pNext = &fdmInfo;
+        ri.subpassCount = 1; ri.pSubpasses = &sp;
+        ri.dependencyCount = 1; ri.pDependencies = &dep;
+        const VkResult res = create2(m_vkDevice, &ri, nullptr, &m_pass);
+        if (res != VK_SUCCESS) {
+            Log::Write(Log::Level::Warning, Fmt("TCVR_M2VK depth resolve render pass failed: VkResult %d", int(res)));
+            m_pass = VK_NULL_HANDLE;
+            return false;
+        }
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK render pass: MSAA x%d, depth resolved into the headset's depth image (AppSW), foveation %s",
+                                         int(m_samples), m_useFdm ? "ON" : "off"));
+        return true;
+    }
+
     void CreateRenderPass() {
+        Log::Write(Log::Level::Info, Fmt("TCVR_M2VK CreateRenderPass depthResolveWanted=%d", int(m_depthResolveWanted)));
+        m_depthResolveOn = m_depthResolveWanted && CreateRenderPassDepthResolve();
+        if (m_depthResolveOn) return;
         std::array<VkAttachmentDescription, 3> at{};
         const bool ms = IsMsaa();
         // 0: colour (MSAA transient, or the swapchain itself at 1x)
@@ -1891,7 +1967,11 @@ public:
         VkDeviceMemory colorMem = VK_NULL_HANDLE, depthMem = VK_NULL_HANDLE;
         VkImageView colorView = VK_NULL_HANDLE, depthView = VK_NULL_HANDLE;
     };
-    struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; VkImageView fdmView = VK_NULL_HANDLE; };
+    struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; VkImageView fdmView = VK_NULL_HANDLE;
+                     VkImage depthImage = VK_NULL_HANDLE; VkImageView depthResolveView = VK_NULL_HANDLE; };
+    bool m_depthResolveWanted = false, m_depthResolveOn = false;
+    void SetDepthResolveWanted(bool on) { m_depthResolveWanted = on; }   // before Initialize
+    bool DepthResolveOn() const { return m_depthResolveOn; }
     static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
     void AllocTransient(VkImage img, VkDeviceMemory* mem) {
@@ -1931,7 +2011,7 @@ public:
         if (et.ext.width == 0) return;
         vkDeviceWaitIdle(m_vkDevice);
         // framebuffers reference these views: drop them all, they are rebuilt lazily
-        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); }
+        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); if (f.depthResolveView) vkDestroyImageView(m_vkDevice, f.depthResolveView, nullptr); }
         m_fbs.clear();
         if (et.colorView) vkDestroyImageView(m_vkDevice, et.colorView, nullptr);
         if (et.depthView) vkDestroyImageView(m_vkDevice, et.depthView, nullptr);
@@ -1955,7 +2035,7 @@ public:
         if (m_flat.image) vkDestroyImage(m_vkDevice, m_flat.image, nullptr);
         if (m_flat.mem) vkFreeMemory(m_vkDevice, m_flat.mem, nullptr);
         m_flat = FlatTarget{};
-        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); }
+        for (auto& f : m_fbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); if (f.fdmView) vkDestroyImageView(m_vkDevice, f.fdmView, nullptr); if (f.depthResolveView) vkDestroyImageView(m_vkDevice, f.depthResolveView, nullptr); }
         m_fbs.clear();
         if (m_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(m_vkDevice, m_pass, nullptr); m_pass = VK_NULL_HANDLE; }
 
