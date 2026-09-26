@@ -1467,7 +1467,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // The Model 2 / System 22 modules draw with their own transient depth: the depth swapchain image of this
         // view is not written, and must not be submitted (25/09: the car-select menu slid when the head moved).
         m_viewWroteDepth = !m2ImmersiveDrawn;
-        m_viewWroteSwDepth = m_viewWroteDepth || (m2ImmersiveDrawn && !s22Drawn && m_m2Renderer.DepthResolveOn());
+        m_viewWroteSwDepth = false;
         if (!m2ImmersiveDrawn) {
         SetViewportAndScissor(cmd, renderArea);
 
@@ -1651,6 +1651,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             SetM2SceneMode((((m2ImmersiveDrawn && m_m2Renderer.HaveMainView()) || m_flatDrawn) && allowSkip) ? 2 : 1);
         }
 
+        // AppSW: the real distance of this eye's polygons into the headset's low-resolution AppSW depth image.
+        if (viewIndex < 2 && m_swDepthTarget[viewIndex].image != VK_NULL_HANDLE) {
+            const SwDepthTarget t = m_swDepthTarget[viewIndex];
+            m_swDepthTarget[viewIndex] = {};
+            m_viewWroteSwDepth = m_m2Renderer.RenderAppSwDepth(cmd, viewIndex, t.image, t.ext, t.format, m2ImmersiveDrawn && !s22Drawn);
+        }
         m_cmdBuffer[v].End();
         const auto tSubmit = clk::now();
         m_cmdBuffer[v].Exec(m_vkQueue);
@@ -1694,12 +1700,23 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_appswWanted = on;   // kept here: the renderer is rebuilt at each game change (ResetM2ForGameChange)
         m_m2Renderer.SetCameraDeltaWanted(on);
         // resolve only into a depth image of the pass's own format (D32F); decided before the renderer's Initialize
-        const bool resolve = on && m_haveDepthResolve && m_xrDepthFormat == int64_t(VK_FORMAT_D32_SFLOAT);
+        // Resolving the colour pass's depth is useless for AppSW: it holds the painter RANK (m2.depthOrder), not the
+        // distance -- the ghosting of 26/09. The real distance comes from RenderAppSwDepth. Kept off.
+        const bool resolve = false;
         m_m2Renderer.SetDepthResolveWanted(resolve);
         Log::Write(Log::Level::Info, Fmt("TCVR_APPSW wanted=%d depth resolve=%d (ext=%d xrDepthFormat=%lld)", int(on), int(resolve),
                                          int(m_haveDepthResolve), (long long)m_xrDepthFormat));
     }
     bool ViewWroteSwDepth() const override { return m_viewWroteSwDepth; }
+    // The AppSW depth image paired with this view's motion-vector image (acquired by the program before RenderView).
+    void SetAppSwDepthTarget(uint32_t view, const XrSwapchainImageBaseHeader* mvImage) override {
+        if (view >= 2 || !mvImage) return;
+        auto dataAndIndex = m_swapchainImageDataMap.GetDataAndIndexFromBasePointer(mvImage);
+        VulkanSwapchainImageData* d = dataAndIndex.first;
+        if (!d || !d->DepthSwapchainEnabled()) return;
+        m_swDepthTarget[view] = {d->GetDepthImageForColorIndex(dataAndIndex.second).image,
+                                 {uint32_t(d->Width()), uint32_t(d->Height())}, VkFormat(d->GetDepthFormat())};
+    }
     void AppSwDepthRange(float* nearZ, float* farZ) override { m_m2Renderer.DepthRange(nearZ, farZ); }
     bool AppSwDelta(XrPosef* pose) override {
         *pose = XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
@@ -2399,6 +2416,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     CmdBuffer m_cmdBuffer[4]{};
     CmdBuffer m_mvCmd{};
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
+    struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; };
+    SwDepthTarget m_swDepthTarget[2]{};
     int64_t m_xrDepthFormat = -1;
     std::vector<VkImage> m_mvCleared;
     uint32_t m_appswSeq = 0, m_appswLogTick = 0;

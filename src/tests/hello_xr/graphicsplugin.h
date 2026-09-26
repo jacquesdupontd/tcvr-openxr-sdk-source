@@ -101,6 +101,7 @@ struct IGraphicsPlugin {
     virtual bool AppSwDelta(XrPosef* pose) { (void)pose; return false; }
     virtual void AppSwDepthRange(float* nearZ, float* farZ) { *nearZ = 0.05f; *farZ = 100.0f; }
     virtual void SetAppSwWanted(bool on) { (void)on; }
+    virtual void SetAppSwDepthTarget(uint32_t view, const XrSwapchainImageBaseHeader* mvImage) { (void)view; (void)mvImage; }
 };
 
 // Graphics API factories are forward declared here.

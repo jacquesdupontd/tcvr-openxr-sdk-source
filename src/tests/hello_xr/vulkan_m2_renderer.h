@@ -19,6 +19,7 @@
 #include "vulkan_m2_regions.h"
 
 #include "m2_vert_spv.h"
+#include "appsw_depth_vert_spv.h"
 #include "m2_frag_spv.h"
 #include "m2_frag_nd_spv.h"
 #include "m2_frag_cutd_spv.h"
@@ -939,6 +940,11 @@ public:
         XrMatrix4x4f_Multiply(&viewProjection, &projection, &worldToEye);
         XrMatrix4x4f mvp;
         XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
+        if (!m_flatMode) {   // AppSW depth pass (RenderAppSwDepth): the same placement as this eye's colour pass
+            std::memcpy(m_swMvp[viewIndex & 1u], mvp.m, sizeof(mvp.m));
+            m_swFocus[0] = focusX; m_swFocus[1] = focusY;
+            m_swMvpValid[viewIndex & 1u] = true;
+        }
 
         // HUD at 2 m (23/09-24/09): at 10 m it was drawn OVER 3D much nearer (a car at 3 m), which the eyes read as
         // "behind yet in front" -- the texts made Guillaume squint, in Virtua Racing and Virtua Cop. Same apparent
@@ -1970,6 +1976,123 @@ public:
     struct FbEntry { VkImage image; uint32_t eye; VkImageView view; VkFramebuffer fb; VkImageView fdmView = VK_NULL_HANDLE;
                      VkImage depthImage = VK_NULL_HANDLE; VkImageView depthResolveView = VK_NULL_HANDLE; };
     bool m_depthResolveWanted = false, m_depthResolveOn = false;
+
+    // ---- AppSW depth pass (26/09) -----------------------------------------------------------------------------------
+    // The real distance of the main view's polygons (opaque + cut-outs, index range [0, m_secIndexStart)) into the
+    // headset's low-resolution AppSW depth image; far where nothing (sky, flat menus). Depth only, no colour.
+    float m_swMvp[2][16] = {}, m_swFocus[2] = {512.0f, 512.0f};
+    bool m_swMvpValid[2] = {false, false};
+    VkRenderPass m_swDepthPass = VK_NULL_HANDLE;
+    VkPipelineLayout m_swDepthLayout = VK_NULL_HANDLE;
+    VkPipeline m_swDepthPipe = VK_NULL_HANDLE;
+    VkFormat m_swDepthFormat = VK_FORMAT_UNDEFINED;
+    struct SwDepthFb { VkImage image; VkImageView view; VkFramebuffer fb; VkExtent2D ext; };
+    std::vector<SwDepthFb> m_swDepthFbs;
+
+    bool CreateSwDepthObjects(VkFormat format) {
+        if (m_swDepthPipe != VK_NULL_HANDLE && m_swDepthFormat == format) return true;
+        DestroySwDepthObjects();
+        m_swDepthFormat = format;
+        VkAttachmentDescription at{};
+        at.format = format; at.samples = VK_SAMPLE_COUNT_1_BIT;
+        at.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        at.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference dref{0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sp{};
+        sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sp.pDepthStencilAttachment = &dref;
+        VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ri.attachmentCount = 1; ri.pAttachments = &at; ri.subpassCount = 1; ri.pSubpasses = &sp;
+        if (vkCreateRenderPass(m_vkDevice, &ri, nullptr, &m_swDepthPass) != VK_SUCCESS) return false;
+        VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 18 * sizeof(float)};
+        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(m_vkDevice, &li, nullptr, &m_swDepthLayout) != VK_SUCCESS) return false;
+        VkShaderModule vs = CreateShaderModule(c_appswDepthVertSpv, sizeof(c_appswDepthVertSpv));
+        VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st.stage = VK_SHADER_STAGE_VERTEX_BIT; st.module = vs; st.pName = "main";
+        VkVertexInputBindingDescription bind{0, 5 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
+        std::array<VkVertexInputAttributeDescription, 2> attrs{{{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+                                                                 {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 2 * sizeof(float)}}};
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;
+        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs.data();
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        std::array<VkDynamicState, 2> dyn{{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount = uint32_t(dyn.size()); dy.pDynamicStates = dyn.data();
+        VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pi.stageCount = 1; pi.pStages = &st;
+        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp; pi.pRasterizationState = &rs;
+        pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds; pi.pColorBlendState = &cb; pi.pDynamicState = &dy;
+        pi.layout = m_swDepthLayout; pi.renderPass = m_swDepthPass; pi.subpass = 0;
+        const VkResult res = vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pi, nullptr, &m_swDepthPipe);
+        vkDestroyShaderModule(m_vkDevice, vs, nullptr);
+        Log::Write(Log::Level::Info, Fmt("TCVR_APPSW depth pass created (format %d): %d", int(format), int(res)));
+        return res == VK_SUCCESS;
+    }
+    void DestroySwDepthObjects() {
+        if (m_vkDevice == VK_NULL_HANDLE) return;
+        for (auto& f : m_swDepthFbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
+        m_swDepthFbs.clear();
+        if (m_swDepthPipe) vkDestroyPipeline(m_vkDevice, m_swDepthPipe, nullptr);
+        if (m_swDepthLayout) vkDestroyPipelineLayout(m_vkDevice, m_swDepthLayout, nullptr);
+        if (m_swDepthPass) vkDestroyRenderPass(m_vkDevice, m_swDepthPass, nullptr);
+        m_swDepthPipe = VK_NULL_HANDLE; m_swDepthLayout = VK_NULL_HANDLE; m_swDepthPass = VK_NULL_HANDLE;
+    }
+
+    // Records the depth pass into cmd (outside any render pass). drawGeometry false: only cleared to far.
+    bool RenderAppSwDepth(VkCommandBuffer cmd, uint32_t eye, VkImage image, VkExtent2D ext, VkFormat format, bool drawGeometry) {
+        if (!m_initialized || image == VK_NULL_HANDLE || !CreateSwDepthObjects(format)) return false;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        for (auto& f : m_swDepthFbs) if (f.image == image && f.ext.width == ext.width && f.ext.height == ext.height) fb = f.fb;
+        if (fb == VK_NULL_HANDLE) {
+            SwDepthFb f{image, VK_NULL_HANDLE, VK_NULL_HANDLE, ext};
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = format;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(m_vkDevice, &vi, nullptr, &f.view) != VK_SUCCESS) return false;
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = m_swDepthPass; fi.attachmentCount = 1; fi.pAttachments = &f.view;
+            fi.width = ext.width; fi.height = ext.height; fi.layers = 1;
+            if (vkCreateFramebuffer(m_vkDevice, &fi, nullptr, &f.fb) != VK_SUCCESS) return false;
+            m_swDepthFbs.push_back(f);
+            fb = f.fb;
+        }
+        VkClearValue cv{}; cv.depthStencil = {1.0f, 0};
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = m_swDepthPass; bi.framebuffer = fb; bi.renderArea = {{0, 0}, ext};
+        bi.clearValueCount = 1; bi.pClearValues = &cv;
+        vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        eye &= 1u;
+        if (drawGeometry && m_swMvpValid[eye] && m_secIndexStart > 0 && !MenuFlat()) {
+            VkViewport v{0.0f, 0.0f, float(ext.width), float(ext.height), 0.0f, 1.0f};
+            VkRect2D sc{{0, 0}, ext};
+            vkCmdSetViewport(cmd, 0, 1, &v);
+            vkCmdSetScissor(cmd, 0, 1, &sc);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_swDepthPipe);
+            float pc[18];
+            std::memcpy(pc, m_swMvp[eye], 16 * sizeof(float));
+            pc[16] = m_swFocus[0]; pc[17] = m_swFocus[1];
+            vkCmdPushConstants(cmd, m_swDepthLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), pc);
+            VkDeviceSize off = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m_vboBufferF[m_fs].buf, &off);
+            vkCmdBindIndexBuffer(cmd, m_iboBufferF[m_fs].buf, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, m_secIndexStart, 1, 0, 0, 0);
+        }
+        vkCmdEndRenderPass(cmd);
+        return true;
+    }
     void SetDepthResolveWanted(bool on) { m_depthResolveWanted = on; }   // before Initialize
     bool DepthResolveOn() const { return m_depthResolveOn; }
     static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
@@ -2025,6 +2148,7 @@ public:
     void Cleanup() {
         if (!m_initialized) return;
         m_initialized = false;
+        DestroySwDepthObjects();
 
         vkDeviceWaitIdle(m_vkDevice);
         m_regions.Destroy();
