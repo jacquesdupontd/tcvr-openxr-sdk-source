@@ -1276,6 +1276,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 // AppSW (26/09): 120 Hz, the app drawing at 60 and the headset synthesising the other refresh.
                 const bool appswGame = m_lastM2Drawn && m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 &&
                                        arcadexr::profiles::GetInt("appsw", 0) != 0;
+                // The AppSW-only CPU work (camera delta, motion vectors) only for a game that uses AppSW now (26/09: it
+                // ran in every game once the extension was on -- House of the Dead's frame preparation paid for it).
+                m_m2Renderer.SetCameraDeltaWanted(appswGame);
+                m_m2Renderer.SetMotionVectorsWanted(appswGame && arcadexr::config::GetInt("appsw_mv", 1) != 0);
                 const int wantRate = (m2Cadence || appswGame) ? 120 : (m_smoothOn ? 90 : 0);
                 if (wantRate != m_m2RateRequested) {
                     if (wantRate > 0 || m_m2RateRequested > 0)
@@ -2080,8 +2084,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // Immersive System 22 renders its scene at immersive.scale: into a sub-rectangle of the swapchain
         // (applied from the next frame), so the composite also runs at that size and the compositor scales.
         m_lastRenderedSeq = m_s22Frame->sequence;
+        // times the dynamic scale (26/09: computed for the System 22 too, but never applied here -- the Dirt Dash
+        // "23 -> 11 ms" of that afternoon was a change of scene, not the dynamic resolution)
         if (arcadexr::config::GetInt("s22.viewportScale", 1) != 0)
-            m_viewportScale = std::max(0.3f, std::min(1.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f)));
+            m_viewportScale = std::max(0.3f, std::min(1.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f) * m_m2DynScale));
     }
 
     bool RenderSystem22Eye(VkCommandBuffer cmd, uint32_t viewIndex, const XrCompositionLayerProjectionView& layerView,

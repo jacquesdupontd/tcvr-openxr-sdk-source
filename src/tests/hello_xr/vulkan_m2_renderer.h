@@ -2071,6 +2071,7 @@ public:
             if (found) { src.emplace(kv.first, src[best]); ++m_mvBorrowed; }
         }
         std::unordered_map<uint32_t, std::pair<const float*, const float*>> primBorrow;   // prim -> borrowed motion
+        std::unordered_map<const float*, std::array<float, 10>> invCache;   // motion source -> inverse (ok in [9])
         const bool sceneryVectors = arcadexr::config::GetInt("appsw_mvScenery", 1) != 0;   // live A/B
         for (size_t v = 0; v < nv; ++v) {
             const uint32_t k = m_rawPrimOfVertex[v];
@@ -2125,8 +2126,15 @@ public:
             }
             const float* d = &m_rawVerts[v * 5];
             const float o[3] = {d[0] / mo[12] - cm[9], d[1] / mo[13] - cm[10], d[2] - cm[11]};
-            float ci[9];
-            if (!Inverse3(cm, ci)) continue;
+            // one inverse per motion source, not per vertex (26/09)
+            auto iv = invCache.find(cm);
+            if (iv == invCache.end()) {
+                std::array<float, 10> e{};
+                e[9] = Inverse3(cm, e.data()) ? 1.0f : 0.0f;
+                iv = invCache.emplace(cm, e).first;
+            }
+            if (iv->second[9] < 0.5f) continue;
+            const float* ci = iv->second.data();
             const float ob[3] = {ci[0] * o[0] + ci[3] * o[1] + ci[6] * o[2], ci[1] * o[0] + ci[4] * o[1] + ci[7] * o[2],
                                  ci[2] * o[0] + ci[5] * o[1] + ci[8] * o[2]};
             const float px = ob[0] * pm[0] + ob[1] * pm[3] + ob[2] * pm[6] + pm[9];
