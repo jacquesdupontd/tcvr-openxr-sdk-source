@@ -2018,8 +2018,12 @@ struct OpenXrProgram : IOpenXrProgram {
                     else x = std::copysign((std::fabs(x) - deadzone) / (1.0f - deadzone), x);
                     // On a menu screen of the game the stick covers the whole wheel (26/09: Sega Rally's third practice
                     // course, far right, was out of reach of the race range of 0.22).
-                    const float range = (controls == "stick_direct" || m_graphicsPlugin->GameMenuScreen()) ? 0.5f :
+                    const bool menuScreen = m_graphicsPlugin->GameMenuScreen();
+                    const float range = (controls == "stick_direct" || menuScreen) ? 0.5f :
                         std::max(0.10f, std::min(0.5f, arcadexr::profiles::GetFloat("driving.stickRange", 0.22f)));
+                    // Menus: a squared response (26/09, Guillaume: "it jumps to the last one ultra fast, you have to be
+                    // gentle to stay in the middle") -- gentle around the centre, full lock still at the stop.
+                    if (menuScreen) x = x * std::fabs(x);
                     steer = 0.5f + x * range;
                 }
             }
