@@ -1995,6 +1995,7 @@ public:
     uint32_t m_mvCertain = 0, m_mvBorrowed = 0, m_mvVerts = 0;
     VkRenderPass m_mvPass = VK_NULL_HANDLE;
     VkPipeline m_mvPipe = VK_NULL_HANDLE;
+    VkPipelineLayout m_mvLayout = VK_NULL_HANDLE;   // the Model 2 set layout + a fragment push constant (scale)
     struct MvFb { VkImage image; VkImageView view; VkFramebuffer fb; VkExtent2D ext; };
     std::vector<MvFb> m_mvFbs;
     VkImage m_mvDepth = VK_NULL_HANDLE; VkDeviceMemory m_mvDepthMem = VK_NULL_HANDLE; VkImageView m_mvDepthView = VK_NULL_HANDLE;
@@ -2060,16 +2061,46 @@ public:
             }
             if (found) { src.emplace(kv.first, src[best]); ++m_mvBorrowed; }
         }
+        std::unordered_map<uint32_t, std::pair<const float*, const float*>> primBorrow;   // prim -> borrowed motion
         for (size_t v = 0; v < nv; ++v) {
             const uint32_t k = m_rawPrimOfVertex[v];
             if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
             const tcvr_m2_prim& p = m_rawPrims[k];
             if (!IsMainPrim(p)) continue;
             const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
-            if (mo[14] < 0.5f || std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
-            auto it = src.find(p.motion_addr);
-            if (it == src.end()) continue;
-            const float* cm = it->second.first; const float* pm = it->second.second;
+            if (std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
+            const float* cm = nullptr; const float* pm = nullptr;
+            if (mo[14] >= 0.5f) {
+                auto it = src.find(p.motion_addr);
+                if (it == src.end()) continue;
+                cm = it->second.first; pm = it->second.second;
+            } else {
+                // No matrix (direct polygons: the car's shadow, its dust): the motion of the moving certain object
+                // whose origin is nearest to the polygon's centroid, within appsw.mvBorrow (26/09: the shadow stayed
+                // doubled under a sharp car).
+                auto pb = primBorrow.find(uint32_t(k));
+                if (pb == primBorrow.end()) {
+                    std::pair<const float*, const float*> got{nullptr, nullptr};
+                    if (p.vertex_count > 0 && !certain.empty()) {
+                        float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                        for (uint32_t vi = 0; vi < p.vertex_count; ++vi) {
+                            const float* dd = &m_rawVerts[size_t(p.first_vertex + vi) * 5];
+                            cx += dd[0] / mo[12]; cy += dd[1] / mo[13]; cz += dd[2];
+                        }
+                        cx /= float(p.vertex_count); cy /= float(p.vertex_count); cz /= float(p.vertex_count);
+                        float bestD = borrow * borrow; uint32_t best = 0; bool found = false;
+                        for (uint32_t c : certain) {
+                            const float* b = cur[c].m;
+                            const float dd = (cx - b[9]) * (cx - b[9]) + (cy - b[10]) * (cy - b[10]) + (cz - b[11]) * (cz - b[11]);
+                            if (dd < bestD) { bestD = dd; best = c; found = true; }
+                        }
+                        if (found) got = src[best];
+                    }
+                    pb = primBorrow.emplace(uint32_t(k), got).first;
+                }
+                cm = pb->second.first; pm = pb->second.second;
+                if (!cm || !pm) continue;
+            }
             const float* d = &m_rawVerts[v * 5];
             const float o[3] = {d[0] / mo[12] - cm[9], d[1] / mo[13] - cm[10], d[2] - cm[11]};
             float ci[9];
@@ -2106,6 +2137,10 @@ public:
         VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
         ri.attachmentCount = 2; ri.pAttachments = at.data(); ri.subpassCount = 1; ri.pSubpasses = &sp;
         if (vkCreateRenderPass(m_vkDevice, &ri, nullptr, &m_mvPass) != VK_SUCCESS) return false;
+        VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(float)};
+        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        li.setLayoutCount = 1; li.pSetLayouts = &m_m2DescLayout; li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(m_vkDevice, &li, nullptr, &m_mvLayout) != VK_SUCCESS) return false;
         VkShaderModule vs = CreateShaderModule(c_m2VertAppswMvSpv, sizeof(c_m2VertAppswMvSpv));
         VkShaderModule fs = CreateShaderModule(c_appswMvFragSpv, sizeof(c_appswMvFragSpv));
         std::array<VkPipelineShaderStageCreateInfo, 2> st{};
@@ -2141,7 +2176,7 @@ public:
         pi.stageCount = 2; pi.pStages = st.data();
         pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp; pi.pRasterizationState = &rs;
         pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds; pi.pColorBlendState = &cb; pi.pDynamicState = &dy;
-        pi.layout = m_m2PipelineLayout; pi.renderPass = m_mvPass; pi.subpass = 0;
+        pi.layout = m_mvLayout; pi.renderPass = m_mvPass; pi.subpass = 0;
         const VkResult res = vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pi, nullptr, &m_mvPipe);
         vkDestroyShaderModule(m_vkDevice, vs, nullptr);
         vkDestroyShaderModule(m_vkDevice, fs, nullptr);
@@ -2161,7 +2196,8 @@ public:
         DestroyMvTargets();
         if (m_mvPipe) vkDestroyPipeline(m_vkDevice, m_mvPipe, nullptr);
         if (m_mvPass) vkDestroyRenderPass(m_vkDevice, m_mvPass, nullptr);
-        m_mvPipe = VK_NULL_HANDLE; m_mvPass = VK_NULL_HANDLE;
+        if (m_mvLayout) vkDestroyPipelineLayout(m_vkDevice, m_mvLayout, nullptr);
+        m_mvPipe = VK_NULL_HANDLE; m_mvPass = VK_NULL_HANDLE; m_mvLayout = VK_NULL_HANDLE;
     }
     // Records the motion-vector pass (outside any render pass) into the headset's motion-vector image: cleared to zero,
     // then the main view's polygons with their CurrNDC - PrevNDC where the motion is certain.
@@ -2211,7 +2247,10 @@ public:
             vkCmdSetViewport(cmd, 0, 1, &v);
             vkCmdSetScissor(cmd, 0, 1, &sc);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_mvPipe);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_mvLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
+            const float k = arcadexr::config::GetFloat("appsw_mvScale", 1.0f);
+            const float sc4[4] = {k, (arcadexr::config::GetInt("appsw_mvFlipY", 0) != 0 ? -k : k), k, 0.0f};
+            vkCmdPushConstants(cmd, m_mvLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(sc4), sc4);
             VkBuffer vtxBufs[2] = {m_vboBufferF[m_fs].buf, m_primIndexBufferF[m_fs].buf};
             VkDeviceSize offs[2] = {0, 0};
             vkCmdBindVertexBuffers(cmd, 0, 2, vtxBufs, offs);
