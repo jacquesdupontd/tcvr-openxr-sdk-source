@@ -1272,11 +1272,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                              arcadexr::profiles::GetInt("immersive.smoothMotion", 1) != 0;
                 const bool m2Cadence = m_lastM2Drawn && !m_smoothOn && arcadexr::profiles::GetInt("immersive.cadence", 0) != 0;
                 // 120 Hz for the cadence, 90 Hz for smooth motion (drawn every refresh), 90 when leaving either.
-                const int wantRate = m2Cadence ? 120 : (m_smoothOn ? 90 : 0);
+                // AppSW (26/09): 120 Hz, the app drawing at 60 and the headset synthesising the other refresh.
+                const bool appswGame = m_lastM2Drawn && m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 &&
+                                       arcadexr::profiles::GetInt("appsw", 0) != 0;
+                const int wantRate = (m2Cadence || appswGame) ? 120 : (m_smoothOn ? 90 : 0);
                 if (wantRate != m_m2RateRequested) {
                     if (wantRate > 0 || m_m2RateRequested > 0)
                         arcadexr::xr::RequestRateForGame(wantRate > 0 ? float(wantRate) : 90.0f,
-                            m2Cadence ? "Model 2 chain: 2 refreshes per arcade frame" : (m_smoothOn ? "smooth motion: every refresh at 90 Hz" : "leaving Model 2 cadence"));
+                            appswGame ? "AppSW: 60 drawn + 60 synthesised" : (m2Cadence ? "Model 2 chain: 2 refreshes per arcade frame" : (m_smoothOn ? "smooth motion: every refresh at 90 Hz" : "leaving Model 2 cadence")));
                     m_m2RateRequested = wantRate;
                 }
                 m_m2CadenceRequested = m2Cadence;

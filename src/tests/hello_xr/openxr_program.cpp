@@ -261,7 +261,8 @@ struct OpenXrProgram : IOpenXrProgram {
         // full-rate immersive path must not pay for an experiment they do not
         // use.  The first hardware gate is only capability discovery; actual
         // frame synthesis is enabled later, once its buffers are valid.
-#if defined(TCVR_BAKE_HWONLY) || defined(TCVR_RAW_SHEET)
+#if defined(TCVR_BAKE_HWONLY) || defined(TCVR_RAW_SHEET) || defined(TCVR_VK_BAKE)
+        // Vulkan (26/09): the extension on; each game submits AppSW only with its profile's LISSAGE (appsw).
         m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 1) != 0;   // AppSW baké ON
 #else
         m_spaceWarpRequested = arcadexr::config::GetInt("appsw", 0) != 0;
