@@ -1214,6 +1214,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             ReadGpuTimestamps();
             if (m_dumpState == 1 && m_cmdBuffer[m_dumpCb].state != CmdBuffer::CmdBufferState::Executing) WriteDump();
             if (m_swDiagState == 1 && m_cmdBuffer[m_swDiagCb].state != CmdBuffer::CmdBufferState::Executing) ReadSwDepthDiag();
+            if (m_mvDiagState == 1 && m_cmdBuffer[m_mvDiagCb].state != CmdBuffer::CmdBufferState::Executing) ReadMvDiag();
             FlushOracle();
             // Game switched in the same process (headset selector, debug.tcvr.switch_game): the Model 2 module
             // still held the previous game's geometry, textures and last frame, and HaveSceneSource() stays true
@@ -1664,6 +1665,57 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             // (Guillaume, headset A/B, 26/09) -- as the first AppSW build. appsw_depthGeo 1 = real distances (live).
             const bool geo = arcadexr::config::GetInt("appsw_depthGeo", 0) != 0;
             m_viewWroteSwDepth = m_m2Renderer.RenderAppSwDepth(cmd, viewIndex, t.image, t.ext, t.format, geo && m2ImmersiveDrawn && !s22Drawn);
+            // Motion vectors where certain (appsw_mv, live; 0 = all zero as before). Whenever the pass cannot run, the
+            // image is cleared here: stale vectors would warp the next picture.
+            const bool mvOn = arcadexr::config::GetInt("appsw_mv", 1) != 0;
+            bool mvDone = mvOn && m_m2Renderer.RenderAppSwMotion(cmd, viewIndex, t.mvImage, t.ext, m2ImmersiveDrawn && !s22Drawn);
+            if (!mvDone && t.mvImage != VK_NULL_HANDLE) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = t.mvImage; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+                VkClearColorValue zero{};
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdClearColorImage(cmd, t.mvImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            }
+            // debug.tcvr.appsw_mvDiag=1: once a second, the motion-vector image of the left eye read back.
+            if (viewIndex == 0 && mvDone && m_mvDiagState == 0 && arcadexr::config::GetInt("appsw_mvDiag", 0) != 0 &&
+                (m_mvLogTick % 60u) == 0u) {
+                const VkDeviceSize bytes = VkDeviceSize(t.ext.width) * t.ext.height * 8;
+                if (m_mvDiagBuf == VK_NULL_HANDLE) {
+                    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                    bi.size = bytes; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                    vkCreateBuffer(m_vkDevice, &bi, nullptr, &m_mvDiagBuf);
+                    VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(m_vkDevice, m_mvDiagBuf, &req);
+                    m_memAllocator.Allocate(req, &m_mvDiagMem);
+                    vkBindBufferMemory(m_vkDevice, m_mvDiagBuf, m_mvDiagMem, 0);
+                }
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = t.mvImage; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+                VkBufferImageCopy rg{};
+                rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rg.imageExtent = {t.ext.width, t.ext.height, 1};
+                vkCmdCopyImageToBuffer(cmd, t.mvImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_mvDiagBuf, 1, &rg);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+                m_mvDiagState = 1; m_mvDiagCb = uint32_t(v); m_mvDiagExt = t.ext;
+            }
+            if (viewIndex == 0 && (++m_mvLogTick % 120u) == 0u) {
+                uint32_t c = 0, bo = 0, vv = 0;
+                m_m2Renderer.MotionStats(&c, &bo, &vv);
+                Log::Write(Log::Level::Info, Fmt("TCVR_APPSW motion vectors on=%d drawn=%d certain=%u borrowed=%u vertices=%u",
+                                                 int(mvOn), int(mvDone), c, bo, vv));
+            }
             // debug.tcvr.appsw_depthDiag=1: once a second, what the headset receives as depth (left eye), read back.
             if (viewIndex == 0 && m_viewWroteSwDepth && m_swDiagState == 0 && t.format == VK_FORMAT_D32_SFLOAT &&
                 arcadexr::config::GetInt("appsw_depthDiag", 0) != 0 && (++m_swDiagTick % 60u) == 0u) {
@@ -1734,6 +1786,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     void SetAppSwWanted(bool on) override {
         m_appswWanted = on;   // kept here: the renderer is rebuilt at each game change (ResetM2ForGameChange)
         m_m2Renderer.SetCameraDeltaWanted(on);
+        m_m2Renderer.SetMotionVectorsWanted(on);   // previous positions for the motion-vector pass
         // resolve only into a depth image of the pass's own format (D32F); decided before the renderer's Initialize
         // Resolving the colour pass's depth is useless for AppSW: it holds the painter RANK (m2.depthOrder), not the
         // distance -- the ghosting of 26/09. The real distance comes from RenderAppSwDepth. Kept off.
@@ -1744,6 +1797,29 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
     bool ViewWroteSwDepth() const override { return m_viewWroteSwDepth; }
     bool GameMenuScreen() const override { return m_lastM2Drawn && m_m2Renderer.GameMenuScreen(); }
+    static float Half(uint16_t h) {
+        const uint32_t sgn = (h >> 15) & 1u, e = (h >> 10) & 31u, m = h & 1023u;
+        float v = e == 0 ? std::ldexp(float(m), -24) : (e == 31 ? 65504.0f : std::ldexp(float(m | 1024u), int(e) - 25));
+        return sgn ? -v : v;
+    }
+    void ReadMvDiag() {
+        m_mvDiagState = 0;
+        void* p = nullptr;
+        const size_t n = size_t(m_mvDiagExt.width) * m_mvDiagExt.height;
+        if (vkMapMemory(m_vkDevice, m_mvDiagMem, 0, VkDeviceSize(n) * 8, 0, &p) != VK_SUCCESS) return;
+        const uint16_t* h = static_cast<const uint16_t*>(p);
+        size_t moving = 0; double sum = 0.0; float mx = 0.0f, sx = 0.0f, sy = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const float x = Half(h[i * 4]), y = Half(h[i * 4 + 1]);
+            const float m = std::sqrt(x * x + y * y);
+            if (m > 1e-4f) { ++moving; sum += m; sx += x; sy += y; }
+            if (m > mx) mx = m;
+        }
+        vkUnmapMemory(m_vkDevice, m_mvDiagMem);
+        Log::Write(Log::Level::Info, Fmt("TCVR_APPSW mvDiag moving=%.1f%% meanNdc=%.4f maxNdc=%.4f meanDir=(%.4f,%.4f)",
+            100.0 * double(moving) / double(std::max<size_t>(1, n)), moving ? sum / double(moving) : 0.0, mx,
+            moving ? sx / float(moving) : 0.0f, moving ? sy / float(moving) : 0.0f));
+    }
     void ReadSwDepthDiag() {
         m_swDiagState = 0;
         void* p = nullptr;
@@ -1769,7 +1845,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         VulkanSwapchainImageData* d = dataAndIndex.first;
         if (!d || !d->DepthSwapchainEnabled()) return;
         m_swDepthTarget[view] = {d->GetDepthImageForColorIndex(dataAndIndex.second).image,
-                                 {uint32_t(d->Width()), uint32_t(d->Height())}, VkFormat(d->GetDepthFormat())};
+                                 {uint32_t(d->Width()), uint32_t(d->Height())}, VkFormat(d->GetDepthFormat()),
+                                 d->GetTypedImage(dataAndIndex.second).image};
     }
     void AppSwDepthRange(float* nearZ, float* farZ) override { m_m2Renderer.DepthRange(nearZ, farZ); }
     bool AppSwDelta(XrPosef* pose) override {
@@ -2473,7 +2550,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     CmdBuffer m_cmdBuffer[4]{};
     CmdBuffer m_mvCmd{};
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
-    struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; };
+    struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };
+    uint32_t m_mvLogTick = 0;
+    VkBuffer m_mvDiagBuf = VK_NULL_HANDLE;
+    VkDeviceMemory m_mvDiagMem = VK_NULL_HANDLE;
+    uint32_t m_mvDiagState = 0, m_mvDiagCb = 0;
+    VkExtent2D m_mvDiagExt{0, 0};
     SwDepthTarget m_swDepthTarget[2]{};
     VkBuffer m_swDiagBuf = VK_NULL_HANDLE;
     VkDeviceMemory m_swDiagMem = VK_NULL_HANDLE;

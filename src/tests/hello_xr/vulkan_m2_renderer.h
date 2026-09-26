@@ -20,6 +20,8 @@
 
 #include "m2_vert_spv.h"
 #include "m2_vert_appsw_spv.h"
+#include "m2_vert_appswmv_spv.h"
+#include "appsw_mv_frag_spv.h"
 #include "m2_frag_spv.h"
 #include "m2_frag_nd_spv.h"
 #include "m2_frag_cutd_spv.h"
@@ -703,8 +705,11 @@ public:
                         for (int c = 0; c < 3; ++c) m_newestPos[v * 3 + c] = m_rawVerts[v * 5 + c];
                     if (m_directColour) MatchMotion(nv); else if (m_m2Smooth) MatchMotionMatrices(frame, nv);
                     if (m_camDeltaWanted && !m_directColour) CameraDelta(frame);
+                    if (m_mvWanted && !m_directColour && !m_m2Smooth) MotionPrevCertain(frame, nv);
+                } else {
+                    m_mvFresh = false;   // same arcade frame again: no motion this refresh
                 }
-                if (!m_directColour && !m_m2Smooth) m_prevPosCpu.clear();   // camera delta only: no blend
+                if (!m_directColour && !m_m2Smooth && !m_mvWanted) m_prevPosCpu.clear();   // camera delta only: no blend
                 m_newGeometry = true;
             } else {
                 m_prevPosCpu.clear();
@@ -1977,6 +1982,248 @@ public:
                      VkImage depthImage = VK_NULL_HANDLE; VkImageView depthResolveView = VK_NULL_HANDLE; };
     bool m_depthResolveWanted = false, m_depthResolveOn = false;
 
+    // ---- AppSW motion vectors (26/09) -------------------------------------------------------------------------------
+    // The headset shows each 60 Hz frame twice at 120 Hz: an object moving on screen (the player's car turning in the
+    // chase view) is seen doubled, i.e. blurred (Guillaume, A/B LISSAGE CASQUE/NON). Motion vectors let the headset move
+    // it in the synthesised frame. ONLY where the motion is certain: an object with one copy in both frames (its own
+    // matrices, exact), and the objects within appsw.mvBorrow units of one (its wheels, swapped models) take its motion.
+    // Everything else: zero -- exactly what was shown before. prevPos (binding 16) carries the previous positions; the
+    // colour pass ignores them (uInterp = 1 without smooth motion).
+    struct MvMat { float m[14]; };
+    bool m_mvWanted = false, m_mvFresh = false;
+    std::unordered_map<uint32_t, MvMat> m_mvPrevMats;   // addr -> matrix of single-copy main-view objects, previous frame
+    uint32_t m_mvCertain = 0, m_mvBorrowed = 0, m_mvVerts = 0;
+    VkRenderPass m_mvPass = VK_NULL_HANDLE;
+    VkPipeline m_mvPipe = VK_NULL_HANDLE;
+    struct MvFb { VkImage image; VkImageView view; VkFramebuffer fb; VkExtent2D ext; };
+    std::vector<MvFb> m_mvFbs;
+    VkImage m_mvDepth = VK_NULL_HANDLE; VkDeviceMemory m_mvDepthMem = VK_NULL_HANDLE; VkImageView m_mvDepthView = VK_NULL_HANDLE;
+    VkExtent2D m_mvDepthExt{0, 0};
+
+    bool IsMainPrim(const tcvr_m2_prim& p) const {
+        return p.center_x == m_mainCenter[0] && p.center_y == m_mainCenter[1] &&
+               std::abs(p.clip_l - m_mainClip[0]) <= 2 && std::abs(p.clip_t - m_mainClip[1]) <= 2 &&
+               std::abs(p.clip_r - m_mainClip[2]) <= 2 && std::abs(p.clip_b - m_mainClip[3]) <= 2;
+    }
+
+    void MotionPrevCertain(const tcvr_m2_frame& frame, size_t nv) {
+        m_prevPosCpu.assign(nv * 4, 0.0f);
+        m_mvFresh = true;
+        m_mvCertain = m_mvBorrowed = m_mvVerts = 0;
+        if (!frame.raw_motion || !m_haveMainView || m_isMenuM1) { m_mvPrevMats.clear(); return; }
+        std::unordered_map<uint32_t, MvMat> cur;
+        std::unordered_map<uint32_t, uint32_t> copies;
+        for (size_t k = 0; k < m_rawPrims.size() && k < m_rawPrimSrc.size(); ++k) {
+            const tcvr_m2_prim& p = m_rawPrims[k];
+            if (!IsMainPrim(p)) continue;
+            const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
+            if (mo[14] < 0.5f) continue;
+            uint32_t& n = copies[p.motion_addr];
+            n = std::max(n, p.motion_serial + 1u);
+            MvMat om; for (int i = 0; i < 14; ++i) om.m[i] = mo[i];
+            cur.emplace(p.motion_addr, om);
+        }
+        std::unordered_map<uint32_t, std::pair<const float*, const float*>> src;   // addr -> (cur, prev) motion source
+        std::vector<uint32_t> certain;
+        // Only objects that do NOT move like the scenery (the camera delta measured by CameraDelta, same frame): the
+        // static world stays uniformly at zero -- vectors on the single-copy road pieces and not on the many-copy
+        // trees would tear the scenery apart in the synthesised frame. No reliable camera delta: no vectors at all.
+        if (!m_cdValid) { m_mvPrevMats.clear(); for (const auto& kv : cur) if (copies[kv.first] == 1u) m_mvPrevMats.emplace(kv.first, kv.second); return; }
+        for (const auto& kv : cur) {
+            if (copies[kv.first] != 1u) continue;
+            auto it = m_mvPrevMats.find(kv.first);
+            if (it == m_mvPrevMats.end()) continue;
+            const float* C = kv.second.m; const float* P = it->second.m;
+            float Ci[9], R[9];
+            if (!Inverse3(C, Ci)) continue;
+            Mul3(P, Ci, R);
+            float T[3];
+            for (int rr = 0; rr < 3; ++rr) T[rr] = P[9 + rr] - (R[rr] * C[9] + R[3 + rr] * C[10] + R[6 + rr] * C[11]);
+            float dr = 0.0f, dt = 0.0f;
+            for (int q = 0; q < 9; ++q) dr = std::max(dr, std::fabs(R[q] - m_cdR[q]));
+            for (int q = 0; q < 3; ++q) dt = std::max(dt, std::fabs(T[q] - m_cdT[q]));
+            const float tol = 0.02f + 0.01f * std::sqrt(T[0] * T[0] + T[1] * T[1] + T[2] * T[2]);
+            if (dr < 0.002f && dt < tol) continue;   // moves like the scenery: stays at zero with it
+            src.emplace(kv.first, std::make_pair(kv.second.m, it->second.m));
+            certain.push_back(kv.first);
+        }
+        m_mvCertain = uint32_t(certain.size());
+        const float borrow = std::max(0.0f, arcadexr::config::GetFloat("appsw.mvBorrow", 3.0f));
+        for (const auto& kv : cur) {
+            if (src.count(kv.first)) continue;
+            const float* a = kv.second.m;
+            float bestD = borrow * borrow; uint32_t best = 0; bool found = false;
+            for (uint32_t c : certain) {
+                const float* b = cur[c].m;
+                const float d = (a[9] - b[9]) * (a[9] - b[9]) + (a[10] - b[10]) * (a[10] - b[10]) + (a[11] - b[11]) * (a[11] - b[11]);
+                if (d < bestD) { bestD = d; best = c; found = true; }
+            }
+            if (found) { src.emplace(kv.first, src[best]); ++m_mvBorrowed; }
+        }
+        for (size_t v = 0; v < nv; ++v) {
+            const uint32_t k = m_rawPrimOfVertex[v];
+            if (k >= m_rawPrims.size() || k >= m_rawPrimSrc.size()) continue;
+            const tcvr_m2_prim& p = m_rawPrims[k];
+            if (!IsMainPrim(p)) continue;
+            const float* mo = &frame.raw_motion[size_t(m_rawPrimSrc[k]) * 16];
+            if (mo[14] < 0.5f || std::fabs(mo[12]) < 1e-6f || std::fabs(mo[13]) < 1e-6f) continue;
+            auto it = src.find(p.motion_addr);
+            if (it == src.end()) continue;
+            const float* cm = it->second.first; const float* pm = it->second.second;
+            const float* d = &m_rawVerts[v * 5];
+            const float o[3] = {d[0] / mo[12] - cm[9], d[1] / mo[13] - cm[10], d[2] - cm[11]};
+            float ci[9];
+            if (!Inverse3(cm, ci)) continue;
+            const float ob[3] = {ci[0] * o[0] + ci[3] * o[1] + ci[6] * o[2], ci[1] * o[0] + ci[4] * o[1] + ci[7] * o[2],
+                                 ci[2] * o[0] + ci[5] * o[1] + ci[8] * o[2]};
+            const float px = ob[0] * pm[0] + ob[1] * pm[3] + ob[2] * pm[6] + pm[9];
+            const float py = ob[0] * pm[1] + ob[1] * pm[4] + ob[2] * pm[7] + pm[10];
+            const float pz = ob[0] * pm[2] + ob[1] * pm[5] + ob[2] * pm[8] + pm[11];
+            float* o4 = &m_prevPosCpu[v * 4];
+            o4[0] = px * pm[12]; o4[1] = py * pm[13]; o4[2] = pz; o4[3] = 1.0f;
+            ++m_mvVerts;
+        }
+        m_mvPrevMats.clear();
+        for (const auto& kv : cur) if (copies[kv.first] == 1u) m_mvPrevMats.emplace(kv.first, kv.second);
+    }
+
+    bool CreateMvObjects() {
+        if (m_mvPipe != VK_NULL_HANDLE) return true;
+        std::array<VkAttachmentDescription, 2> at{};
+        at[0].format = VK_FORMAT_R16G16B16A16_SFLOAT; at[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        at[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        at[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        at[1].format = kDepthFormat; at[1].samples = VK_SAMPLE_COUNT_1_BIT;
+        at[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sp{};
+        sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sp.colorAttachmentCount = 1; sp.pColorAttachments = &cref; sp.pDepthStencilAttachment = &dref;
+        VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ri.attachmentCount = 2; ri.pAttachments = at.data(); ri.subpassCount = 1; ri.pSubpasses = &sp;
+        if (vkCreateRenderPass(m_vkDevice, &ri, nullptr, &m_mvPass) != VK_SUCCESS) return false;
+        VkShaderModule vs = CreateShaderModule(c_m2VertAppswMvSpv, sizeof(c_m2VertAppswMvSpv));
+        VkShaderModule fs = CreateShaderModule(c_appswMvFragSpv, sizeof(c_appswMvFragSpv));
+        std::array<VkPipelineShaderStageCreateInfo, 2> st{};
+        st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
+        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+        std::array<VkVertexInputBindingDescription, 2> binds{{{0, 5 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX},
+                                                              {1, sizeof(uint32_t), VK_VERTEX_INPUT_RATE_VERTEX}}};
+        std::array<VkVertexInputAttributeDescription, 3> attrs{{{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+                                                                 {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 2 * sizeof(float)},
+                                                                 {2, 1, VK_FORMAT_R32_UINT, 0}}};
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds.data();
+        vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = attrs.data();
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+        std::array<VkDynamicState, 2> dyn{{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount = uint32_t(dyn.size()); dy.pDynamicStates = dyn.data();
+        VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pi.stageCount = 2; pi.pStages = st.data();
+        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp; pi.pRasterizationState = &rs;
+        pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds; pi.pColorBlendState = &cb; pi.pDynamicState = &dy;
+        pi.layout = m_m2PipelineLayout; pi.renderPass = m_mvPass; pi.subpass = 0;
+        const VkResult res = vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pi, nullptr, &m_mvPipe);
+        vkDestroyShaderModule(m_vkDevice, vs, nullptr);
+        vkDestroyShaderModule(m_vkDevice, fs, nullptr);
+        Log::Write(Log::Level::Info, Fmt("TCVR_APPSW motion-vector pass created: %d", int(res)));
+        return res == VK_SUCCESS;
+    }
+    void DestroyMvTargets() {
+        for (auto& f : m_mvFbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
+        m_mvFbs.clear();
+        if (m_mvDepthView) vkDestroyImageView(m_vkDevice, m_mvDepthView, nullptr);
+        if (m_mvDepth) vkDestroyImage(m_vkDevice, m_mvDepth, nullptr);
+        if (m_mvDepthMem) vkFreeMemory(m_vkDevice, m_mvDepthMem, nullptr);
+        m_mvDepthView = VK_NULL_HANDLE; m_mvDepth = VK_NULL_HANDLE; m_mvDepthMem = VK_NULL_HANDLE; m_mvDepthExt = {0, 0};
+    }
+    void DestroyMvObjects() {
+        if (m_vkDevice == VK_NULL_HANDLE) return;
+        DestroyMvTargets();
+        if (m_mvPipe) vkDestroyPipeline(m_vkDevice, m_mvPipe, nullptr);
+        if (m_mvPass) vkDestroyRenderPass(m_vkDevice, m_mvPass, nullptr);
+        m_mvPipe = VK_NULL_HANDLE; m_mvPass = VK_NULL_HANDLE;
+    }
+    // Records the motion-vector pass (outside any render pass) into the headset's motion-vector image: cleared to zero,
+    // then the main view's polygons with their CurrNDC - PrevNDC where the motion is certain.
+    bool RenderAppSwMotion(VkCommandBuffer cmd, uint32_t eye, VkImage image, VkExtent2D ext, bool drawGeometry) {
+        if (!m_initialized || image == VK_NULL_HANDLE || !CreateMvObjects()) return false;
+        if (m_mvDepthExt.width != ext.width || m_mvDepthExt.height != ext.height) {
+            DestroyMvTargets();
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = kDepthFormat; ii.extent = {ext.width, ext.height, 1};
+            ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(m_vkDevice, &ii, nullptr, &m_mvDepth) != VK_SUCCESS) return false;
+            AllocTransient(m_mvDepth, &m_mvDepthMem);
+            VkImageViewCreateInfo dv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            dv.image = m_mvDepth; dv.viewType = VK_IMAGE_VIEW_TYPE_2D; dv.format = kDepthFormat;
+            dv.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(m_vkDevice, &dv, nullptr, &m_mvDepthView) != VK_SUCCESS) return false;
+            m_mvDepthExt = ext;
+        }
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        for (auto& f : m_mvFbs) if (f.image == image) fb = f.fb;
+        if (fb == VK_NULL_HANDLE) {
+            MvFb f{image, VK_NULL_HANDLE, VK_NULL_HANDLE, ext};
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(m_vkDevice, &vi, nullptr, &f.view) != VK_SUCCESS) return false;
+            std::array<VkImageView, 2> att{{f.view, m_mvDepthView}};
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = m_mvPass; fi.attachmentCount = 2; fi.pAttachments = att.data();
+            fi.width = ext.width; fi.height = ext.height; fi.layers = 1;
+            if (vkCreateFramebuffer(m_vkDevice, &fi, nullptr, &f.fb) != VK_SUCCESS) return false;
+            m_mvFbs.push_back(f);
+            fb = f.fb;
+        }
+        std::array<VkClearValue, 2> cv{};
+        cv[1].depthStencil = {1.0f, 0};
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = m_mvPass; bi.framebuffer = fb; bi.renderArea = {{0, 0}, ext};
+        bi.clearValueCount = 2; bi.pClearValues = cv.data();
+        vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        eye &= 1u;
+        if (drawGeometry && m_mvFresh && m_opaqueIndexCount > 0 && m_mvVerts > 0) {
+            VkViewport v{0.0f, 0.0f, float(ext.width), float(ext.height), 0.0f, 1.0f};
+            VkRect2D sc{{0, 0}, ext};
+            vkCmdSetViewport(cmd, 0, 1, &v);
+            vkCmdSetScissor(cmd, 0, 1, &sc);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_mvPipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
+            VkBuffer vtxBufs[2] = {m_vboBufferF[m_fs].buf, m_primIndexBufferF[m_fs].buf};
+            VkDeviceSize offs[2] = {0, 0};
+            vkCmdBindVertexBuffers(cmd, 0, 2, vtxBufs, offs);
+            vkCmdBindIndexBuffer(cmd, m_iboBufferF[m_fs].buf, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, m_opaqueIndexCount, 1, 0, 0, 0);
+        }
+        vkCmdEndRenderPass(cmd);
+        return true;
+    }
+    void SetMotionVectorsWanted(bool on) { m_mvWanted = on; }
+    void MotionStats(uint32_t* certain, uint32_t* borrowed, uint32_t* verts) const { *certain = m_mvCertain; *borrowed = m_mvBorrowed; *verts = m_mvVerts; }
+
     // ---- AppSW depth pass (26/09) -----------------------------------------------------------------------------------
     // The real distance of the main view's polygons (opaque + cut-outs, index range [0, m_secIndexStart)) into the
     // headset's low-resolution AppSW depth image; far where nothing (sky, flat menus). Depth only, no colour.
@@ -2150,6 +2397,7 @@ public:
         if (!m_initialized) return;
         m_initialized = false;
         DestroySwDepthObjects();
+        DestroyMvObjects();
 
         vkDeviceWaitIdle(m_vkDevice);
         m_regions.Destroy();

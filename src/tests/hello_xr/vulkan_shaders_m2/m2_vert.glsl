@@ -4,6 +4,9 @@ invariant gl_Position;
 out float gl_ClipDistance[4];
 // APPSW_DEPTH (26/09): the same placement for everything (HUD and overlays on their plane, scenery at its distance),
 // but the REAL depth: the headset's reprojection needs distances, not the painter rank of the colour pass.
+#ifdef APPSW_MV
+#define APPSW_DEPTH
+#endif
 #ifdef APPSW_DEPTH
 #define DEPTH_ORDER_ON false
 #else
@@ -90,8 +93,16 @@ layout(location = 6) flat out ivec4 vPC;   // clip l, t, r, b
 layout(location = 7) flat out uint vSlot;  // region texture slots: main | microtexture << 16 (0xffff = none)
 layout(location = 8) flat out uint vColor; // the polygon's palette entry (palram[colorbase + 0x1000]), 16 bits
 layout(location = 9) flat out uint vLayer; // texture-array layers: main | microtexture << 16 (0xffff = none)
+#ifdef APPSW_MV
+// AppSW motion vectors (26/09): CurrNDC - PrevNDC of this vertex, both through THIS eye's current transform (the head's
+// own motion is the headset's business). Zero where the previous position is unknown (prevPos.w = 0).
+layout(location = 10) out vec3 vMv;
+#endif
 
 void main() {
+#ifdef APPSW_MV
+    vMv = vec3(0.0);
+#endif
     gl_ClipDistance[0] = 1.0; gl_ClipDistance[1] = 1.0; gl_ClipDistance[2] = 1.0; gl_ClipDistance[3] = 1.0;
     vPrim = aPrim;
     {
@@ -164,6 +175,15 @@ void main() {
         float X = (uRaw != 0) ? aPosI.x / max(uFocus.x, 1e-6) : (xs.x - uCrtc.x - float(p.center_x)) * z / max(uFocus.x, 1e-6);
         float Y = (uRaw != 0) ? aPosI.y / max(uFocus.y, 1e-6) : ((384.0 - float(p.center_y)) + uCrtc.y - xs.y) * z / max(uFocus.y, 1e-6);
         gl_Position = uMvp * vec4(X, Y, z, 1.0);
+#ifdef APPSW_MV
+        if (uRaw != 0) {
+            vec4 pp = prevPos[gl_VertexIndex];
+            if (pp.w > 0.5) {
+                vec4 cp = uMvp * vec4(pp.x / max(uFocus.x, 1e-6), pp.y / max(uFocus.y, 1e-6), pp.z, 1.0);
+                if (cp.w > 1e-4 && gl_Position.w > 1e-4) vMv = gl_Position.xyz / gl_Position.w - cp.xyz / cp.w;
+            }
+        }
+#endif
         gl_Position.z += uDepthBias * float(p.zsort) * gl_Position.w;
         if (DEPTH_ORDER_ON) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
         vParam = (uRaw != 0) ? vec3(aParamI.y / 8.0, aParamI.z / 8.0, z)
