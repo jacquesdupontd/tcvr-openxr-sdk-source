@@ -1605,6 +1605,16 @@ struct OpenXrProgram : IOpenXrProgram {
         XrFrameWaitInfo frameWaitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         CHECK_XRCMD(xrWaitFrame(m_session, &frameWaitInfo, &frameState));
+        {   // Frame lock: 60 ticks a second on the headset's DISPLAY timeline (one per frame at 60, one every other frame
+            // at 120 without AppSW), never the app's own count -- the game must not run twice as fast at 120 Hz.
+            constexpr XrTime kTick = 16666667;   // ns
+            if (m_lastTickDisplayTime != 0 && frameState.predictedDisplayTime > m_lastTickDisplayTime)
+                m_tickAcc += frameState.predictedDisplayTime - m_lastTickDisplayTime;
+            m_lastTickDisplayTime = frameState.predictedDisplayTime;
+            if (m_tickAcc > 3 * kTick) m_tickAcc = 3 * kTick;
+            while (m_tickAcc >= kTick - 2000000) { arcadexr::mame::FrameTick(); m_tickAcc -= kTick; }
+            if (m_tickAcc < 0) m_tickAcc = 0;
+        }
         const auto adpfStart = std::chrono::steady_clock::now();  // ADPF: measure the frame WORK (post-wait)
 
         XrFrameBeginInfo frameBeginInfo{XR_TYPE_FRAME_BEGIN_INFO};
@@ -2231,6 +2241,7 @@ struct OpenXrProgram : IOpenXrProgram {
     // We may still use a runtime allocated depth swapchain but not submit depth if false
     bool m_supportsDepthLayer{false};
     bool m_bugComboHeld{false}, m_bugPaused{false};
+    XrTime m_lastTickDisplayTime{0}, m_tickAcc{0};
     XrPosef m_swDelta{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     bool m_swDeltaOk{false};
     int m_bugBurst{0};
