@@ -19,7 +19,7 @@
 #include "vulkan_m2_regions.h"
 
 #include "m2_vert_spv.h"
-#include "appsw_depth_vert_spv.h"
+#include "m2_vert_appsw_spv.h"
 #include "m2_frag_spv.h"
 #include "m2_frag_nd_spv.h"
 #include "m2_frag_cutd_spv.h"
@@ -1983,7 +1983,6 @@ public:
     float m_swMvp[2][16] = {}, m_swFocus[2] = {512.0f, 512.0f};
     bool m_swMvpValid[2] = {false, false};
     VkRenderPass m_swDepthPass = VK_NULL_HANDLE;
-    VkPipelineLayout m_swDepthLayout = VK_NULL_HANDLE;
     VkPipeline m_swDepthPipe = VK_NULL_HANDLE;
     VkFormat m_swDepthFormat = VK_FORMAT_UNDEFINED;
     struct SwDepthFb { VkImage image; VkImageView view; VkFramebuffer fb; VkExtent2D ext; };
@@ -2004,19 +2003,20 @@ public:
         VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
         ri.attachmentCount = 1; ri.pAttachments = &at; ri.subpassCount = 1; ri.pSubpasses = &sp;
         if (vkCreateRenderPass(m_vkDevice, &ri, nullptr, &m_swDepthPass) != VK_SUCCESS) return false;
-        VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 18 * sizeof(float)};
-        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(m_vkDevice, &li, nullptr, &m_swDepthLayout) != VK_SUCCESS) return false;
-        VkShaderModule vs = CreateShaderModule(c_appswDepthVertSpv, sizeof(c_appswDepthVertSpv));
+        // The colour pass's own vertex shader (m2_vert) built with APPSW_DEPTH, its layout and descriptor sets: every
+        // polygon lands exactly where the player sees it (a minimal shader left the camera-attached fades at their raw
+        // place, 0.4-0.9 m in front of the eyes over the whole picture: everything smeared when the head moved).
+        VkShaderModule vs = CreateShaderModule(c_m2VertAppswSpv, sizeof(c_m2VertAppswSpv));
         VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         st.stage = VK_SHADER_STAGE_VERTEX_BIT; st.module = vs; st.pName = "main";
-        VkVertexInputBindingDescription bind{0, 5 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-        std::array<VkVertexInputAttributeDescription, 2> attrs{{{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
-                                                                 {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 2 * sizeof(float)}}};
+        std::array<VkVertexInputBindingDescription, 2> binds{{{0, 5 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX},
+                                                              {1, sizeof(uint32_t), VK_VERTEX_INPUT_RATE_VERTEX}}};
+        std::array<VkVertexInputAttributeDescription, 3> attrs{{{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+                                                                 {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 2 * sizeof(float)},
+                                                                 {2, 1, VK_FORMAT_R32_UINT, 0}}};
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs.data();
+        vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds.data();
+        vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = attrs.data();
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -2035,7 +2035,7 @@ public:
         pi.stageCount = 1; pi.pStages = &st;
         pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp; pi.pRasterizationState = &rs;
         pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds; pi.pColorBlendState = &cb; pi.pDynamicState = &dy;
-        pi.layout = m_swDepthLayout; pi.renderPass = m_swDepthPass; pi.subpass = 0;
+        pi.layout = m_m2PipelineLayout; pi.renderPass = m_swDepthPass; pi.subpass = 0;
         const VkResult res = vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pi, nullptr, &m_swDepthPipe);
         vkDestroyShaderModule(m_vkDevice, vs, nullptr);
         Log::Write(Log::Level::Info, Fmt("TCVR_APPSW depth pass created (format %d): %d", int(format), int(res)));
@@ -2046,9 +2046,8 @@ public:
         for (auto& f : m_swDepthFbs) { vkDestroyFramebuffer(m_vkDevice, f.fb, nullptr); vkDestroyImageView(m_vkDevice, f.view, nullptr); }
         m_swDepthFbs.clear();
         if (m_swDepthPipe) vkDestroyPipeline(m_vkDevice, m_swDepthPipe, nullptr);
-        if (m_swDepthLayout) vkDestroyPipelineLayout(m_vkDevice, m_swDepthLayout, nullptr);
         if (m_swDepthPass) vkDestroyRenderPass(m_vkDevice, m_swDepthPass, nullptr);
-        m_swDepthPipe = VK_NULL_HANDLE; m_swDepthLayout = VK_NULL_HANDLE; m_swDepthPass = VK_NULL_HANDLE;
+        m_swDepthPipe = VK_NULL_HANDLE; m_swDepthPass = VK_NULL_HANDLE;
     }
 
     // Records the depth pass into cmd (outside any render pass). drawGeometry false: only cleared to far.
@@ -2075,20 +2074,20 @@ public:
         bi.clearValueCount = 1; bi.pClearValues = &cv;
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
         eye &= 1u;
-        if (drawGeometry && m_swMvpValid[eye] && m_secIndexStart > 0 && !MenuFlat()) {
+        // Everything the colour pass draws with depth (main view, cut-outs, secondary views/HUD on their plane),
+        // with this eye's own uniforms.
+        if (drawGeometry && m_swMvpValid[eye] && m_opaqueIndexCount > 0) {
             VkViewport v{0.0f, 0.0f, float(ext.width), float(ext.height), 0.0f, 1.0f};
             VkRect2D sc{{0, 0}, ext};
             vkCmdSetViewport(cmd, 0, 1, &v);
             vkCmdSetScissor(cmd, 0, 1, &sc);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_swDepthPipe);
-            float pc[18];
-            std::memcpy(pc, m_swMvp[eye], 16 * sizeof(float));
-            pc[16] = m_swFocus[0]; pc[17] = m_swFocus[1];
-            vkCmdPushConstants(cmd, m_swDepthLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), pc);
-            VkDeviceSize off = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &m_vboBufferF[m_fs].buf, &off);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_m2PipelineLayout, 0, 1, &m_m2DescSetF[m_fs][eye][0], 0, nullptr);
+            VkBuffer vtxBufs[2] = {m_vboBufferF[m_fs].buf, m_primIndexBufferF[m_fs].buf};
+            VkDeviceSize offs[2] = {0, 0};
+            vkCmdBindVertexBuffers(cmd, 0, 2, vtxBufs, offs);
             vkCmdBindIndexBuffer(cmd, m_iboBufferF[m_fs].buf, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, m_secIndexStart, 1, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, m_opaqueIndexCount, 1, 0, 0, 0);
         }
         vkCmdEndRenderPass(cmd);
         return true;

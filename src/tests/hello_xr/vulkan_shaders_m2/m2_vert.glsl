@@ -2,6 +2,13 @@
 // The cut-out colour pass tests depth EQUAL against its own pre-pass: positions must be bit-identical.
 invariant gl_Position;
 out float gl_ClipDistance[4];
+// APPSW_DEPTH (26/09): the same placement for everything (HUD and overlays on their plane, scenery at its distance),
+// but the REAL depth: the headset's reprojection needs distances, not the painter rank of the colour pass.
+#ifdef APPSW_DEPTH
+#define DEPTH_ORDER_ON false
+#else
+#define DEPTH_ORDER_ON (uDepthOrder != 0)
+#endif
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec3 aParam;
 layout(location = 2) in uint aPrim;
@@ -120,13 +127,17 @@ void main() {
         if ((p.rgb & 0x2000000u) != 0u) {
             // Screen overlay (fade, hit flash): straight to the screen like the cabinet, enlarged over the view. A
             // letterbox band (bit 26) is the edge of a screen the headset does not have: not drawn in immersive.
+#ifdef APPSW_DEPTH
+            // a fade or a flash is not a surface: the headset must see the scene behind it
+            gl_Position = vec4(0.0, 0.0, -2.0, 1.0); vParam = vec3(0.0); return;
+#endif
             if ((p.rgb & 0x4000000u) != 0u && uOverlayK > 1.0) { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); vParam = vec3(0.0); return; }
             // On the arcade screen plane (the HUD's), enlarged uOverlayK times: each eye sees it through its own
             // projection. Straight screen coordinates were the same NDC in both eyes, which the Quest's asymmetric
             // eye frusta turn into a false disparity -- texts that made the player squint (Guillaume, 23/09).
             vec2 plane = vec2(xs.x / uViewport.x - 0.5, 0.5 - xs.y / uViewport.y) * uOverlayK;
             gl_Position = uHudMvp * vec4(plane, 0.0, 1.0);
-            if (uDepthOrder != 0) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
+            if (DEPTH_ORDER_ON) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
             vParam = (uRaw != 0) ? vec3(aParamI.y / 8.0, aParamI.z / 8.0, zr) : aParamI;
             return;
         }
@@ -144,7 +155,7 @@ void main() {
             vec2 plane = vec2(xs.x / uViewport.x - 0.5, 0.5 - xs.y / uViewport.y);
             gl_Position = uHudMvp * vec4(plane, 0.0, 1.0);
             gl_Position.z += uDepthBias * 5.0 * float(aPrim) * gl_Position.w;
-            if (uDepthOrder != 0) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
+            if (DEPTH_ORDER_ON) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
             vParam = (uRaw != 0) ? vec3(1.0 / zr, aParamI.y / (8.0 * zr), aParamI.z / (8.0 * zr)) : aParamI;
             return;
         }
@@ -154,7 +165,7 @@ void main() {
         float Y = (uRaw != 0) ? aPosI.y / max(uFocus.y, 1e-6) : ((384.0 - float(p.center_y)) + uCrtc.y - xs.y) * z / max(uFocus.y, 1e-6);
         gl_Position = uMvp * vec4(X, Y, z, 1.0);
         gl_Position.z += uDepthBias * float(p.zsort) * gl_Position.w;
-        if (uDepthOrder != 0) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
+        if (DEPTH_ORDER_ON) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
         vParam = (uRaw != 0) ? vec3(aParamI.y / 8.0, aParamI.z / 8.0, z)
                              : vec3(aParamI.y * z, aParamI.z * z, z);
         return;
