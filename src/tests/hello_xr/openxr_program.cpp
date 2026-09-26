@@ -2005,7 +2005,9 @@ struct OpenXrProgram : IOpenXrProgram {
                     float x = stickX;
                     if (std::fabs(x) <= deadzone) x = 0.0f;
                     else x = std::copysign((std::fabs(x) - deadzone) / (1.0f - deadzone), x);
-                    const float range = controls == "stick_direct" ? 0.5f :
+                    // On a menu screen of the game the stick covers the whole wheel (26/09: Sega Rally's third practice
+                    // course, far right, was out of reach of the race range of 0.22).
+                    const float range = (controls == "stick_direct" || m_graphicsPlugin->GameMenuScreen()) ? 0.5f :
                         std::max(0.10f, std::min(0.5f, arcadexr::profiles::GetFloat("driving.stickRange", 0.22f)));
                     steer = 0.5f + x * range;
                 }

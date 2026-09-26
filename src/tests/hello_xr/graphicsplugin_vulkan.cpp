@@ -1740,6 +1740,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                                          int(m_haveDepthResolve), (long long)m_xrDepthFormat));
     }
     bool ViewWroteSwDepth() const override { return m_viewWroteSwDepth; }
+    bool GameMenuScreen() const override { return m_lastM2Drawn && m_m2Renderer.GameMenuScreen(); }
     void ReadSwDepthDiag() {
         m_swDiagState = 0;
         void* p = nullptr;

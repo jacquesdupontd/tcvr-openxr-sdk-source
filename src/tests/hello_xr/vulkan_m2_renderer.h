@@ -2094,6 +2094,8 @@ public:
     }
     void SetDepthResolveWanted(bool on) { m_depthResolveWanted = on; }   // before Initialize
     bool DepthResolveOn() const { return m_depthResolveOn; }
+    // A menu screen of the game (car or course select...): the menu rule of the renderer (no horizon, 30 frames).
+    bool GameMenuScreen() const { return m_initialized && m_isMenuM1; }
     static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
     void AllocTransient(VkImage img, VkDeviceMemory* mem) {
