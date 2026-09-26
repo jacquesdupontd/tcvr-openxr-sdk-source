@@ -2329,9 +2329,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // Never below m2.dynresMin (0.5 = the recommended size, i.e. no supersampling). m2.dynres=0 turns it off,
     // m2.viewportScale forces a fixed scale for A/B. Logged as TCVR_DYNRES when it moves.
     void UpdateM2DynamicScale(float gpuMs) {
-        // Sega Rally is the validated GOLD (23/09, judged perfect in the headset by Guillaume): never touched.
+        // Sega Rally is the validated GOLD (23/09, judged perfect in the headset by Guillaume): never touched -- except
+        // under AppSW (26/09): the app has ONE draw per two refreshes, and the dense sections (GPU 17-22 ms against 16.7)
+        // dropped frames in pairs ("clac clac, like a mini loading").
+        const bool appsw = m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 && arcadexr::profiles::GetInt("appsw", 1) != 0;
         const bool on = arcadexr::config::GetInt("m2.dynres", 1) != 0 &&
-                        arcadexr::profiles::GetInt("immersive.dynres", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
+                        arcadexr::profiles::GetInt("immersive.dynres", (arcadexr::profiles::CurrentGame() == "srallyc" && !appsw) ? 0 : 1) != 0;
         if (!on || !m_lastM2Drawn || m_s22Active) {
             m_m2DynScale = 1.0f; m_dynSamples.clear(); return;
         }
@@ -2346,7 +2349,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const float hz = arcadexr::xr::State().current > 1.0f ? arcadexr::xr::State().current : 90.0f;
         // Arcade cadence (one draw per new arcade frame, shown on two refreshes): a draw has two refresh periods, not
         // one (25/09: Top Skater at 120 Hz was held at 0.58 against a 7 ms budget it did not have to meet).
-        const float period = (1000.0f / hz) * (m_m2CadenceActive ? 2.0f : 1.0f);
+        const float period = (1000.0f / hz) * ((m_m2CadenceActive || appsw) ? 2.0f : 1.0f);   // AppSW: half rate
         const float target = period * std::max(0.5f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresBudget", 0.85f)));
         const float lo = std::max(0.3f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresMin", 0.5f)));
         // GPU time is roughly fixed + area; area goes with scale squared.
@@ -2357,7 +2360,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         next = std::max(lo, std::min(1.0f, next));
         if (std::fabs(next - m_m2DynScale) >= 0.01f) {
             Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES gpu p75=%.2f ms target=%.2f (%.0f Hz%s) scale %.2f -> %.2f",
-                                             p75, target, hz, m_m2CadenceActive ? ", cadence" : "", m_m2DynScale, next));
+                                             p75, target, hz, appsw ? ", AppSW" : (m_m2CadenceActive ? ", cadence" : ""), m_m2DynScale, next));
             m_m2DynScale = next;
         }
     }
