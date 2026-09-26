@@ -4,9 +4,8 @@ invariant gl_Position;
 out float gl_ClipDistance[4];
 // APPSW_DEPTH (26/09): the same placement for everything (HUD and overlays on their plane, scenery at its distance),
 // but the REAL depth: the headset's reprojection needs distances, not the painter rank of the colour pass.
-#ifdef APPSW_MV
-#define APPSW_DEPTH
-#endif
+// APPSW_MV keeps the colour pass's visibility (painter rank as depth): the vector of a pixel is the one of the polygon
+// the player SEES there, not of the nearest one.
 #ifdef APPSW_DEPTH
 #define DEPTH_ORDER_ON false
 #else

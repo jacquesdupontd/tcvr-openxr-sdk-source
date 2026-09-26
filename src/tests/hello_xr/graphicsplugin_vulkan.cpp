@@ -1667,7 +1667,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_viewWroteSwDepth = m_m2Renderer.RenderAppSwDepth(cmd, viewIndex, t.image, t.ext, t.format, geo && m2ImmersiveDrawn && !s22Drawn);
             // Motion vectors where certain (appsw_mv, live; 0 = all zero as before). Whenever the pass cannot run, the
             // image is cleared here: stale vectors would warp the next picture.
-            const bool mvOn = arcadexr::config::GetInt("appsw_mv", 1) != 0;
+            // Not under the app's own menu: it is drawn over the game, and the game's vectors under it smeared it.
+            const bool mvOn = arcadexr::config::GetInt("appsw_mv", 1) != 0 && !arcadexr::ui::Menu::Get().IsOpen();
             bool mvDone = mvOn && m_m2Renderer.RenderAppSwMotion(cmd, viewIndex, t.mvImage, t.ext, m2ImmersiveDrawn && !s22Drawn);
             if (!mvDone && t.mvImage != VK_NULL_HANDLE) {
                 VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

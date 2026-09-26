@@ -1209,6 +1209,7 @@ public:
         }
 
         // 4. DrawPlaneLayer (Front 2D HUD)
+        m_hudMvAll[eye & 1u] = false; m_hudMvRects[eye & 1u].clear();   // where the HUD covers the eye (AppSW vectors)
         if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0 && !(skip & 32)) {
             PlanePushConstants frontPc{};
             frontPc.uLift = LiftExponent();
@@ -1275,6 +1276,7 @@ public:
                             const int x0 = run * cs, y0 = cy * cs;
                             const int x1 = std::min(int(outW), cx * cs), y1 = std::min(int(outH), (cy + 1) * cs);
                             const VkRect2D rc{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+                            m_hudMvRects[eye & 1u].push_back({float(x0) / outW, float(y0) / outH, float(x1) / outW, float(y1) / outH});
                             vkCmdSetScissor(cmd, 0, 1, &rc);
                             vkCmdDraw(cmd, 3, 1, 0, 0);
                             run = -1;
@@ -1284,6 +1286,7 @@ public:
                 const VkRect2D full{{0, 0}, {uint32_t(outW), uint32_t(outH)}};
                 vkCmdSetScissor(cmd, 0, 1, &full);
             } else {
+                m_hudMvAll[eye & 1u] = true;   // the whole plane: no vector anywhere under it
                 vkCmdDraw(cmd, 3, 1, 0, 0);
             }
         }
@@ -1990,6 +1993,10 @@ public:
     // Everything else: zero -- exactly what was shown before. prevPos (binding 16) carries the previous positions; the
     // colour pass ignores them (uInterp = 1 without smooth motion).
     struct MvMat { float m[14]; };
+    // The HUD drawn over the scene (normalised eye rectangles of its cells): its pixels do not move with the car behind
+    // them (26/09: the HUD and the menu smeared with the intro's cars passing behind).
+    std::vector<std::array<float, 4>> m_hudMvRects[2];
+    bool m_hudMvAll[2] = {false, false};
     bool m_mvWanted = false, m_mvFresh = false;
     std::unordered_map<uint32_t, MvMat> m_mvPrevMats;   // addr -> matrix of single-copy main-view objects, previous frame
     uint32_t m_mvCertain = 0, m_mvBorrowed = 0, m_mvVerts = 0;
@@ -2256,6 +2263,17 @@ public:
             vkCmdBindVertexBuffers(cmd, 0, 2, vtxBufs, offs);
             vkCmdBindIndexBuffer(cmd, m_iboBufferF[m_fs].buf, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, m_opaqueIndexCount, 1, 0, 0, 0);
+            // the HUD's cells back to zero
+            VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+            std::vector<VkClearRect> crs;
+            if (m_hudMvAll[eye]) crs.push_back({{{0, 0}, ext}, 0, 1});
+            else
+                for (const auto& h : m_hudMvRects[eye]) {
+                    const int x0 = std::max(0, int(h[0] * float(ext.width)) - 1), y0 = std::max(0, int(h[1] * float(ext.height)) - 1);
+                    const int x1 = std::min(int(ext.width), int(h[2] * float(ext.width)) + 2), y1 = std::min(int(ext.height), int(h[3] * float(ext.height)) + 2);
+                    if (x1 > x0 && y1 > y0) crs.push_back({{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1});
+                }
+            if (!crs.empty()) vkCmdClearAttachments(cmd, 1, &ca, uint32_t(crs.size()), crs.data());
         }
         vkCmdEndRenderPass(cmd);
         return true;
