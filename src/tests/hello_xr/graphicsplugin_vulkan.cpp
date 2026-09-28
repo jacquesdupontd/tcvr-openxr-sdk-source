@@ -1987,7 +1987,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 XrMatrix4x4f_CreateTranslationRotationScale(&model, &guns.pose[g].position, &guns.pose[g].orientation, &unit);
                 XrMatrix4x4f_Multiply(&mvp, &vp, &model);
                 const float eye[3] = {pose.position.x, pose.position.y, pose.position.z};
-                m_overlay.DrawGun(cmd, mvp.m, model.m, eye);
+                m_overlay.DrawGun(cmd, mvp.m, model.m, eye, guns.anim[g]);
             }
         }
         if (drawReticle) {

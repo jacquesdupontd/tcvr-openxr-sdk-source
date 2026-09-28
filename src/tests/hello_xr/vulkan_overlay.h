@@ -263,7 +263,8 @@ public:
     }
 
     // model: column-major XrMatrix4x4f of the gun pose; eye: eye position (world).
-    void DrawGun(VkCommandBuffer cmd, const float mvp[16], const float model[16], const float eye[3]) {
+    // anim: packed slide / trigger / flash (gun/aim_state.h GunPoses::anim), read by gun_vert.glsl from eye.w.
+    void DrawGun(VkCommandBuffer cmd, const float mvp[16], const float model[16], const float eye[3], float anim = 0.0f) {
         if (!m_gunIndexCount) return;
         GunPC pc{};
         std::memcpy(pc.mvp, mvp, 64);
@@ -271,7 +272,7 @@ public:
             float* row = r == 0 ? pc.model0 : (r == 1 ? pc.model1 : pc.model2);
             for (int c = 0; c < 4; ++c) row[c] = model[c * 4 + r];
         }
-        pc.eye[0] = eye[0]; pc.eye[1] = eye[1]; pc.eye[2] = eye[2]; pc.eye[3] = 1.0f;
+        pc.eye[0] = eye[0]; pc.eye[1] = eye[1]; pc.eye[2] = eye[2]; pc.eye[3] = anim;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gunPipe);
         VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &m_gunVbo.buf, &off);

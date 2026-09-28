@@ -1416,7 +1416,9 @@ struct OpenXrProgram : IOpenXrProgram {
         m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld && !menuOpen;
         // Recoil: one hard pulse per shot, on the hand that holds the gun.
         const bool driving = arcadexr::profiles::IsDriving();
+        m_gunPull = (triggerValue.isActive == XR_TRUE) ? triggerValue.currentState : 0.0f;   // the 3D gun's trigger follows
         if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen && !driving) {
+            m_gunShotAt = std::chrono::steady_clock::now();   // slide recoil + muzzle flash of the 3D gun (28/09)
             const int ms = arcadexr::profiles::GetInt("haptics.ms", 120);
             if (ms > 0) {
                 XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
@@ -1874,7 +1876,23 @@ struct OpenXrProgram : IOpenXrProgram {
             // One pose per gun; the renderer draws the whole mesh in a single
             // call. Twenty-six boxes through the cube path was six thousand
             // draw calls a second on the thread that competes with MAME.
-            if (drawThisHand && gunPoses.count < 2) gunPoses.pose[gunPoses.count++] = pose;
+            if (drawThisHand && gunPoses.count < 2) {
+                // 3D gun animation (28/09, Guillaume: "le trigger qui bouge, la partie haute quand on tire, comme un vrai
+                // flingue", sparks out of the gun): trigger = the controller's analog trigger; on a shot the slide goes
+                // back in 30 ms and returns in 60 ms, the muzzle flash lasts 50 ms. Right hand (the aiming one) only.
+                float slide = 0.0f, flash = 0.0f, pull = 0.0f;
+                if (hand == Side::RIGHT) {
+                    pull = std::max(0.0f, std::min(1.0f, m_gunPull));
+                    if (m_gunShotAt.time_since_epoch().count() != 0) {
+                        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_gunShotAt).count();
+                        slide = t < 0.03f ? t / 0.03f : std::max(0.0f, 1.0f - (t - 0.03f) / 0.06f);
+                        flash = t < 0.05f ? 1.0f - t / 0.05f : 0.0f;
+                    }
+                }
+                const auto b = [](float v) { return float(int(std::max(0.0f, std::min(1.0f, v)) * 255.0f + 0.5f)); };
+                gunPoses.anim[gunPoses.count] = b(slide) + 256.0f * b(pull) + 65536.0f * b(flash);
+                gunPoses.pose[gunPoses.count++] = pose;
+            }
             if (hand != Side::RIGHT) continue;
             gunTracked = true;
             const auto muzzle = arcadexr::gun::Muzzle(pose);
@@ -2250,6 +2268,8 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_bugComboHeld{false}, m_bugPaused{false};
     XrTime m_lastTickDisplayTime{0}, m_tickAcc{0};
     XrPosef m_swDelta{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+    float m_gunPull = 0.0f;                                   // 3D gun: analog trigger of the aiming hand
+    std::chrono::steady_clock::time_point m_gunShotAt{};      // 3D gun: last shot (slide recoil, muzzle flash)
     bool m_swDeltaOk{false};
     int m_bugBurst{0};
     std::string m_bugBurstTag;
