@@ -333,11 +333,24 @@ public:
     std::chrono::steady_clock::time_point m_polyDiagAt{};   // TCVR_S22POLY, once a second (s22.polyDiag)
     bool m_dropBands = false;      // immersive: letterbox bands of cutscenes not drawn (SetDropBands)
     uint32_t m_bandsDropped = 0, m_bandNear = 0;   // bands dropped; facing polygons near enough to be one (diag)
+    uint32_t m_screenMoved = 0, m_fxMoved = 0;     // camera-glued polygons moved to the HUD plane / onto what they cover
+    uint32_t m_fxSec = 0, m_screenSecMax = 0, m_bandsSecMax = 0;   // over the second (TakeMoveDiag)
+    float m_hudDepthM = 0.0f;                      // the HUD plane's distance (metres), from the last frame
+    std::vector<tcvr_scene_vertex> m_moveVerts;
     float m_bandBox[5] = {}, m_bandSceneZ = 0.0f;
     void SetDropBands(bool on, float a2w = 0.0f) { m_dropBands = on; m_bandA2w = a2w; }
     float m_bandA2w = 0.0f;   // metres per unit (camera-attached test)
     uint32_t BandsDropped() const { return m_bandsDropped; }
-    std::string BandDiag() const { return Fmt("near facing %u last %.0f,%.0f..%.0f,%.0f z %.1f scene z %.0f drop %d", m_bandNear, m_bandBox[0], m_bandBox[1], m_bandBox[2], m_bandBox[3], m_bandBox[4], m_bandSceneZ, int(m_dropBands)); }
+    void SetHudDepthM(float m) { m_hudDepthM = m; }
+    std::string TakeMoveDiag() {   // the second's totals: effects moved (sum), screen polygons and bands (most in a frame)
+        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u", m_fxSec, m_screenSecMax, m_bandsSecMax);
+        m_fxSec = m_screenSecMax = m_bandsSecMax = 0;
+        return r;
+    }
+    std::string BandDiag() const {
+        return Fmt("screen->HUD %u effects->target %u | near facing %u last %.0f,%.0f..%.0f,%.0f z %.1f scene z %.0f drop %d", m_screenMoved, m_fxMoved,
+                   m_bandNear, m_bandBox[0], m_bandBox[1], m_bandBox[2], m_bandBox[3], m_bandBox[4], m_bandSceneZ, int(m_dropBands));
+    }
     int m_textDiag = 0;
     int m_hudSharp = 3;
     static constexpr uint32_t kBankMips = 9;   // 4096 .. 16
@@ -567,6 +580,31 @@ public:
                             p.clip_l, p.clip_t, p.clip_r, p.clip_b);
             }
             Log::Write(Log::Level::Info, Fmt("TCVR_S22POLY %u prims:%s", f.prim_count, line.c_str()));
+            if (arcadexr::config::GetInt("s22.polyDiag", 0) == 2 && m_bandA2w > 0.0f) {
+                // Camera-attached polygons (29/09, Time Crisis II: ammo, screen impacts, enemy hits "trop près"): every
+                // polygon wholly nearer than 15 cm in the headset -- box, depth, alpha, texture, facing -- grouped by box.
+                std::map<std::string, int> seen;
+                for (uint32_t i = 0; i < f.prim_count; ++i) {
+                    const tcvr_scene_prim& p = f.prims[i];
+                    if (p.kind != 0 || p.direct || p.vertex_count < 3) continue;
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                    for (uint32_t k = 0; k < p.vertex_count; ++k) {
+                        const tcvr_scene_vertex& v = f.vertices[p.first_vertex + k];
+                        const float zz = std::max(v.z, 1e-6f);
+                        const float sx = float(p.cx) + v.x / zz, sy = float(p.cy) - v.y / zz;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                        z0 = std::min(z0, v.z); z1 = std::max(z1, v.z);
+                    }
+                    if (z1 * m_bandA2w >= 1.0f || z0 <= 0.0f) continue;
+                    if (x1 < 0.0f || y1 < 0.0f || x0 > float(f.width) || y0 > float(f.height)) continue;   // in the picture only
+                    seen[Fmt("box %.0f,%.0f..%.0f,%.0f %.0f..%.0fcm %s tex%u a%d/%u pri%u", std::floor(x0 / 8) * 8, std::floor(y0 / 8) * 8,
+                              std::ceil(x1 / 8) * 8, std::ceil(y1 / 8) * 8, z0 * m_bandA2w * 100.0f, z1 * m_bandA2w * 100.0f,
+                              (z1 - z0 <= 0.01f * z0) ? "FACE" : "3D", p.texture_enabled, p.alpha, p.alpha_enabled, p.prioverchar)]++;
+                }
+                std::string near;
+                for (const auto& kv : seen) near += Fmt(" [%dx %s]", kv.second, kv.first.c_str());
+                if (!near.empty()) Log::Write(Log::Level::Info, Fmt("TCVR_S22NEAR%s", near.c_str()));
+            }
         }
         m_vertexData.clear(); m_indexData.clear(); m_primData.clear(); m_runs.clear(); m_ranges.clear();
         std::uint32_t lastPolyIndex = 0; (void)lastPolyIndex;
@@ -702,13 +740,71 @@ public:
             return (fullW && y1 - y0 <= 0.35f * bh && (y0 <= 0.05f * bh || y1 >= 0.95f * bh)) ||
                    (fullH && x1 - x0 <= 0.35f * bw && (x0 <= 0.05f * bw || x1 >= 0.95f * bw));
         };
-        m_bandsDropped = 0; m_bandNear = 0; m_bandSceneZ = sceneZ;
+        // UNIVERSAL placement of what the game glues to its camera (29/09, Guillaume: "un outil universel, automatique, qui
+        // s'adapte à tous les jeux"; Time Crisis II draws its ammo as flat 3D quads 25 cm from the eyes -- they swam out of
+        // their 2D container when the head moved -- and its screen impacts 5 cm away). Geometry alone decides, no game list:
+        //  - FLAT facing the camera and glued to it (< 40 cm, or 10x nearer than the scene): screen content. A strip along
+        //    an edge = letterbox, dropped (isBand); anything else goes ON THE HUD PLANE at the same pixels, perceived at
+        //    the HUD's distance (NearInv undoes the near comfort), next to its 2D container.
+        //  - not flat, at most half the picture, wholly nearer than 20 cm, in it: an effect (shot impact, a hit on the screen:
+        //    Time Crisis II's are 128-192 px at 5-7 cm; a real surface that near covers more): along its rays onto what
+        //    it covers (depth map around its centre, what is nearer than 20 cm ignored).
+        //  - everything else: real 3D (with the near comfort).
+        m_bandsDropped = 0; m_bandNear = 0; m_bandSceneZ = sceneZ; m_screenMoved = 0; m_fxMoved = 0;   // this frame
+        const float a2w = m_bandA2w;
+        auto nearInv = [&](float hudM) {   // geometric distance nearStereo perceives at hudM (f^-1)
+            const float mn = m_settings.nearParams[0], st = m_settings.nearParams[1];
+            if (m_settings.nearCyc[3] <= 0.0f || hudM >= st || mn <= 0.0f) return hudM;
+            const float qa = mn / (st * st), qb = 1.0f - 2.0f * mn / st, qc = mn - hudM;
+            const float disc = qb * qb - 4.0f * qa * qc;
+            return disc > 0.0f ? std::max(0.01f, (-qb + std::sqrt(disc)) / (2.0f * qa)) : hudM;
+        };
+        auto targetAt = [&](float cx, float cy) {   // what an effect covers: nearest depth >= 20 cm around its centre
+            if (m_depthCpu.empty() || m_depthCpuW == 0 || a2w <= 0.0f) return sceneZ;
+            const int gx = int(cx * float(m_depthCpuW) / bw), gy = int(cy * float(m_depthCpuH) / bh);
+            float best = 0.0f;
+            for (int yy = std::max(0, gy - 3); yy <= std::min(int(m_depthCpuH) - 1, gy + 3); ++yy)
+                for (int xx = std::max(0, gx - 3); xx <= std::min(int(m_depthCpuW) - 1, gx + 3); ++xx) {
+                    const float d = m_depthCpu[size_t(yy) * m_depthCpuW + size_t(xx)];
+                    if (d > 0.0f && std::isfinite(d) && d * a2w >= 0.2f && (best == 0.0f || d < best)) best = d;
+                }
+            return best > 0.0f ? best : sceneZ;
+        };
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
             if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
-            if (isBand(pr, f.vertices + pr.first_vertex)) { ++m_bandsDropped; continue; }
-            emit(pr, f.vertices + pr.first_vertex, m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0);
+            const tcvr_scene_vertex* v = f.vertices + pr.first_vertex;
+            const bool half = m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0;
+            if (isBand(pr, v)) { ++m_bandsDropped; continue; }
+            float k = 1.0f;
+            if (m_dropBands && a2w > 0.0f && pr.kind == 0 && !pr.direct && pr.vertex_count <= 8) {
+                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                for (uint32_t i = 0; i < pr.vertex_count; ++i) {
+                    const float zz = std::max(v[i].z, 1e-6f);
+                    const float sx = float(pr.cx) + v[i].x / zz, sy = float(pr.cy) - v[i].y / zz;
+                    x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                    z0 = std::min(z0, v[i].z); z1 = std::max(z1, v[i].z);
+                }
+                const bool inPicture = x1 >= 0.0f && y1 >= 0.0f && x0 <= bw && y0 <= bh;
+                if (z0 > 0.0f && inPicture) {
+                    const bool flat = z1 - z0 <= 0.01f * z0;
+                    if (flat && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ)) && m_hudDepthM > 0.0f) {
+                        k = (nearInv(m_hudDepthM) / a2w) / z0; ++m_screenMoved;
+                    } else if (!flat && z1 * a2w < 0.20f && x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh) {   // hits: 128-192 px
+                        const float zt = targetAt(0.5f * (x0 + x1), 0.5f * (y0 + y1));
+                        if (zt > z1) { k = 0.95f * zt / z0; ++m_fxMoved; }
+                    }
+                }
+            }
+            if (k != 1.0f) {
+                m_moveVerts.assign(v, v + pr.vertex_count);
+                for (auto& mv : m_moveVerts) { mv.x *= k; mv.y *= k; mv.z *= k; }
+                emit(pr, m_moveVerts.data(), half);
+            } else {
+                emit(pr, v, half);
+            }
         }
+        m_fxSec += m_fxMoved; m_screenSecMax = std::max(m_screenSecMax, m_screenMoved); m_bandsSecMax = std::max(m_bandsSecMax, m_bandsDropped);
         if (m_altFix)
             for (size_t i = 0; i < m_altCarry.size(); ++i) emit(m_altCarry[i], m_altCarryVerts.data() + m_altCarryFirst[i], true);
         if (!m_runs.empty()) m_runs.back().count = uint32_t(m_indexData.size()) - m_runs.back().first;

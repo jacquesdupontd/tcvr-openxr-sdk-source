@@ -30,6 +30,11 @@ bool textTexel(out ivec2 p) {
     p = clamp(ivec2((u + 0.5) * OutText.z, (0.5 - v) * OutText.w), ivec2(0), ivec2(OutText.zw) - 1);
     return true;
 }
+bool darkOrNoText(ivec2 q) {
+    if ((priAt(q) & 4u) == 0u) return true;
+    uvec3 c = penRGB(textAt(q));
+    return max(c.r, max(c.g, c.b)) <= 8u;
+}
 uvec3 mixText(ivec2 p, uvec3 dest, int prival) {
     bool spot = Mix0.x != 0 && Flags.z != 79;   // 79: diagnostic, spot remap off
     uint src = textAt(p);
@@ -47,12 +52,13 @@ uvec3 mixText(ivec2 p, uvec3 dest, int prival) {
         // black bars): the text layer's big BLACK areas -- letterbox bands, story boxes -- were the edges of a flat screen.
         // A black texel whose four neighbours 3 texels away are black too lies inside such an area: transparent. The
         // text and its thin outline stay.
+        // A neighbour with NO text (priority bit 4 clear) counts as black too: otherwise the black texels along a box's
+        // outer edge stayed -- "une ligne noire en pointillés" at the start of a 2P game (29/09).
         if (Flags.x != 0 && Flags.y != 0 && max(rgb.r, max(rgb.g, rgb.b)) <= 8u) {
             ivec2 hi = ivec2(OutText.zw) - 1;
-            uvec3 a = penRGB(textAt(clamp(p + ivec2(3, 0), ivec2(0), hi))), b = penRGB(textAt(clamp(p - ivec2(3, 0), ivec2(0), hi)));
-            uvec3 c = penRGB(textAt(clamp(p + ivec2(0, 3), ivec2(0), hi))), d = penRGB(textAt(clamp(p - ivec2(0, 3), ivec2(0), hi)));
-            uvec3 m = max(max(a, b), max(c, d));
-            if (max(m.r, max(m.g, m.b)) <= 8u) return dest;
+            ivec2 q0 = clamp(p + ivec2(3, 0), ivec2(0), hi), q1 = clamp(p - ivec2(3, 0), ivec2(0), hi);
+            ivec2 q2 = clamp(p + ivec2(0, 3), ivec2(0), hi), q3 = clamp(p - ivec2(0, 3), ivec2(0), hi);
+            if (darkOrNoText(q0) && darkOrNoText(q1) && darkOrNoText(q2) && darkOrNoText(q3)) return dest;
         }
     }
     if (spot && pen >= 0x80u) {

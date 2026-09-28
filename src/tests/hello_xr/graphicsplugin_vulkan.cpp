@@ -2129,6 +2129,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 4096));
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
         m_s22.SetDropBands(want && arcadexr::profiles::GetInt("immersive.dropBands", 1) != 0, m_s22AnchorValid ? m_s22AnchorScale : 0.0f);
+        m_s22.SetHudDepthM(m_s22LastHudD);   // camera-glued screen content goes to the HUD plane (last frame's distance)
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
         m_s22Prepared = true;
         if (!want) return;   // flat: drawn after the Model 2 flat block (RenderSystem22Flat)
@@ -2202,6 +2203,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 hudD = std::max(arcadexr::config::GetFloat("hud.nearMin", nearOn ? 0.45f : 1.2f), hudD);
             }
         }
+        if (viewIndex == 0) m_s22LastHudD = hudD;
         const float hk = hudD / distance;
         const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudD, camera.y - screen.normal.y * hudD, camera.z - screen.normal.z * hudD};
         XrMatrix4x4f hudToWorld{};
@@ -2219,7 +2221,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 const auto nowH = std::chrono::steady_clock::now();
                 if (nowH - s_at > std::chrono::seconds(1)) {
                     s_at = nowH;
-                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m bands dropped %u | %s", zoomS, bw, bh, hudD, m_s22.BandsDropped(), m_s22.BandDiag().c_str()));
+                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m | %s", zoomS, bw, bh, hudD, m_s22.TakeMoveDiag().c_str()));
                 }
             }
             if (arcadexr::config::GetInt("s22.hudIso", 1) != 0 && zoomS > 1e-3f && bw > 0 && bh > 0 && worldScale > 1e-9f) {
@@ -2781,6 +2783,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     CmdBuffer m_mvCmd{};
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
     XrVector3f m_s22EyePosW[2]{};   // near comfort: the eyes' positions (inter-eye distance)
+    float m_s22LastHudD = 0.0f;     // the HUD plane's distance (m), for camera-glued screen content
     float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
     float m_s22HudNear = 0.0f;    // ... and of the nearest thing in the picture (m): the HUD stays just in front of it
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };
