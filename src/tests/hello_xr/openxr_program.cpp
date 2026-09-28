@@ -1896,6 +1896,9 @@ struct OpenXrProgram : IOpenXrProgram {
                         const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_gunShotAt).count();
                         slide = t < 0.03f ? t / 0.03f : std::max(0.0f, 1.0f - (t - 0.03f) / 0.06f);
                         flash = t < 0.05f ? 1.0f - t / 0.05f : 0.0f;
+                        // gun.flash (live, debug.tcvr.gun_flash): 0 = no muzzle flash (28/09: suspected of the "impacts font un
+                        // peu loucher" -- a bright flash 45 cm from the eyes is seen double while they rest on a target at 2 m)
+                        flash *= std::max(0.0f, std::min(1.0f, arcadexr::config::GetFloat("gun.flash", 1.0f)));
                     }
                 }
                 const auto b = [](float v) { return float(int(std::max(0.0f, std::min(1.0f, v)) * 255.0f + 0.5f)); };
