@@ -68,6 +68,7 @@ public:
         float ImmersiveMvpCyc[16];   // near comfort: this eye's projection from the cyclopean eye
         float NearCyc[4];            // near comfort: cyclopean eye in the game camera's space, metres per unit (0 = off)
         float NearParams[4];         // near comfort: nearest perceived distance, start of the compression (metres)
+        int32_t FilterCfg[4];        // x: most anisotropic taps of filter mode 3
     };
 
     struct Settings {
@@ -201,14 +202,16 @@ public:
         }
         // Decoded pen banks for filtered sampling (see StartBankWorker). Shader-readable from the start;
         // a bank is used only once its bit is in the ready mask, the ROM table chain covers the rest.
+        // System 23 (28/09): 32 banks -- its unwrapped v runs through 131072 texel rows (8192 tile rows of 16).
+        m_bankCount = wide ? 32u : 16u;
         m_penBanks = NewImage(VK_FORMAT_R8_UINT, 4096, 4096, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                              VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 16, kBankMips);
+                              VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, m_bankCount, kBankMips);
         Barrier(cmd, m_penBanks.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        // The decoded banks follow the System 22's chain (4096 x 65536 address space): not for the System 23, whose
-        // polygons then all take the table chain (texPen), texel-exact like the board.
-        if (!wide) StartBankWorker(a, tiles);
-        else StopBankWorker(), m_bankReadyMask = 0;
+        // Decoded banks for BOTH boards (28/09): the System 23 had none -- every Time Crisis II polygon took the table
+        // chain, texel-exact and unfiltered ("très moche", near textures in blocks, far ones shimmering). Its chain (the
+        // masks above, bit 0 of the attribute = tile bit 16) is decoded the same way over its 32 banks.
+        StartBankWorker(a, tiles, wide);
         m_assetsReady = true;
         m_setsDirty = true;
         Log::Write(Log::Level::Info, Fmt("TCVR_S22VK assets: tiles %u bytes (%u tiles, atlas 4096x%u, maps 256x%u, masks v %x row %x tile %x shade %x), sprites %u (%ux%u)",
@@ -223,21 +226,22 @@ public:
     // bank gives a plain 4096x4096 image of palette indices: one textureGather then returns the 4
     // neighbours a bilinear filter needs (the chain would cost 4 dependent fetches per neighbour).
     // 16 banks = 256 MB, decoded on a worker at game load and uploaded one per frame.
-    void StartBankWorker(const tcvr_scene_assets& a, uint32_t tiles) {
+    void StartBankWorker(const tcvr_scene_assets& a, uint32_t tiles, bool wide) {
         StopBankWorker();
         m_bankCancel = false;
         m_bankReadyMask = 0;
         const tcvr_scene_assets A = a;
-        m_bankWorker = std::thread([this, A, tiles] {
-            for (uint32_t bank = 0; bank < 16 && !m_bankCancel; ++bank) {
+        const uint32_t rowMask = m_tex[1], tileMask = m_tex[2], banks = m_bankCount;
+        m_bankWorker = std::thread([this, A, tiles, wide, rowMask, tileMask, banks] {
+            for (uint32_t bank = 0; bank < banks && !m_bankCancel; ++bank) {
                 std::vector<uint8_t> img(size_t(4096) * 4096, 0);
                 for (uint32_t y = 0; y < 4096; ++y) {
                     const uint32_t ty = (bank << 12) | y;
                     uint8_t* row = &img[size_t(y) * 4096];
                     for (uint32_t tx = 0; tx < 4096; ++tx) {
-                        const uint32_t to = ((ty << 4) & 0xfff00u) | (tx >> 4);
+                        const uint32_t to = ((ty << 4) & rowMask) | (tx >> 4);
                         if (to >= A.tilemap_entries || to >= A.tileattr_entries) continue;
-                        const uint32_t tile = A.tilemap[to];
+                        const uint32_t tile = (uint32_t(A.tilemap[to]) | (wide ? ((uint32_t(A.tileattr[to]) & 1u) << 16) : 0u)) & tileMask;
                         const uint32_t ai = (uint32_t(A.tileattr[to]) << 8) | ((ty << 4) & 0xf0u) | (tx & 0xfu);
                         if (ai >= A.ayx_entries || tile >= tiles) continue;
                         const uint32_t pix = A.ayx[ai];
@@ -316,7 +320,8 @@ public:
                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         m_bankStaging.emplace_back(std::move(sb), m_frameCounter);
         m_bankReadyMask |= 1u << job.first;
-        if (m_bankReadyMask == 0xffffu) Log::Write(Log::Level::Info, "TCVR_S22VK pen banks: 16/16 decoded and uploaded");
+        if (m_bankReadyMask == (m_bankCount >= 32 ? 0xffffffffu : ((1u << m_bankCount) - 1u)))
+            Log::Write(Log::Level::Info, Fmt("TCVR_S22VK pen banks: %u/%u decoded and uploaded", m_bankCount, m_bankCount));
     }
     void SetFilter(int mode) { m_filter = mode; }
     void SetLinearOut(bool on) { m_linearOut = on; }
@@ -505,6 +510,11 @@ private:
     std::vector<std::pair<int, std::vector<uint8_t>>> m_bankQueue;
     std::vector<std::pair<std::unique_ptr<BufferAndMemory>, uint64_t>> m_bankStaging;
     uint32_t m_bankReadyMask = 0;
+    uint32_t m_bankCount = 16;   // decoded banks: 16 (System 22), 32 (System 23)
+    int m_anisoTaps = 4;         // filter mode 3: most anisotropic taps (SetAnisoTaps)
+public:
+    void SetAnisoTaps(int n) { m_anisoTaps = std::max(1, std::min(4, n)); }
+private:
     uint64_t m_frameCounter = 0;
     int m_filter = 1;
     VkSampler m_repeatNearest = VK_NULL_HANDLE;
@@ -1149,6 +1159,7 @@ private:
         // Scene passes: Sprite.z = decoded pen banks ready (bit per bank), Sprite.w = texture filter
         // (0 texel-exact like the board, 1 bilinear). The composite overwrites both with its own meaning.
         u.Sprite[2] = int(m_bankReadyMask); u.Sprite[3] = m_filter;
+        u.FilterCfg[0] = m_anisoTaps;
         if (mvp && m_settings.voidMode == 2) {
             u.Bg[0] = m_settings.voidRGB[0]; u.Bg[1] = m_settings.voidRGB[1]; u.Bg[2] = m_settings.voidRGB[2];
         } else if (mvp && m_settings.voidMode == 1) {

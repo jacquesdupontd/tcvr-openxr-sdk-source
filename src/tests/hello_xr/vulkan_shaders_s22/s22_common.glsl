@@ -20,6 +20,7 @@ layout(set = 0, binding = 0, std140) uniform S22 {
     mat4 ImmersiveMvpCyc; // near comfort (28/09): this eye's projection seen from the cyclopean eye
     vec4 NearCyc;         // near comfort: the cyclopean eye in the game camera's space (xyz), metres per unit (w, 0 = off)
     vec4 NearParams;      // near comfort: nearest perceived distance, start of the compression (metres)
+    ivec4 FilterCfg;      // x: most anisotropic taps of filter mode 3 (s22.anisoTaps; 4 = Time Crisis 1, 2 = Time Crisis II)
 };
 layout(std430, set = 0, binding = 1) readonly buffer PrimTable { vec4 prim[]; };   // 16 vec4 per primitive
 layout(std430, set = 0, binding = 2) readonly buffer Pens { uint pens[]; };

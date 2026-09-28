@@ -35,15 +35,22 @@ bool stencilOn(vec2 uv) {
 }
 // One level of the decoded bank, bilinear on the COLOURS of the 4 neighbouring indices (wraps like the
 // 12-bit address). Level l = the index mipmap (majority of each 2x2 block).
+// One decoded texel at mip level l. System 22: in the polygon's bank, both axes wrapped (the board wraps v at 4096).
+// System 23 (Tex.x = ~0, 28/09): uv carries the GLOBAL row (saturated v + the bank's 4096 rows, see texPen): a row runs
+// on into the next bank, so the bank of each texel is its row / 4096 -- read there, no seam between banks.
+uint bankPen(ivec2 t, int bank, int l) {
+    int m = (4096 >> l) - 1;
+    if (Tex.x == 0xffffffffu) return texelFetch(PenBanks, ivec3(t.x & m, t.y & m, (t.y >> (12 - l)) & 31), l).r;
+    return texelFetch(PenBanks, ivec3(t & m, bank), l).r;
+}
 vec3 bankBilinear(vec2 uv, int bank, int l, uint pensOff, uint pshift, uint pmask) {
-    int size = 4096 >> l, m = size - 1;
     vec2 p = uv / float(1 << l) - 0.5;
     ivec2 i0 = ivec2(floor(p));
     vec2 f = p - vec2(i0);
-    uint a = texelFetch(PenBanks, ivec3(i0 & m, bank), l).r;
-    uint b = texelFetch(PenBanks, ivec3((i0 + ivec2(1, 0)) & m, bank), l).r;
-    uint c = texelFetch(PenBanks, ivec3((i0 + ivec2(0, 1)) & m, bank), l).r;
-    uint d = texelFetch(PenBanks, ivec3((i0 + ivec2(1, 1)) & m, bank), l).r;
+    uint a = bankPen(i0, bank, l);
+    uint b = bankPen(i0 + ivec2(1, 0), bank, l);
+    uint c = bankPen(i0 + ivec2(0, 1), bank, l);
+    uint d = bankPen(i0 + ivec2(1, 1), bank, l);
     vec3 ca = vec3(penRGB(pensOff + ((a >> pshift) & pmask))), cb = vec3(penRGB(pensOff + ((b >> pshift) & pmask)));
     vec3 cc = vec3(penRGB(pensOff + ((c >> pshift) & pmask))), cd = vec3(penRGB(pensOff + ((d >> pshift) & pmask)));
     return mix(mix(ca, cb, f.x), mix(cc, cd, f.x), f.y);
@@ -100,12 +107,25 @@ void main() {
     {
 #endif
         pen = 0u;
-        if (texEn && Sprite.w != 0 && ((uint(Sprite.z) >> uint(bn >> 12)) & 1u) != 0u) {
+        // System 23: the texture coordinate in the GLOBAL rows of the decoded banks (saturated like the board, + bank rows)
+        bool s23 = Tex.x == 0xffffffffu;
+        vec2 uvB = s23 ? vec2(max(vTex.x, 0.0), max(vTex.y, 0.0) + float(bn)) : vTex.xy;
+        int bankReady = s23 ? ((int(floor(uvB.y)) >> 12) & 31) : (bn >> 12);
+        if (texEn && Sprite.w != 0 && ((uint(Sprite.z) >> uint(bankReady)) & 1u) != 0u) {
             // Bilinear filter of the COLOURS: one gather of the 4 neighbouring palette indices from the
             // decoded bank, palette per neighbour, then the blend (an index cannot be interpolated).
-            vec2 p = vTex.xy - 0.5;
+            vec2 p = uvB - 0.5;
             vec2 i0 = floor(p), f = p - i0;
-            uvec4 g = textureGather(PenBanks, vec3((i0 + 1.0) / 4096.0, float(bn >> 12)));
+            uvec4 g;
+            if (s23 && (int(i0.y) & 4095) == 4095) {   // the 2x2 straddles two banks (one row in 4096): four fetches
+                ivec2 ii = ivec2(i0);
+                g = uvec4(bankPen(ii + ivec2(0, 1), 0, 0), bankPen(ii + ivec2(1, 1), 0, 0), bankPen(ii + ivec2(1, 0), 0, 0), bankPen(ii, 0, 0));
+            } else if (s23) {   // one gather in the bank of the row, the row taken inside it
+                int gy = int(i0.y);
+                g = textureGather(PenBanks, vec3((i0.x + 1.0) / 4096.0, (float(gy & 4095) + 1.0) / 4096.0, float((gy >> 12) & 31)));
+            } else {
+                g = textureGather(PenBanks, vec3((i0 + 1.0) / 4096.0, float(bn >> 12)));
+            }
             pen = f.y < 0.5 ? (f.x < 0.5 ? g.w : g.z) : (f.x < 0.5 ? g.x : g.y);   // nearest, for the alpha pen test
             // Mode 3: anisotropic footprint. The level follows the MINOR axis of the pixel's footprint (the
             // road seen at a grazing angle keeps its detail across), and up to 4 taps are spread along the
@@ -118,10 +138,10 @@ void main() {
                 int l0 = int(floor(lc));
                 int taps = 1;
                 vec2 major = length(tdx) > length(tdy) ? tdx : tdy;
-                if (Sprite.w >= 3) taps = int(clamp(exp2(lod - lodUse), 1.0, 4.0) + 0.5);
+                if (Sprite.w >= 3) taps = int(clamp(exp2(lod - lodUse), 1.0, float(clamp(FilterCfg.x, 1, 4))) + 0.5);
                 vec3 acc = vec3(0.0);
                 for (int k = 0; k < taps; ++k) {
-                    vec2 uvk = vTex.xy + major * ((float(k) + 0.5) / float(taps) - 0.5);
+                    vec2 uvk = uvB + major * ((float(k) + 0.5) / float(taps) - 0.5);
                     vec3 c0 = bankBilinear(uvk, bn >> 12, l0, pensOff, pshift, pmask);
                     vec3 c1 = l0 < 8 ? bankBilinear(uvk, bn >> 12, l0 + 1, pensOff, pshift, pmask) : c0;
                     acc += mix(c0, c1, lc - float(l0));

@@ -2114,6 +2114,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         m_s22.PumpBanks(cmd);
         m_s22.SetFilter(arcadexr::config::GetInt("s22.filter", 3));   // 0 texel-exact, 1 bilinear, 2 + index mipmaps, 3 sharp + anisotropic
+        // Most anisotropic taps of mode 3 (28/09): Time Crisis II gets its filter at last (decoded System 23 banks) but is the
+        // heaviest game -- 4 taps cost 30 % over texel-exact on a frozen frame, the dynamic resolution paid for it.
+        m_s22.SetAnisoTaps(arcadexr::config::GetInt("s22.anisoTaps", arcadexr::profiles::GetInt("s22.anisoTaps", 4)));
         m_s22.SetHudSharp(arcadexr::config::GetInt("s22.hudSharp", 3));
         m_s22.SetLinearOut(arcadexr::config::GetInt("s22.linearOut", 1) != 0);   // true colours on an _SRGB eye image
         m_s22.SetTextDiag(arcadexr::config::GetInt("s22.textDiag", 0));
