@@ -165,9 +165,11 @@ public:
         planeBind.descriptorCount = 1;
         planeBind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+        VkDescriptorSetLayoutBinding planeBinds[2] = {planeBind, planeBind};
+        planeBinds[1].binding = 1;   // the board picture's depth (projection of the front 2D layer onto the 3D, 28/09)
         VkDescriptorSetLayoutCreateInfo planeLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        planeLayoutInfo.bindingCount = 1;
-        planeLayoutInfo.pBindings = &planeBind;
+        planeLayoutInfo.bindingCount = 2;
+        planeLayoutInfo.pBindings = planeBinds;
         XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_vkDevice, &planeLayoutInfo, nullptr, &m_planeDescLayout));
 
         // 3. Create Pipeline Layouts
@@ -683,6 +685,7 @@ public:
             }
             GroundProbe(frame, mainCx, mainCy, mainB);
             SceneDepthProbe(frame, mainCx, mainCy);
+            RasterArcadeDepth(frame, mainCx, mainCy);
             // Smooth motion for a Model 2 game (25/09, profile immersive.smoothMotion2: Sega Rally first): polygons carry
             // their identity in the prim (object address, rank, copy) instead of Model 1's u/v.
             m_m2Smooth = !m_directColour && !m_flatMode &&
@@ -754,6 +757,24 @@ public:
     // descriptor updates, copies into the host-visible buffers, 2D layers.
     void CommitFrame(const tcvr_m2_frame& frame, VkCommandBuffer cmd) {
         if (!m_initialized) return;
+        static_assert(kArcSlots == kFrames, "one board-depth staging buffer per frame slot");
+        if (m_arcDepthImage != VK_NULL_HANDLE && m_arcDepthStageMap[m_fs] != nullptr) {   // board depth -> GPU
+            std::memcpy(m_arcDepthStageMap[m_fs], m_arcDepthCpu.data(), m_arcDepthCpu.size() * sizeof(float));
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.oldLayout = m_arcDepthLayout; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = m_arcDepthImage; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {uint32_t(kArcW), uint32_t(kArcH), 1};
+            vkCmdCopyBufferToImage(cmd, m_arcDepthStage[m_fs].buf, m_arcDepthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            m_arcDepthLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
         if (m_rbPendingNext) { m_rbPendingNext = false; m_rbWaitFrames = 3; }
         if (m_rbWaitFrames > 0 && --m_rbWaitFrames == 0) m_rbPending = true;
         if (m_dbgMapped && (m_dbgMapped[0] | m_dbgMapped[1]) != 0u) {
@@ -1244,6 +1265,28 @@ public:
             frontPc.uOutSize[0] = outW; frontPc.uOutSize[1] = outH;
             frontPc.uKeyZero = 1;
             frontPc.uUvScaleX = m_layerUvScaleX[0];
+            // Front 2D layer PROJECTED onto the 3D (28/09, Guillaume: one method for every 2D pixel, "soit tout bug,
+            // soit rien"): each pixel at the depth of the 3D behind it in the board's picture (plane_frag.glsl).
+            // m2.hud2d: 1 projected (default, every game but Sega Rally), 0 per-element planes.
+            const bool projected2d = hudIso && hudNearRule && !m_frontFullscreen && m_arcDepthImage != VK_NULL_HANDLE &&
+                                     arcadexr::config::GetInt("m2.hud2d", 1) == 1;
+            const float zNearArc = (m_a2wScale > 1e-6f) ? 1.2f / m_a2wScale : 1.0f;
+            XrMatrix4x4f projNear{}, projFar{};
+            if (projected2d) {
+                const float zRef = hudSceneZ;
+                XrMatrix4x4f refMvp; hudMvpAt(zRef, refMvp);
+                memcpy(frontPc.uHudMvp, refMvp.m, sizeof(refMvp.m));
+                XrMatrix4x4f worldToArc; XrMatrix4x4f_Invert(&worldToArc, &arcadeToWorld);
+                const XrVector3f eyeW = layerView.pose.position;
+                XrVector3f eyeA; XrMatrix4x4f_TransformVector3f(&eyeA, &worldToArc, &eyeW);
+                frontPc.uEyeArc[0] = eyeA.x; frontPc.uEyeArc[1] = eyeA.y; frontPc.uEyeArc[2] = eyeA.z; frontPc.uEyeArc[3] = zRef;
+                frontPc.uProj[0] = float(m_crtc[0]) + float(m_mainCenter[0]);
+                frontPc.uProj[1] = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
+                frontPc.uProj[2] = focusX; frontPc.uProj[3] = focusY;
+                frontPc.uZNear = zNearArc;
+                hudMvpAt(zNearArc, projNear);
+                hudMvpAt(std::max(zNearArc * 4096.0f, hudSceneZ * 64.0f), projFar);
+            }
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[0], 0, nullptr);
@@ -1256,7 +1299,7 @@ public:
             // Per-element depth (28/09): each run takes the depth of its HUD element (m_hudCellZ, see SceneDepthProbe),
             // just in front of what is behind it; cells then keep the NEAREST element and each run of cells is drawn
             // once with its element's plane. Off (Sega Rally, m2.hudPerElement=0): one plane as before.
-            const bool perElement = tiled && hudIso && hudNearRule && arcadexr::config::GetInt("m2.hudPerElement", 1) != 0;
+            const bool perElement = tiled && hudIso && hudNearRule && !projected2d && arcadexr::config::GetInt("m2.hudPerElement", 1) != 0;
             std::vector<float> keyZ;               // distinct depths (arcade units), index = key
             std::vector<XrMatrix4x4f> keyMvp;
             std::vector<uint16_t> rectKey;
@@ -1284,7 +1327,8 @@ public:
                         M = keyMvp[k].m;
                     }
                     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-                    for (int c = 0; c < 4; ++c) {
+                    for (int c = 0; c < (projected2d ? 8 : 4); ++c) {
+                        if (projected2d) M = (c < 4) ? projNear.m : projFar.m;
                         // three arcade texels of margin: the HUD filter reads up to 2 texels around (measured: 1.5 lost pixels)
                         const float px = (c & 1) ? float(r.x1) + 3.0f : float(r.x0) - 3.0f;
                         const float py = (c & 2) ? float(r.y1) + 3.0f : float(r.y0) - 3.0f;
@@ -1803,6 +1847,72 @@ public:
         if (m_flatMode) return 1.0f;
         const float g = std::max(1.0f, std::min(2.0f, arcadexr::profiles::GetFloat("immersive.lift", 1.0f)));
         return 1.0f / g;
+    }
+    // The board picture's depth (28/09): arcade eye-space z of the nearest main-view surface per 4 x 4 board pixels,
+    // rasterised on the CPU from the frame's own triangles (near-clipped, screen overlays excluded). The front 2D layer
+    // is projected onto it (plane_frag.glsl): each 2D pixel at the depth of the 3D behind it in the board's image.
+    static constexpr int kArcW = 124, kArcH = 96;
+    std::vector<float> m_arcDepthCpu = std::vector<float>(size_t(kArcW) * kArcH, 0.0f);
+    VkImage m_arcDepthImage = VK_NULL_HANDLE; VkDeviceMemory m_arcDepthMem = VK_NULL_HANDLE;
+    VkImageView m_arcDepthView = VK_NULL_HANDLE; VkSampler m_arcDepthSampler = VK_NULL_HANDLE;
+    static constexpr int kArcSlots = 2;   // = kFrames (declared further down; checked in CommitFrame)
+    BufferAndMemory m_arcDepthStage[kArcSlots]; float* m_arcDepthStageMap[kArcSlots] = {};
+    VkImageLayout m_arcDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    void RasterArcadeDepth(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy) {
+        std::fill(m_arcDepthCpu.begin(), m_arcDepthCpu.end(), 0.0f);
+        if (!m_haveMainView) return;
+        const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
+        const float kx = float(kArcW) / 496.0f, ky = float(kArcH) / 384.0f;
+        const size_t end = std::min<size_t>(m_secIndexStart, m_rawIdx.size());
+        const float zc = 0.05f;
+        auto rasterTri = [&](const float* a, const float* b, const float* c) {   // (x, y, 1/z) in grid pixels
+            const float area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            if (std::fabs(area) < 1e-9f) return;
+            const int x0 = std::max(0, int(std::floor(std::min(a[0], std::min(b[0], c[0])))));
+            const int x1 = std::min(kArcW - 1, int(std::ceil(std::max(a[0], std::max(b[0], c[0])))));
+            const int y0 = std::max(0, int(std::floor(std::min(a[1], std::min(b[1], c[1])))));
+            const int y1 = std::min(kArcH - 1, int(std::ceil(std::max(a[1], std::max(b[1], c[1])))));
+            const float inv = 1.0f / area;
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x) {
+                    const float px = float(x) + 0.5f, py = float(y) + 0.5f;
+                    const float w0 = ((b[0] - px) * (c[1] - py) - (b[1] - py) * (c[0] - px)) * inv;
+                    const float w1 = ((c[0] - px) * (a[1] - py) - (c[1] - py) * (a[0] - px)) * inv;
+                    const float w2 = 1.0f - w0 - w1;
+                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                    const float iz = w0 * a[2] + w1 * b[2] + w2 * c[2];
+                    if (iz <= 0.0f) continue;
+                    const float z = 1.0f / iz;
+                    float& d = m_arcDepthCpu[size_t(y) * kArcW + size_t(x)];
+                    if (d == 0.0f || z < d) d = z;
+                }
+        };
+        for (size_t i = 0; i + 2 < end; i += 3) {
+            const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+            float in[3][3], out[4][3]; int n = 0;
+            for (int k = 0; k < 3; ++k) {
+                const float* q = &m_rawVerts[size_t(m_rawIdx[i + k]) * 5];
+                in[k][0] = q[0]; in[k][1] = q[1]; in[k][2] = q[2];
+            }
+            for (int k = 0; k < 3; ++k) {   // clip against z = zc
+                const float* a = in[k]; const float* b = in[(k + 1) % 3];
+                const bool ai = a[2] >= zc, bi = b[2] >= zc;
+                if (ai) { out[n][0] = a[0]; out[n][1] = a[1]; out[n][2] = a[2]; ++n; }
+                if (ai != bi) {
+                    const float t = (zc - a[2]) / (b[2] - a[2]);
+                    out[n][0] = a[0] + t * (b[0] - a[0]); out[n][1] = a[1] + t * (b[1] - a[1]); out[n][2] = zc; ++n;
+                }
+            }
+            if (n < 3) continue;
+            float g[4][3];
+            for (int k = 0; k < n; ++k) {
+                g[k][0] = (fx + out[k][0] / out[k][2]) * kx;
+                g[k][1] = (fy - out[k][1] / out[k][2]) * ky;
+                g[k][2] = 1.0f / out[k][2];
+            }
+            for (int t = 1; t + 1 < n; ++t) rasterTri(g[0], g[t], g[t + 1]);
+        }
     }
     float m_sceneDepth = 0.0f;
     float m_hudNear = 0.0f;   // nearest scene under the HUD (arcade units, 20th percentile, smoothed), 0 = none
@@ -2703,6 +2813,11 @@ public:
             if (m_sheetImage[i] != VK_NULL_HANDLE) { vkDestroyImage(m_vkDevice, m_sheetImage[i], nullptr); m_sheetImage[i] = VK_NULL_HANDLE; }
             if (m_sheetMem[i] != VK_NULL_HANDLE) { vkFreeMemory(m_vkDevice, m_sheetMem[i], nullptr); m_sheetMem[i] = VK_NULL_HANDLE; }
         }
+        if (m_arcDepthSampler != VK_NULL_HANDLE) { vkDestroySampler(m_vkDevice, m_arcDepthSampler, nullptr); m_arcDepthSampler = VK_NULL_HANDLE; }
+        if (m_arcDepthView != VK_NULL_HANDLE) { vkDestroyImageView(m_vkDevice, m_arcDepthView, nullptr); m_arcDepthView = VK_NULL_HANDLE; }
+        if (m_arcDepthImage != VK_NULL_HANDLE) { vkDestroyImage(m_vkDevice, m_arcDepthImage, nullptr); m_arcDepthImage = VK_NULL_HANDLE; }
+        if (m_arcDepthMem != VK_NULL_HANDLE) { vkFreeMemory(m_vkDevice, m_arcDepthMem, nullptr); m_arcDepthMem = VK_NULL_HANDLE; }
+        for (int f = 0; f < kArcSlots; ++f) { m_arcDepthStage[f].Reset(m_vkDevice); m_arcDepthStageMap[f] = nullptr; }
         for (int i = 0; i < 2; ++i) {
             if (m_layerSampler[i] != VK_NULL_HANDLE) { vkDestroySampler(m_vkDevice, m_layerSampler[i], nullptr); m_layerSampler[i] = VK_NULL_HANDLE; }
             if (m_sheetView[i] != VK_NULL_HANDLE) { vkDestroyImageView(m_vkDevice, m_sheetView[i], nullptr); m_sheetView[i] = VK_NULL_HANDLE; }
@@ -3184,6 +3299,42 @@ private:
             writeDesc.descriptorCount = 1;
             writeDesc.pImageInfo = &descImgInfo;
             vkUpdateDescriptorSets(m_vkDevice, 1, &writeDesc, 0, nullptr);
+        }
+
+        {   // Board depth (RasterArcadeDepth): R32F kArcW x kArcH, uploaded every frame from a per-slot staging buffer
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.extent = {uint32_t(kArcW), uint32_t(kArcH), 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+            ii.format = VK_FORMAT_R32_SFLOAT; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &ii, nullptr, &m_arcDepthImage));
+            VkMemoryRequirements mr{}; vkGetImageMemoryRequirements(m_vkDevice, m_arcDepthImage, &mr);
+            m_memAllocator->Allocate(mr, &m_arcDepthMem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_vkDevice, m_arcDepthImage, m_arcDepthMem, 0));
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = m_arcDepthImage; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R32_SFLOAT;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &vi, nullptr, &m_arcDepthView));
+            VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            si.magFilter = VK_FILTER_NEAREST; si.minFilter = VK_FILTER_NEAREST; si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_vkDevice, &si, nullptr, &m_arcDepthSampler));
+            for (int f = 0; f < kArcSlots; ++f) {   // host-visible staging, as AllocateBuffers' createMappedBuffer
+                VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                bufInfo.size = VkDeviceSize(kArcW) * kArcH * sizeof(float);
+                bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                m_arcDepthStage[f].Create(m_vkDevice, *m_memAllocator, bufInfo);
+                XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, m_arcDepthStage[f].mem, 0, bufInfo.size, 0,
+                                                  reinterpret_cast<void**>(&m_arcDepthStageMap[f])));
+            }
+            m_arcDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            for (int l = 0; l < 2; ++l) {
+                VkDescriptorImageInfo di{m_arcDepthSampler, m_arcDepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.dstSet = m_layerDescSet[l]; w.dstBinding = 1; w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w.descriptorCount = 1; w.pImageInfo = &di;
+                vkUpdateDescriptorSets(m_vkDevice, 1, &w, 0, nullptr);
+            }
         }
 
         // Allocate Model 2 descriptor sets (2 eyes x 2 passes = 4 sets) per frame slot

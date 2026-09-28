@@ -68,6 +68,10 @@ struct PlanePushConstants {
     float uClipRow;    // > 0: the back layer is not drawn below this board row (ground fill, gun games)
     float uNoTile;     // 1: the back layer is a menu page -- only inside the arcade frame, not repeated
     float uLift;       // brightness curve exponent, as M2UniformBufferObject::uLift
+    // Front 2D layer PROJECTED onto the 3D (28/09): each 2D pixel at the depth of the 3D behind it in the board's image.
+    float uZNear;      // arcade units: nearest depth marched (1.2 m)
+    float uEyeArc[4];  // eye position in the board camera's space; w = depth of uHudMvp's plane (0 = projection off)
+    float uProj[4];    // board projection: centre x, centre y, focus x, focus y
 };
 
 }  // namespace arcadexr::vulkan

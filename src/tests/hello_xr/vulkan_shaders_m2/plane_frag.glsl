@@ -4,6 +4,9 @@ layout(location = 0) out vec4 oColorOut;
 vec4 oColor;
 
 layout(set = 0, binding = 0) uniform sampler2D uLayer;
+// Depth of the 3D in the board's own image (arcade eye-space z of the nearest main-view surface, 0 = nothing), 124 x 96
+// over the 496 x 384 board picture, rasterised on the CPU every frame (RasterArcadeDepth).
+layout(set = 0, binding = 1) uniform sampler2D uArcDepth;
 
 layout(push_constant) uniform PlanePushConstants {
     mat4 uHudMvp;
@@ -13,7 +16,52 @@ layout(push_constant) uniform PlanePushConstants {
     float uClipRow;    // > 0: back layer cut below this board row, the ground colour shows there (gun games)
     float uNoTile;     // 1: a menu page: inside the arcade frame only
     float uLift;       // brightness curve exponent (menu LUMINOSITE)
+    float uZNear;      // nearest depth marched (arcade units)
+    vec4 uEyeArc;      // eye in the board camera's space; w = depth of uHudMvp's plane (0 = off)
+    vec4 uProj;        // board projection: centre x, centre y, focus x, focus y
 };
+
+// The board picture PROJECTED onto the 3D (28/09, one rule for every 2D pixel: Guillaume, "soit tout bug, soit rien"):
+// march the eye ray from the nearest depth to infinity until it passes behind the 3D the board drew at that point of
+// its picture; the 2D pixel there is the one this eye sees. A HUD letter lies on what it covers, a spark on its impact,
+// a piece of 2D scenery on the 3D scenery -- the same for every game, no element, no threshold.
+vec2 boardAt(vec3 E, vec3 D, float w) {   // board coords of the ray point at depth 1/w (w -> 0: infinity)
+    float z = 1.0 / max(w, 1e-9);
+    float s = (z - E.z) / D.z;
+    vec3 P = (w > 1e-9) ? E + s * D : D;
+    return vec2(uProj.x + uProj.z * P.x / P.z, uProj.y - uProj.w * P.y / P.z);
+}
+bool projected(float u, float v, out vec2 board) {
+    float zr = uEyeArc.w;
+    vec3 E = uEyeArc.xyz;
+    float bx = u * 496.0 + 248.0, by = 192.0 - v * 384.0;
+    vec3 P1 = vec3(zr * (bx - uProj.x) / uProj.z, zr * (uProj.y - by) / uProj.w, zr);
+    vec3 D = P1 - E;
+    if (D.z <= 1e-6) return false;
+    float wNear = 1.0 / max(uZNear, E.z + 1e-3);
+    const int N = 24;
+    float wPrev = wNear;
+    for (int k = 0; k <= N; ++k) {
+        float w = wNear * (1.0 - float(k) / float(N));
+        vec2 b = boardAt(E, D, w);
+        float d = texture(uArcDepth, b / vec2(496.0, 384.0)).r;
+        if (d > 0.0 && 1.0 / max(w, 1e-9) >= d && b.x >= 0.0 && b.y >= 0.0 && b.x <= 496.0 && b.y <= 384.0) {
+            float lo = wPrev, hi = w;   // lo: in front of the surface, hi: behind it
+            for (int i = 0; i < 6; ++i) {
+                float m = 0.5 * (lo + hi);
+                vec2 bm = boardAt(E, D, m);
+                float dm = texture(uArcDepth, bm / vec2(496.0, 384.0)).r;
+                if (dm > 0.0 && 1.0 / max(m, 1e-9) >= dm) hi = m; else lo = m;
+            }
+            board = boardAt(E, D, hi);
+            return true;
+        }
+        wPrev = w;
+    }
+    board = boardAt(E, D, 0.0);   // nothing behind: the 2D pixel at infinity
+    return true;
+}
+
 
 void main_body() {
     vec2 ndc = gl_FragCoord.xy / uOutSize * 2.0 - 1.0;
@@ -24,6 +72,11 @@ void main_body() {
     if (abs(det) < 1e-12) discard;
     float u = (b1 * a22 - a12 * b2) / det, v = (a11 * b2 - a21 * b1) / det;
     if (u * c0.w + v * c1.w + c3.w <= 0.0) discard;
+    if (uKeyZero != 0 && uEyeArc.w > 0.0) {
+        vec2 b;
+        if (!projected(u, v, b)) discard;
+        u = (b.x - 248.0) / 496.0; v = (192.0 - b.y) / 384.0;
+    }
     bool inside = abs(u) <= 0.5 && abs(v) <= 0.5;
     if ((uKeyZero != 0 || uNoTile > 0.5) && !inside) discard;
     // Back layer beyond the arcade frame: repeated MIRRORED (identity inside the frame), so the edges meet
