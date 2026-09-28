@@ -286,7 +286,7 @@ public:
                 for (size_t i = 0; i < m_fireNear.size() && i < 6; ++i) {
                     const NearPoly& e = m_fireNear[i];
                     line += Fmt(" [r%u z=%.2f box=%.0f,%.0f..%.0f,%.0f tex=%u tr=%u cb=%u %s]", e.k, e.z, e.x0, e.y0, e.x1, e.y1, e.tex, e.trans, e.cb,
-                                (e.rgb & 0x2000000u) ? "VOILE" : "");
+                                (e.rgb & 0x2000000u) ? "VOILE" : (e.rgb & 0x8000000u) ? "FX" : "");
                 }
                 uint32_t rx0 = 9999, ry0 = 9999, rx1 = 0, ry1 = 0;
                 for (const auto& r : m_frontRuns) { rx0 = std::min<uint32_t>(rx0, r.x0); ry0 = std::min<uint32_t>(ry0, r.y0); rx1 = std::max<uint32_t>(rx1, r.x1); ry1 = std::max<uint32_t>(ry1, r.y1); }
@@ -530,7 +530,7 @@ public:
                 // translucent, in the main view, entirely nearer than half a metre in the headset AND than a quarter of the
                 // scene's depth (rain around the camera, 2 m away, stays in 3D): PushNearEffects()
                 // moves each burst along its camera rays onto what it covers. The depth probes and the aim skip them.
-                // Only a small thing wholly inside the picture (28/09 evening: without that, rain drops grazing the camera at 2 cm
+                // Only a small thing in the picture (28/09 evening: without that, rain drops grazing the camera at 2 cm
                 // and the fountain's translucent water as the camera ran along it were pushed too -- "un bout de la fontaine se
                 // sépare en deux"). A spark polygon is at most ~70 px; a world surface that close projects far off the frame.
                 if (m_nearFxOn && vc >= 3 && q.textured != 0u && q.translucent != 0u && m_sceneDepth > 0.0f &&
@@ -546,8 +546,10 @@ public:
                         bx0 = std::min(bx0, sx); bx1 = std::max(bx1, sx); by0 = std::min(by0, sy); by1 = std::max(by1, sy);
                     }
                     const bool small = bx1 - bx0 <= 128.0f && by1 - by0 <= 128.0f;
-                    const bool inside = bx0 >= float(p.clip_l) - 16.0f && bx1 <= float(p.clip_r) + 16.0f &&
-                                        by0 >= float(p.clip_t) - 16.0f && by1 <= float(p.clip_b) + 16.0f;
+                    // touching the picture is enough: a shot near an edge throws half its burst past it (x down to -70 on
+                    // the left edge, 28/09) -- those streaks stayed at 9.5 cm. The size alone keeps world surfaces out.
+                    const bool inside = bx1 >= float(p.clip_l) && bx0 <= float(p.clip_r) &&
+                                        by1 >= float(p.clip_t) && by0 <= float(p.clip_b);
                     if (inFront && small && inside && zmax < 0.25f * m_sceneDepth && zmax * m_a2wScale < 0.5f) q.rgb |= 0x8000000u;
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
@@ -2224,6 +2226,7 @@ public:
         if (!m_nearFxOn || !m_haveMainView) return;
         const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
         m_fxPrims.clear(); m_fxGroups.clear();
+        if (!m_nearFxOn) m_fxPrevGroups.clear();
         for (uint32_t k = 0; k < m_rawPrims.size(); ++k) {
             const tcvr_m2_prim& q = m_rawPrims[k];
             if ((q.rgb & 0x8000000u) == 0u) continue;
@@ -2259,9 +2262,15 @@ public:
                     if (d > 0.0f && (zt == 0.0f || d < zt)) zt = d;
                 }
             if (zt <= 0.0f) zt = m_sceneDepth;
+            // The same burst as last frame (boxes overlapping): keep ITS depth for its whole life (28/09 evening: "les impacts
+            // semblent faire un peu loucher" -- re-measured every frame, a burst on a moving zombie hopped in depth).
+            for (const FxBox& o : m_fxPrevGroups)
+                if (b.x0 <= o.x1 + 16.0f && b.x1 >= o.x0 - 16.0f && b.y0 <= o.y1 + 16.0f && b.y1 >= o.y0 - 16.0f && o.zt > 0.0f) { zt = o.zt; break; }
+            b.zt = zt;
             b.group = 0;
             b.scale = (zt > 0.0f && b.z > 1e-3f) ? std::max(1.0f, 0.95f * zt / b.z) : 1.0f;
         }
+        m_fxPrevGroups = m_fxGroups;
         for (const FxBox& e : m_fxPrims) {
             const float s = m_fxGroups[e.group].scale;
             if (s == 1.0f) continue;
@@ -2276,8 +2285,8 @@ public:
                                              m_fxPrims.size(), m_fxGroups.size(), m_a2wScale, m_sceneDepth, m_fxGroups[0].x0, m_fxGroups[0].y0,
                                              m_fxGroups[0].x1, m_fxGroups[0].y1, m_fxGroups[0].z, m_fxGroups[0].scale));
     }
-    struct FxBox { uint32_t k; float x0, y0, x1, y1, z; uint32_t group; float scale = 1.0f; };
-    std::vector<FxBox> m_fxPrims, m_fxGroups;
+    struct FxBox { uint32_t k; float x0, y0, x1, y1, z; uint32_t group; float scale = 1.0f; float zt = 0.0f; };
+    std::vector<FxBox> m_fxPrims, m_fxGroups, m_fxPrevGroups;
     bool m_nearFxOn = false;
     // Near comfort on the CPU, the vertex stage's nearComfort (m2_vert.glsl): a distance in metres -> where it is drawn; a point
     // of the board camera's space (a2w metres per unit) slid along its ray the same way.

@@ -2540,6 +2540,28 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         m_dynSamples.push_back(gpuMs);
         const auto now = std::chrono::steady_clock::now();
+        {   // A refresh about to be missed reacts AT ONCE (28/09, Guillaume: "des fois j'ai eu un gros lag"; a heavy second of
+            // House of the Dead's demo at 20-27 ms waited up to two 400 ms windows before the scale fell -- a second of lost
+            // frames): two frames in a row over the period drop the scale now. Going back up stays slow (below).
+            const float hzU = arcadexr::xr::State().current > 1.0f ? arcadexr::xr::State().current : 90.0f;
+            const float periodU = (1000.0f / hzU) * ((m_m2CadenceActive || m_cadenceActive || appsw) ? 2.0f : 1.0f);
+            if (gpuMs > periodU) {
+                if (++m_dynOver >= 2) {
+                    const float targetU = periodU * std::max(0.5f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresBudget", 0.85f)));
+                    const float loU = std::max(0.3f, std::min(1.0f, arcadexr::config::GetFloat("m2.dynresMin", 0.5f)));
+                    const float nextU = std::max(loU, std::min(m_m2DynScale - 0.05f, m_m2DynScale * std::sqrt(targetU / gpuMs)));
+                    if (nextU < m_m2DynScale - 0.005f) {
+                        Log::Write(Log::Level::Info, Fmt("TCVR_DYNRES urgence gpu %.2f ms > %.2f ms deux images de suite : scale %.2f -> %.2f",
+                                                         gpuMs, periodU, m_m2DynScale, nextU));
+                        m_m2DynScale = nextU;
+                    }
+                    m_dynOver = 0; m_dynSamples.clear(); m_dynAt = now;
+                    return;
+                }
+            } else {
+                m_dynOver = 0;
+            }
+        }
         if (now - m_dynAt < std::chrono::milliseconds(400) || m_dynSamples.size() < 8) return;
         m_dynAt = now;
         std::vector<float> v = m_dynSamples;
@@ -2568,6 +2590,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
     }
     float m_m2DynScale{1.0f};
+    int m_dynOver{0};   // frames in a row over the refresh period (dynamic resolution's emergency drop)
     int m_flatK{0};
     std::chrono::steady_clock::time_point m_flatRoomSince{};
     std::vector<float> m_dynSamples;
