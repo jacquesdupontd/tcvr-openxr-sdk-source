@@ -2168,6 +2168,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // layer and the HUD sprites were on the virtual screen 2 m away, over a scene tens of metres deep. Now on the
         // camera's rays at the depth of the scene looked at (median of the aim's depth map, smoothed, updated once per
         // frame so both eyes agree), same angular size: they sit where the scene is. immersive.hudIso=0: the 2 m plane.
+        // Near comfort (28/09, the Model 2's method, see nearStereo in s22_scene_vert.glsl): perceived distance
+        // f(d) = d + nearMin (1 - d/nearStart)^2 below nearStart. Every game (the System 22 draws down to 5 mm from the eyes).
+        const bool nearOn = arcadexr::config::GetInt("s22.nearComfort", arcadexr::profiles::GetInt("immersive.nearComfort", 1)) != 0;
+        const float nearMinM = std::max(0.1f, arcadexr::config::GetFloat("m2.nearMin", 0.5f));
+        const float nearStartM = std::max(2.0f * nearMinM, arcadexr::config::GetFloat("m2.nearStart", 1.0f));
+        const auto nearF = [&](float dm) { if (!nearOn || dm >= nearStartM || dm <= 1e-6f) return dm; const float u = 1.0f - dm / nearStartM; return dm + nearMinM * u * u; };
         float hudD = distance;
         if (arcadexr::profiles::GetInt("immersive.hudIso", 1) != 0) {
             if (viewIndex == 0) {
@@ -2187,8 +2193,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             }
             if (m_s22HudDepth > 0.0f) {
                 hudD = std::min(arcadexr::config::GetFloat("s22.hudMaxDepth", 40.0f), m_s22HudDepth);
-                if (m_s22HudNear > 0.0f) hudD = std::min(hudD, 0.9f * m_s22HudNear);
-                hudD = std::max(1.2f, hudD);
+                // just in front of the nearest thing where it is PERCEIVED; never nearer than 0.45 m (1.2 m without near comfort)
+                if (m_s22HudNear > 0.0f) hudD = std::min(hudD, nearF(0.9f * m_s22HudNear));
+                hudD = std::max(arcadexr::config::GetFloat("hud.nearMin", nearOn ? 0.45f : 1.2f), hudD);
             }
         }
         const float hk = hudD / distance;
@@ -2209,6 +2216,30 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.merged = arcadexr::config::GetInt("s22.merged", 1) != 0;
         st.depthBias = arcadexr::config::GetFloat("s22.depthBiasRel", 8e-6f);   // validated by eye on Dirt Dash shadows (23/09)
         st.nearClip = nearMetres;
+        {   // near comfort: the cyclopean eye (half the inter-eye distance towards the other eye, same orientation)
+            if (viewIndex < 2) m_s22EyePosW[viewIndex] = layerView.pose.position;
+            st.nearParams[0] = nearMinM; st.nearParams[1] = nearStartM;
+            st.nearCyc[3] = 0.0f;
+            if (nearOn && viewIndex < 2) {
+                const float ex = m_s22EyePosW[1].x - m_s22EyePosW[0].x, ey = m_s22EyePosW[1].y - m_s22EyePosW[0].y, ez = m_s22EyePosW[1].z - m_s22EyePosW[0].z;
+                const float ipd = std::sqrt(ex * ex + ey * ey + ez * ez);
+                const XrVector3f unitX{1.0f, 0.0f, 0.0f};
+                XrVector3f rightW; XrQuaternionf_RotateVector3f(&rightW, &layerView.pose.orientation, &unitX);
+                const float h = (viewIndex == 0 ? 0.5f : -0.5f) * ((ipd > 0.03f && ipd < 0.09f) ? ipd : 0.0f);
+                XrPosef cyc = layerView.pose;
+                cyc.position = {cyc.position.x + rightW.x * h, cyc.position.y + rightW.y * h, cyc.position.z + rightW.z * h};
+                XrMatrix4x4f cycToWorld, worldToCyc, vpCyc, cycMvp, worldToArc;
+                XrMatrix4x4f_CreateFromRigidTransform(&cycToWorld, &cyc);
+                XrMatrix4x4f_InvertRigidBody(&worldToCyc, &cycToWorld);
+                XrMatrix4x4f_Multiply(&vpCyc, &projection, &worldToCyc);
+                XrMatrix4x4f_Multiply(&cycMvp, &vpCyc, &arcadeToWorld);
+                std::memcpy(st.nearCycMvp, cycMvp.m, sizeof(st.nearCycMvp));
+                XrMatrix4x4f_Invert(&worldToArc, &arcadeToWorld);
+                XrVector3f cycArc; XrMatrix4x4f_TransformVector3f(&cycArc, &worldToArc, &cyc.position);
+                st.nearCyc[0] = cycArc.x; st.nearCyc[1] = cycArc.y; st.nearCyc[2] = cycArc.z; st.nearCyc[3] = worldScale;
+            }
+            m_s22.SetAimNear(nearOn ? worldScale : 0.0f, nearMinM, nearStartM);
+        }
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");
             unsigned r = 0, g = 0, b = 0;
@@ -2723,6 +2754,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     CmdBuffer m_cmdBuffer[4]{};
     CmdBuffer m_mvCmd{};
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
+    XrVector3f m_s22EyePosW[2]{};   // near comfort: the eyes' positions (inter-eye distance)
     float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
     float m_s22HudNear = 0.0f;    // ... and of the nearest thing in the picture (m): the HUD stays just in front of it
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };

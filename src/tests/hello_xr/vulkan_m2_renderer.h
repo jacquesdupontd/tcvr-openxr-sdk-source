@@ -1090,9 +1090,9 @@ public:
             m_a2wRight = screen.right; m_a2wUp = upP; m_a2wNormal = normalP; m_a2wCam = camera; m_a2wScale = worldScale;
             m_a2wValid = true; m_depthNear = nearMetres; m_depthFar = farMetres;
             // Near comfort (see nearComfort in m2_vert.glsl): nothing of the game drawn nearer than m2.nearMin metres, the depths
-            // below m2.nearStart compressed. Games not driven (a driving camera's road is validated as is). Live props.
+            // below m2.nearStart compressed. Every game but Sega Rally (validated as is, 23/09). Live props.
             m_nearOn = arcadexr::config::GetInt("m2.nearComfort", arcadexr::profiles::GetInt("immersive.nearComfort",
-                                                arcadexr::profiles::IsDriving() ? 0 : 1)) != 0;
+                                                arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1)) != 0;   // every game but the validated Sega Rally
             m_nearMinM = std::max(0.1f, arcadexr::config::GetFloat("m2.nearMin", 0.5f));
             m_nearStartM = std::max(2.0f * m_nearMinM, arcadexr::config::GetFloat("m2.nearStart", 1.0f));
         }

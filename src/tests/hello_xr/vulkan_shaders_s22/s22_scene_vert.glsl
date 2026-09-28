@@ -13,6 +13,18 @@ layout(location = 3) flat out int vPrim;
 layout(location = 4) flat out uvec4 vP0;
 layout(location = 5) flat out uvec4 vP1;
 uint u8(float x) { return uint(clamp(x + 0.5, 0.0, 255.0)); }
+// Near comfort (28/09, same as the Model 2's nearStereo in m2_vert.glsl): a point nearer than NearParams.y metres keeps its
+// place; only the disparity shrinks, to that of f(d) = d + NearParams.x (1 - d / NearParams.y)^2 -- perceived at f(d), never
+// nearer than NearParams.x, each eye keeping a true perspective (textures do not move). The aim (RayCast) and the HUD use f.
+vec4 nearStereo(vec3 P) {
+    vec4 ce = ImmersiveMvp * vec4(P, 1.0);
+    if (NearCyc.w <= 0.0 || P.z <= 0.0) return ce;
+    float d = length(P - NearCyc.xyz) * NearCyc.w;
+    if (d >= NearParams.y || d < 1e-6) return ce;
+    float t = 1.0 - d / NearParams.y;
+    float k = d / (d + NearParams.x * t * t);
+    return mix(ImmersiveMvpCyc * vec4(P, 1.0), ce, k);
+}
 void main() {
     vec2 ScreenSize = ScreenOut.xy;
     int p = int(aMeta.y + 0.5);
@@ -42,7 +54,7 @@ void main() {
                 d = max(d, DepthInfo.w);
                 float zoom = max(t9.z, 1e-6);
                 vec3 cam = vec3((sx - ScreenSize.x * 0.5) * d / zoom, (ScreenSize.y * 0.5 - sy) * d / zoom, d);
-                gl_Position = ImmersiveMvp * vec4(cam, 1.0);
+                gl_Position = nearStereo(cam);
                 gl_Position.z = Bias.w * (1.0 + Bias.x * float(p));   // reversed infinite depth, painter order as a relative offset
                 vTex = aTex; vOriginalDepth = d; vPrim = p;
                 return;
@@ -63,7 +75,7 @@ void main() {
         float cameraX = (aPos.x + (t0.z - ScreenSize.x * 0.5) * aPos.z) / zoom;
         float cameraY = (aPos.y + (ScreenSize.y * 0.5 - t0.w) * aPos.z) / zoom;
         vScreen = vec2(t0.z + aPos.x / max(aPos.z, 1e-6), t0.w - aPos.y / max(aPos.z, 1e-6));
-        gl_Position = ImmersiveMvp * vec4(cameraX, cameraY, aPos.z, 1.0);
+        gl_Position = nearStereo(vec3(cameraX, cameraY, aPos.z));
         gl_Position.z = Bias.w * (1.0 + Bias.x * float(p));   // reversed infinite depth, painter order as a relative offset
         vTex = aTex + 0.5;
         vOriginalDepth = aPos.z;

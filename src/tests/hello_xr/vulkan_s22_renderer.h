@@ -65,6 +65,9 @@ public:
         uint32_t FadeColor[4];
         float Bias[4];
         uint32_t Tex[4];      // texture address chain: VMask, RowMask, TileMask, ShadeMax (tcvr_scene_assets)
+        float ImmersiveMvpCyc[16];   // near comfort: this eye's projection from the cyclopean eye
+        float NearCyc[4];            // near comfort: cyclopean eye in the game camera's space, metres per unit (0 = off)
+        float NearParams[4];         // near comfort: nearest perceived distance, start of the compression (metres)
     };
 
     struct Settings {
@@ -76,6 +79,11 @@ public:
         // (2.5e-7 = ~4 ulp between consecutive primitives). The old per-game values were for the standard
         // mapping, whose precision collapsed with distance (Dirt Dash's far shadows flashed on the road).
         float depthBias = 2.5e-7f;
+        // Near comfort (28/09, see nearStereo in s22_scene_vert.glsl): this eye seen from the cyclopean eye, the cyclopean
+        // eye in the game camera's space and metres per unit (w, 0 = off), nearest perceived distance and start (metres).
+        float nearCycMvp[16] = {};
+        float nearCyc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float nearParams[4] = {0.5f, 1.0f, 0.0f, 0.0f};
         float nearClip = 0.005f;
         int voidMode = 0;              // 0 game bg, 1 fog colour (slate if black), 2 fixed
         unsigned voidRGB[3] = {28, 30, 38};
@@ -972,6 +980,9 @@ public:
 
     // Immersive aim (port of SceneRenderer::RayCast): march the ray in board camera space until it meets
     // the depth map. False when it leaves the screen or meets nothing.
+    // Near comfort for the aim: metres per unit (0 = off), nearest perceived distance, start (metres).
+    void SetAimNear(float a2w, float nearMin, float nearStart) { m_aimNear[0] = a2w; m_aimNear[1] = nearMin; m_aimNear[2] = nearStart; }
+    float m_aimNear[3] = {0.0f, 0.5f, 1.0f};
     bool RayCast(const float o[3], const float d[3], int screenW, int screenH, float& sx, float& sy, float hit[3]) const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || d[2] <= 1e-6f) return false;
         const float zoom = m_lastZoom > 0.0f ? m_lastZoom : 1.0f;
@@ -982,7 +993,12 @@ public:
             if (p[2] <= 1.0f) return 0;
             x = screenW * 0.5f + zoom * p[0] / p[2]; y = screenH * 0.5f - zoom * p[1] / p[2];
             if (x < 0.0f || y < 0.0f || x >= screenW || y >= screenH) return -1;
-            const float depth = m_depthCpu[size_t(int(y * ky)) * m_depthCpuW + size_t(int(x * kx))];
+            float depth = m_depthCpu[size_t(int(y * ky)) * m_depthCpuW + size_t(int(x * kx))];
+            if (depth > 0.0f && m_aimNear[0] > 0.0f) {   // near comfort: the surface where it is PERCEIVED (f, nearStereo)
+                const float tx = (x - screenW * 0.5f) / zoom, ty = (screenH * 0.5f - y) / zoom;
+                const float dist = depth * std::sqrt(1.0f + tx * tx + ty * ty) * m_aimNear[0];
+                if (dist < m_aimNear[2] && dist > 1e-6f) { const float u = 1.0f - dist / m_aimNear[2]; depth *= (dist + m_aimNear[1] * u * u) / dist; }
+            }
             return (depth > 0.0f && p[2] >= depth) ? 1 : 0;
         };
         float t = (100.0f - o[2]) / d[2];
@@ -1113,6 +1129,11 @@ private:
     void FillCommonUbo(Ubo& u, const float* mvp, const float* hud, float outW, float outH) {
         const tcvr_scene_frame& f = m_frame;
         if (mvp) std::memcpy(u.ImmersiveMvp, mvp, 64);
+        if (mvp) {
+            std::memcpy(u.ImmersiveMvpCyc, m_settings.nearCyc[3] > 0.0f ? m_settings.nearCycMvp : mvp, 64);
+            std::memcpy(u.NearCyc, m_settings.nearCyc, sizeof(u.NearCyc));
+            std::memcpy(u.NearParams, m_settings.nearParams, sizeof(u.NearParams));
+        }
         if (hud) std::memcpy(u.HudMvp, hud, 64);
         u.ScreenOut[0] = float(f.width); u.ScreenOut[1] = float(f.height);
         u.ScreenOut[2] = outW / float(std::max(1, f.width)); u.ScreenOut[3] = outH / float(std::max(1, f.height));
