@@ -43,6 +43,17 @@ uvec3 mixText(ivec2 p, uvec3 dest, int prival) {
         else rgb = dest;
     } else {
         rgb = penRGB(src); pen = src;
+        // Immersive (28/09, Time Crisis II: "un gros rectangle noir devant nous qui bouge en inverse de notre tête", then two
+        // black bars): the text layer's big BLACK areas -- letterbox bands, story boxes -- were the edges of a flat screen.
+        // A black texel whose four neighbours 3 texels away are black too lies inside such an area: transparent. The
+        // text and its thin outline stay.
+        if (Flags.x != 0 && Flags.y != 0 && max(rgb.r, max(rgb.g, rgb.b)) <= 8u) {
+            ivec2 hi = ivec2(OutText.zw) - 1;
+            uvec3 a = penRGB(textAt(clamp(p + ivec2(3, 0), ivec2(0), hi))), b = penRGB(textAt(clamp(p - ivec2(3, 0), ivec2(0), hi)));
+            uvec3 c = penRGB(textAt(clamp(p + ivec2(0, 3), ivec2(0), hi))), d = penRGB(textAt(clamp(p - ivec2(0, 3), ivec2(0), hi)));
+            uvec3 m = max(max(a, b), max(c, d));
+            if (max(m.r, max(m.g, m.b)) <= 8u) return dest;
+        }
     }
     if (spot && pen >= 0x80u) {
         uint factor = (uint(Mix0.y) * (pen & 0x7fu)) >> 7u;

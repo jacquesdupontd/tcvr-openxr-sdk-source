@@ -330,6 +330,14 @@ public:
     void SetTextDiag(int on) { m_textDiag = on; }
     void RequestPrimDump() { m_dumpPrims = true; }
     bool m_dumpPrims = false;
+    std::chrono::steady_clock::time_point m_polyDiagAt{};   // TCVR_S22POLY, once a second (s22.polyDiag)
+    bool m_dropBands = false;      // immersive: letterbox bands of cutscenes not drawn (SetDropBands)
+    uint32_t m_bandsDropped = 0, m_bandNear = 0;   // bands dropped; facing polygons near enough to be one (diag)
+    float m_bandBox[5] = {}, m_bandSceneZ = 0.0f;
+    void SetDropBands(bool on, float a2w = 0.0f) { m_dropBands = on; m_bandA2w = a2w; }
+    float m_bandA2w = 0.0f;   // metres per unit (camera-attached test)
+    uint32_t BandsDropped() const { return m_bandsDropped; }
+    std::string BandDiag() const { return Fmt("near facing %u last %.0f,%.0f..%.0f,%.0f z %.1f scene z %.0f drop %d", m_bandNear, m_bandBox[0], m_bandBox[1], m_bandBox[2], m_bandBox[3], m_bandBox[4], m_bandSceneZ, int(m_dropBands)); }
     int m_textDiag = 0;
     int m_hudSharp = 3;
     static constexpr uint32_t kBankMips = 9;   // 4096 .. 16
@@ -527,6 +535,39 @@ public:
         m_slot = slot & 1;
         Slot& S = m_slots[m_slot];
         const auto tBuild = std::chrono::steady_clock::now();
+        if (arcadexr::config::GetInt("s22.polyDiag", 0) != 0 && tBuild - m_polyDiagAt > std::chrono::seconds(1)) {
+            // TCVR_S22POLY (28/09, Time Crisis II's black boxes in front of the characters): the 8 largest polygons of this
+            // frame on the board -- kind, direct, textured, depth, box, pens, alpha -- to find what draws them.
+            m_polyDiagAt = tBuild;
+            struct Big { float area, x0, y0, x1, y1, z0, z1; uint32_t i; };
+            std::vector<Big> big;
+            for (uint32_t i = 0; i < f.prim_count; ++i) {
+                const tcvr_scene_prim& p = f.prims[i];
+                if (p.vertex_count < 3) continue;
+                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                for (uint32_t k = 0; k < p.vertex_count; ++k) {
+                    const tcvr_scene_vertex& v = f.vertices[p.first_vertex + k];
+                    float sx, sy;
+                    if (p.kind == 1 || p.direct) { sx = float(p.cx) + v.x; sy = float(p.cy) - v.y; }
+                    else { const float zz = std::max(v.z, 1e-6f); sx = float(p.cx) + v.x / zz; sy = float(p.cy) - v.y / zz; }
+                    x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                    z0 = std::min(z0, v.z); z1 = std::max(z1, v.z);
+                }
+                x0 = std::max(x0, 0.0f); y0 = std::max(y0, 0.0f); x1 = std::min(x1, float(f.width)); y1 = std::min(y1, float(f.height));
+                if (x1 <= x0 || y1 <= y0) continue;
+                big.push_back({(x1 - x0) * (y1 - y0), x0, y0, x1, y1, z0, z1, i});
+            }
+            std::sort(big.begin(), big.end(), [](const Big& a, const Big& b) { return a.area > b.area; });
+            std::string line;
+            for (size_t k = 0; k < big.size() && k < 8; ++k) {
+                const Big& b = big[k]; const tcvr_scene_prim& p = f.prims[b.i];
+                const uint32_t pen0 = (f.pens && p.pens_offset < f.pen_count) ? f.pens[p.pens_offset] : 0u;
+                line += Fmt(" [#%u k%u d%u tex%u box %.0f,%.0f..%.0f,%.0f z %.3g..%.3g pens %u(%06x) a%d/%u fade%u clip %d,%d..%d,%d]", b.i, p.kind, p.direct,
+                            p.texture_enabled, b.x0, b.y0, b.x1, b.y1, b.z0, b.z1, p.pens_offset, pen0, p.alpha, p.alpha_enabled, p.fade_enabled,
+                            p.clip_l, p.clip_t, p.clip_r, p.clip_b);
+            }
+            Log::Write(Log::Level::Info, Fmt("TCVR_S22POLY %u prims:%s", f.prim_count, line.c_str()));
+        }
         m_vertexData.clear(); m_indexData.clear(); m_primData.clear(); m_runs.clear(); m_ranges.clear();
         std::uint32_t lastPolyIndex = 0; (void)lastPolyIndex;
         bool anyPoly = false;
@@ -635,9 +676,37 @@ public:
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
             m_primData.insert(m_primData.end(), row, row + 64);
         };
+        // Letterbox bands of a cutscene (28/09, Time Crisis II: "un gros rectangle noir devant nous qui bouge en inverse de
+        // notre tête", then two black bars): a polygon facing the camera at ONE depth, twenty times nearer than the scene
+        // (z 78 against thousands: 3 cm from the eyes in the headset), full width against the top or bottom edge (or full
+        // height against a side) -- the edge of a flat screen. Dropped in immersive like the Model 2's bands; flat keeps it.
+        const float sceneZ = SceneDepthUnits();
+        const float bw = float(std::max(1, f.width)), bh = float(std::max(1, f.height));
+        auto isBand = [&](const tcvr_scene_prim& pr, const tcvr_scene_vertex* v) -> bool {
+            if (!m_dropBands || pr.kind != 0 || pr.direct) return false;
+            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+            for (uint32_t k = 0; k < pr.vertex_count; ++k) {
+                const float zz = std::max(v[k].z, 1e-6f);
+                const float sx = float(pr.cx) + v[k].x / zz, sy = float(pr.cy) - v[k].y / zz;
+                x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                z0 = std::min(z0, v[k].z); z1 = std::max(z1, v[k].z);
+            }
+            // camera-attached: nearer than 15 cm in the headset, or twenty times nearer than the scene
+            const bool nearCam = (m_bandA2w > 0.0f && z0 * m_bandA2w < 0.15f) || (sceneZ > 0.0f && z0 < 0.05f * sceneZ);
+            if (z0 <= 0.0f || z1 - z0 > 0.01f * z0 || !nearCam) return false;
+            // the VISIBLE part: a band polygon runs past the screen's edge (Time Crisis II's: y 415..656 of 480)
+            x0 = std::max(x0, 0.0f); y0 = std::max(y0, 0.0f); x1 = std::min(x1, bw); y1 = std::min(y1, bh);
+            if (x1 <= x0 || y1 <= y0) return false;
+            ++m_bandNear; m_bandBox[0] = x0; m_bandBox[1] = y0; m_bandBox[2] = x1; m_bandBox[3] = y1; m_bandBox[4] = z0;
+            const bool fullW = x0 <= 0.05f * bw && x1 >= 0.95f * bw, fullH = y0 <= 0.05f * bh && y1 >= 0.95f * bh;
+            return (fullW && y1 - y0 <= 0.35f * bh && (y0 <= 0.05f * bh || y1 >= 0.95f * bh)) ||
+                   (fullH && x1 - x0 <= 0.35f * bw && (x0 <= 0.05f * bw || x1 >= 0.95f * bw));
+        };
+        m_bandsDropped = 0; m_bandNear = 0; m_bandSceneZ = sceneZ;
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
             if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
+            if (isBand(pr, f.vertices + pr.first_vertex)) { ++m_bandsDropped; continue; }
             emit(pr, f.vertices + pr.first_vertex, m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0);
         }
         if (m_altFix)

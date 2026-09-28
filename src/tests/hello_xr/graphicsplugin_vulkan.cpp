@@ -2128,6 +2128,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 0) != 0);   // off: the arcade flicker is kept (Guillaume 23/09)
         m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 4096));
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
+        m_s22.SetDropBands(want && arcadexr::profiles::GetInt("immersive.dropBands", 1) != 0, m_s22AnchorValid ? m_s22AnchorScale : 0.0f);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
         m_s22Prepared = true;
         if (!want) return;   // flat: drawn after the Model 2 flat block (RenderSystem22Flat)
@@ -2208,6 +2209,27 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         hudToWorld.m[4] = screen.up.x * screen.height * hk; hudToWorld.m[5] = screen.up.y * screen.height * hk; hudToWorld.m[6] = screen.up.z * screen.height * hk;
         hudToWorld.m[8] = screen.normal.x; hudToWorld.m[9] = screen.normal.y; hudToWorld.m[10] = screen.normal.z;
         hudToWorld.m[12] = hudCenter.x; hudToWorld.m[13] = hudCenter.y; hudToWorld.m[14] = hudCenter.z; hudToWorld.m[15] = 1.0f;
+        {   // HUD ISO (28/09, the Model 2's hudMvpAt): each 2D pixel on the game camera's ray through it, at hudD -- over
+            // exactly the pixels it covers in the immersive view. The plane above had the virtual screen's size, smaller than
+            // the game's field of view: Time Crisis II's ammo sat "pas assez sur les côtés". s22.hudIso=0 = the old plane.
+            const float zoomS = m_s22.Zoom();
+            const int bw = m_s22Frame ? m_s22Frame->width : 0, bh = m_s22Frame ? m_s22Frame->height : 0;
+            if (viewIndex == 0) {   // TCVR_S22HUD once a second: the camera zoom the ISO plane follows, and its distance
+                static std::chrono::steady_clock::time_point s_at{};
+                const auto nowH = std::chrono::steady_clock::now();
+                if (nowH - s_at > std::chrono::seconds(1)) {
+                    s_at = nowH;
+                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m bands dropped %u | %s", zoomS, bw, bh, hudD, m_s22.BandsDropped(), m_s22.BandDiag().c_str()));
+                }
+            }
+            if (arcadexr::config::GetInt("s22.hudIso", 1) != 0 && zoomS > 1e-3f && bw > 0 && bh > 0 && worldScale > 1e-9f) {
+                const float zh = hudD / worldScale;
+                XrMatrix4x4f Hm{};
+                Hm.m[0] = float(bw) / zoomS * zh; Hm.m[5] = float(bh) / zoomS * zh; Hm.m[10] = 1.0f;
+                Hm.m[14] = zh; Hm.m[15] = 1.0f;
+                XrMatrix4x4f_Multiply(&hudToWorld, &arcadeToWorld, &Hm);
+            }
+        }
         XrMatrix4x4f hudMvp;
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
         arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
