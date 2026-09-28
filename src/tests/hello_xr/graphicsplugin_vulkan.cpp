@@ -2048,7 +2048,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_viewportScale = 1.0f;
         m_s22Prepared = false;
         // Namco System 23 (Time Crisis II, 28/09): its driver records the same scene format (tcvr_scene.h, texture
-        // masks in the assets), this module draws it. Behind s23.vkFlat / s23.immersive until validated.
+        // masks in the assets), this module draws it. Flat oracle identical to MAME's raster (MAE 0.1-0.4, letterbox
+        // and stencil text included); s23.vkFlat=0 returns to MAME's CPU framebuffer.
         const bool s23 = arcadexr::profiles::IsSystem23();
         const bool isS22 = (arcadexr::profiles::IsSystem22() || s23) && s22::HaveSceneSource();
         // Vulkan: System 22 is ALWAYS drawn by the GPU module, flat or immersive. The stored "render=cpu /
@@ -2059,7 +2060,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                           arcadexr::config::GetInt("s22.vk", 1) != 0;
         // SCREEN presentation drawn by the GPU too (s22.vkFlat=0 returns to MAME's CPU framebuffer).
         const bool wantFlat = isS22 && !want && arcadexr::profiles::GetString("presentation", "screen") != "immersive" &&
-                              arcadexr::config::GetInt(s23 ? "s23.vkFlat" : "s22.vkFlat", s23 ? 0 : 1) != 0;
+                              arcadexr::config::GetInt(s23 ? "s23.vkFlat" : "s22.vkFlat", 1) != 0;
         m_s22FlatWanted = wantFlat;
         const int mode = (want || wantFlat) ? (arcadexr::config::GetInt("s22.cpuRaster", 0) ? 1 : 2) : 0;
         {   // Arcade cadence: 120 Hz display while a System 22 game is immersive, back to the baked rate after.
