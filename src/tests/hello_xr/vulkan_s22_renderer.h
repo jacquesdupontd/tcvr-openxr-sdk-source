@@ -81,6 +81,7 @@ public:
         float depthBias = 2.5e-7f;
         // Near comfort (28/09, see nearStereo in s22_scene_vert.glsl): this eye seen from the cyclopean eye, the cyclopean
         // eye in the game camera's space and metres per unit (w, 0 = off), nearest perceived distance and start (metres).
+        uint32_t fullW = 0, fullH = 0;   // the swapchain image's size: the merged target is allocated once at it
         float nearCycMvp[16] = {};
         float nearCyc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float nearParams[4] = {0.5f, 1.0f, 0.0f, 0.0f};
@@ -813,12 +814,16 @@ public:
                          VkExtent2D ext, const Settings& st) {
         Slot& S = m_slots[m_slot];
         MergedTarget& M = m_mt[eye];
-        if (M.w != ext.width || M.h != ext.height) {
+        // Allocated ONCE at the swapchain's full size (st.fullW/H), the dynamic resolution only changes the rendered AREA
+        // (28/09: every scale change rebuilt the target behind a vkDeviceWaitIdle -- 8 to 16 rebuilds in 20 s of Time
+        // Crisis II, a hitch every 2-3 s). The attachments are lazily allocated (on-tile): the size costs no memory.
+        const uint32_t capW = std::max(ext.width, st.fullW), capH = std::max(ext.height, st.fullH);
+        if (M.w < ext.width || M.h < ext.height || M.w == 0) {
             vkDeviceWaitIdle(m_dev);
             for (auto it = m_mergedFbs.begin(); it != m_mergedFbs.end();)
                 if (it->eye == int(eye)) { vkDestroyFramebuffer(m_dev, it->fb, nullptr); vkDestroyImageView(m_dev, it->view, nullptr); it = m_mergedFbs.erase(it); }
                 else ++it;
-            DestroyMergedTarget(M); CreateMergedTarget(M, ext.width, ext.height); m_setsDirty = true;
+            DestroyMergedTarget(M); CreateMergedTarget(M, capW, capH); m_setsDirty = true;
         }
         UpdateSetsIfDirty();
         m_settings = st;
@@ -833,7 +838,7 @@ public:
             VkImageView v[6] = {M.msColor.view, M.msPri.view, M.depth.view, M.rColor.view, M.rPri.view, f.view};
             VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
             fi.renderPass = m_rpMerged; fi.attachmentCount = 6; fi.pAttachments = v;
-            fi.width = ext.width; fi.height = ext.height; fi.layers = 1;
+            fi.width = M.w; fi.height = M.h; fi.layers = 1;   // the whole target; the pass renders ext of it
             XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_dev, &fi, nullptr, &f.fb));
             m_mergedFbs.push_back(f); fb = f.fb;
         }

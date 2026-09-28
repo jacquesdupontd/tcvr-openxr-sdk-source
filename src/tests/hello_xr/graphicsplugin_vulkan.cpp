@@ -2252,6 +2252,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         st.spriteMinDepth = arcadexr::config::GetFloat("immersive.spriteMinDepth", 50.0f);
         const float scale = std::max(0.3f, std::min(2.0f, arcadexr::profiles::GetFloat("immersive.scale", 1.0f)));
         VkExtent2D ext{uint32_t(swapchainData->Width()), uint32_t(swapchainData->Height())};
+        st.fullW = ext.width; st.fullH = ext.height;
         float renderScale = scale;
         if (renderArea.extent.width < ext.width) { ext = renderArea.extent; renderScale = 1.0f; }   // sub-rectangle: already scaled
         return m_s22.RenderEye(cmd, viewIndex, mvp.m, hudMvp.m, swapchainData->GetTypedImage(imageIndex).image, ext, renderArea, renderScale, st);
