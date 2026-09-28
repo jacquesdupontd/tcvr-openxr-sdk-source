@@ -49,6 +49,10 @@ struct M2UniformBufferObject {
     int32_t padEnd[3];       // 12 bytes, offset 300
     int32_t uBoardLod;       // 4 bytes, offset 312: 1 = the board's mip level (-texlod + log2 z) in the exact path
     float uLift;             // 4 bytes, offset 316: brightness curve exponent (1 = exact colours, < 1 = lighter)
+    float uNearA2w;          // 4 bytes, offset 320: near comfort, metres per arcade unit (0 = off)
+    float uNearMin;          // 4 bytes, offset 324: the nearest a point is drawn, metres
+    float uNearStart;        // 4 bytes, offset 328: distances below this are compressed, metres
+    float padNear;           // 4 bytes, offset 332
 };
 
 struct VoidPushConstants {

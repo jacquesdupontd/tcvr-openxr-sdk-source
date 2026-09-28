@@ -56,6 +56,9 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     int uTexImplicit;   // bit 0: texture() with implicit derivatives; bit 1: use the texture array
     int uBoardLod;      // 1: the board's mip level in the exact path (m2.boardLod)
     float uLift;        // brightness curve exponent (1 = the game's exact colours, < 1 = lighter; menu LUMINOSITE)
+    float uNearA2w;     // (vertex stage) near comfort
+    float uNearMin;
+    float uNearStart;
 };
 
 struct Prim {

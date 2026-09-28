@@ -512,6 +512,10 @@ public:
                     // background plate against the bottom edge caught by the same test blacked out a third of the view.
                     const bool front = k < std::max<std::uint32_t>(8u, n / 20u);
                     if (facing && ((fullW && fullH) || (band && front))) {
+                        if (fullW && fullH) ++m_clsFrameFull; else ++m_clsFrameBand;
+                        m_cls.ovBox[0] = std::min(m_cls.ovBox[0], x0); m_cls.ovBox[1] = std::min(m_cls.ovBox[1], y0);
+                        m_cls.ovBox[2] = std::max(m_cls.ovBox[2], x1); m_cls.ovBox[3] = std::max(m_cls.ovBox[3], y1);
+                        m_cls.ovZ = zmin;
                         q.rgb |= 0x2000000u;
                         if (!(fullW && fullH)) q.rgb |= 0x4000000u;   // letterbox band: dropped in immersive
                         if (arcadexr::config::GetInt("m2.overlayDiag", 0) != 0)
@@ -526,15 +530,25 @@ public:
                 // translucent, in the main view, entirely nearer than half a metre in the headset AND than a quarter of the
                 // scene's depth (rain around the camera, 2 m away, stays in 3D): PushNearEffects()
                 // moves each burst along its camera rays onto what it covers. The depth probes and the aim skip them.
+                // Only a small thing wholly inside the picture (28/09 evening: without that, rain drops grazing the camera at 2 cm
+                // and the fountain's translucent water as the camera ran along it were pushed too -- "un bout de la fontaine se
+                // sépare en deux"). A spark polygon is at most ~70 px; a world surface that close projects far off the frame.
                 if (m_nearFxOn && vc >= 3 && q.textured != 0u && q.translucent != 0u && m_sceneDepth > 0.0f &&
                     q.center_x == mainCx && q.center_y == mainCy) {
                     float zmax = 0.0f; bool inFront = true;
+                    float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
                     for (std::uint32_t v = 0; v < vc; v++) {
-                        const float z = frame.raw_vertices[p.first_vertex + v].z;
-                        if (z <= 1e-3f) { inFront = false; break; }
-                        zmax = std::max(zmax, z);
+                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                        if (rv.z <= 1e-3f) { inFront = false; break; }
+                        zmax = std::max(zmax, rv.z);
+                        const float sx = float(frame.crtc_xoffset + p.center_x) + rv.x / rv.z;
+                        const float sy = float((384 - p.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
+                        bx0 = std::min(bx0, sx); bx1 = std::max(bx1, sx); by0 = std::min(by0, sy); by1 = std::max(by1, sy);
                     }
-                    if (inFront && zmax < 0.25f * m_sceneDepth && zmax * m_a2wScale < 0.5f) q.rgb |= 0x8000000u;
+                    const bool small = bx1 - bx0 <= 128.0f && by1 - by0 <= 128.0f;
+                    const bool inside = bx0 >= float(p.clip_l) - 16.0f && bx1 <= float(p.clip_r) + 16.0f &&
+                                        by0 >= float(p.clip_t) - 16.0f && by1 <= float(p.clip_b) + 16.0f;
+                    if (inFront && small && inside && zmax < 0.25f * m_sceneDepth && zmax * m_a2wScale < 0.5f) q.rgb |= 0x8000000u;
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
                     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
@@ -659,6 +673,19 @@ public:
                 }
                 if (invisible) {
                 } else if (!isGlass && !isMain) {
+                    {   // TCVR_CLASS (28/09): polygons drawn FLAT as a secondary view, where they are, which camera
+                        ++m_clsFrameSec;
+                        for (std::uint32_t v = 0; v < vc; v++) {
+                            const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                            if (rv.z <= 1e-3f) continue;
+                            const float sx = float(frame.crtc_xoffset + q.center_x) + rv.x / rv.z;
+                            const float sy = float((384 - q.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
+                            m_cls.secBox[0] = std::min(m_cls.secBox[0], sx); m_cls.secBox[1] = std::min(m_cls.secBox[1], sy);
+                            m_cls.secBox[2] = std::max(m_cls.secBox[2], sx); m_cls.secBox[3] = std::max(m_cls.secBox[3], sy);
+                        }
+                        m_cls.secCam = {q.center_x, q.center_y, q.clip_l, q.clip_t, q.clip_r, q.clip_b};
+                        m_cls.mainCam = {mainCx, mainCy, mainL, mainT, mainR, mainB};
+                    }
                     for (std::uint32_t t = 1; t + 1 < vc; t++) {
                         rawSecIdx.push_back(q.first_vertex);
                         rawSecIdx.push_back(q.first_vertex + t);
@@ -738,6 +765,57 @@ public:
             SceneDepthProbe(frame, mainCx, mainCy);
             RasterArcadeDepth(frame, mainCx, mainCy);
             PushNearEffects(frame, mainCx, mainCy);
+            {   // fold this frame into the second's TCVR_CLASS summary
+                if (m_clsFrameSec) { ++m_cls.secFrames; m_cls.secMax = std::max(m_cls.secMax, m_clsFrameSec); }
+                if (m_clsFrameFull || m_clsFrameBand) { ++m_cls.ovFrames; m_cls.fullMax = std::max(m_cls.fullMax, m_clsFrameFull); m_cls.bandMax = std::max(m_cls.bandMax, m_clsFrameBand); }
+                if (!m_fxPrims.empty()) {
+                    ++m_cls.fxFrames; m_cls.fxMax = std::max<unsigned>(m_cls.fxMax, unsigned(m_fxPrims.size()));
+                    const FxBox& g = m_fxGroups[0];
+                    m_cls.fxBox[0] = std::min(m_cls.fxBox[0], g.x0); m_cls.fxBox[1] = std::min(m_cls.fxBox[1], g.y0);
+                    m_cls.fxBox[2] = std::max(m_cls.fxBox[2], g.x1); m_cls.fxBox[3] = std::max(m_cls.fxBox[3], g.y1);
+                    m_cls.fxZ = g.z * m_a2wScale; m_cls.fxScale = g.scale;
+                }
+                m_clsFrameSec = m_clsFrameFull = m_clsFrameBand = 0;
+                ++m_cls.frames;
+            }
+            {   // TCVR_NEAR, once a second (28/09, Guillaume squints "au sol près des escaliers", "quand l'oiseau attrape la
+                // femme"): how near the game's geometry comes on screen, in metres, and where the HUD plane is. The arcade
+                // depth map (near-clipped, overlays and pushed effects excluded): nearest, 2nd percentile, and the board
+                // position of the nearest (a floor at the bottom edge, or a thing in the middle).
+                const auto now = std::chrono::steady_clock::now();
+                if (m_a2wScale > 1e-6f && now - m_nearLogAt > std::chrono::seconds(1)) {
+                    m_nearLogAt = now;
+                    // TCVR_CLASS: what the second drew OUTSIDE the plain 3D -- flat secondary views, screen veils or bands,
+                    // effects pushed off the camera (frames of the second that had any, most in one frame, where)
+                    if (m_cls.secFrames || m_cls.ovFrames || m_cls.fxFrames) {
+                        const Cls& c = m_cls;
+                        Log::Write(Log::Level::Info, Fmt("TCVR_CLASS %u frames | vue secondaire (a plat) %u frames max %u box %.0f,%.0f..%.0f,%.0f camera %d,%d clip %d,%d..%d,%d (principale %d,%d clip %d,%d..%d,%d)"
+                            " | voiles plein %u bande %u (%u frames) box %.0f,%.0f..%.0f,%.0f z %.2f | effets repousses %u frames max %u box %.0f,%.0f..%.0f,%.0f a %.2f m x%.1f",
+                            c.frames, c.secFrames, c.secMax, c.secBox[0], c.secBox[1], c.secBox[2], c.secBox[3],
+                            c.secCam[0], c.secCam[1], c.secCam[2], c.secCam[3], c.secCam[4], c.secCam[5],
+                            c.mainCam[0], c.mainCam[1], c.mainCam[2], c.mainCam[3], c.mainCam[4], c.mainCam[5],
+                            c.fullMax, c.bandMax, c.ovFrames, c.ovBox[0], c.ovBox[1], c.ovBox[2], c.ovBox[3], c.ovZ,
+                            c.fxFrames, c.fxMax, c.fxBox[0], c.fxBox[1], c.fxBox[2], c.fxBox[3], c.fxZ, c.fxScale));
+                    }
+                    m_cls = Cls{};
+                    m_nearTmp.clear();
+                    float best = 0.0f; int bx = 0, by = 0;
+                    for (int y = 0; y < kArcH; ++y)
+                        for (int x = 0; x < kArcW; ++x) {
+                            const float d = m_arcDepthCpu[size_t(y) * kArcW + size_t(x)];
+                            if (d <= 0.0f) continue;
+                            m_nearTmp.push_back(d);
+                            if (best == 0.0f || d < best) { best = d; bx = x; by = y; }
+                        }
+                    if (!m_nearTmp.empty()) {
+                        const size_t k2 = m_nearTmp.size() / 50;
+                        std::nth_element(m_nearTmp.begin(), m_nearTmp.begin() + long(k2), m_nearTmp.end());
+                        Log::Write(Log::Level::Info, Fmt("TCVR_NEAR geometry nearest %.2f m at board %d,%d (2%% %.2f m) | under HUD %.2f m | HUD plane %.2f m | scene %.2f m",
+                            best * m_a2wScale, int((bx + 0.5f) * 496.0f / kArcW), int((by + 0.5f) * 384.0f / kArcH), m_nearTmp[k2] * m_a2wScale,
+                            m_hudNear * m_a2wScale, m_lastHudZ * m_a2wScale, m_sceneDepth * m_a2wScale));
+                    }
+                }
+            }
             // Smooth motion for a Model 2 game (25/09, profile immersive.smoothMotion2: Sega Rally first): polygons carry
             // their identity in the prim (object address, rank, copy) instead of Model 1's u/v.
             m_m2Smooth = !m_directColour && !m_flatMode &&
@@ -1009,6 +1087,12 @@ public:
         if (viewIndex == 0 && !m_flatMode) {
             m_a2wRight = screen.right; m_a2wUp = upP; m_a2wNormal = normalP; m_a2wCam = camera; m_a2wScale = worldScale;
             m_a2wValid = true; m_depthNear = nearMetres; m_depthFar = farMetres;
+            // Near comfort (see nearComfort in m2_vert.glsl): nothing of the game drawn nearer than m2.nearMin metres, the depths
+            // below m2.nearStart compressed. Games not driven (a driving camera's road is validated as is). Live props.
+            m_nearOn = arcadexr::config::GetInt("m2.nearComfort", arcadexr::profiles::GetInt("immersive.nearComfort",
+                                                arcadexr::profiles::IsDriving() ? 0 : 1)) != 0;
+            m_nearMinM = std::max(0.1f, arcadexr::config::GetFloat("m2.nearMin", 0.5f));
+            m_nearStartM = std::max(2.0f * m_nearMinM, arcadexr::config::GetFloat("m2.nearStart", 1.0f));
         }
 
         XrMatrix4x4f projection;
@@ -1034,9 +1118,10 @@ public:
         // distance ou de panneau"; UEVR's "UI distance", 3D Vision's constant HUD depth): hud.distance > 0 (metres) puts the
         // whole front 2D layer -- a menu's page with it, the screen overlays and secondary views, the panel -- at that one
         // constant distance: no depth following the scene, no nearest rule, no per-element depth. Live
-        // (debug.tcvr.hud_distance). 0 = adaptive, as before. Gun games (every game not driven): 50 m for the test.
-        const float hudFixedM = arcadexr::config::GetFloat("hud.distance",
-            arcadexr::profiles::GetFloat("hud.distance", arcadexr::profiles::IsDriving() ? 0.0f : 50.0f));
+        // (debug.tcvr.hud_distance). 0 = adaptive (default). Tested at 50 m on 28/09: squint at once, "il n'a rien de 50 m"
+        // -- measured at 50 m (same left/right shift as the far trees), but painted OVER nearer 3D the brain cannot place it.
+        // A 2D layer must never be behind what it covers: the nearest rule below stays the method.
+        const float hudFixedM = arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 0.0f));
         const bool hudFixed = hudFixedM > 0.0f && !m_flatMode;
         const float hudDistance = hudFixed ? std::max(0.5f, hudFixedM) : std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 2.0f));
         const float hudK = hudDistance / distance;
@@ -1080,9 +1165,15 @@ public:
             if (hudFixed && m_a2wScale > 1e-6f) {
                 zh = hudFixedM / m_a2wScale;
             } else if (hudNearRule) {
-                if (m_hudNear > 0.0f) zh = std::min(zh, 0.9f * m_hudNear);
-                if (m_a2wScale > 1e-6f) zh = std::max(zh, 1.2f / m_a2wScale);
+                if (m_hudNear > 0.0f) {   // just in front of where that nearest thing is DRAWN (near comfort moves it off the eyes)
+                    float nz = 0.9f * m_hudNear;
+                    if (m_nearOn && m_a2wScale > 1e-6f) nz = NearComfortM(nz * m_a2wScale) / m_a2wScale;
+                    zh = std::min(zh, nz);
+                }
+                // never nearer than hud.nearMin metres (live: debug.tcvr.hud_nearMin; 1.2 m since 28/09)
+                if (m_a2wScale > 1e-6f) zh = std::max(zh, std::max(0.3f, arcadexr::config::GetFloat("hud.nearMin", m_nearOn ? 0.45f : 1.2f)) / m_a2wScale);
             }
+            if (viewIndex == 0) m_lastHudZ = zh;
             const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
             XrMatrix4x4f H{};
             H.m[0] = 496.0f / focusX * zh;
@@ -1200,6 +1291,8 @@ public:
             ubo.uContrast = m_flatMode ? 1.0f : arcadexr::config::GetFloat("contrast", 1.0f);
             ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", 0.0f);
             ubo.uLift = LiftExponent();
+            ubo.uNearA2w = (m_nearOn && !m_flatMode) ? worldScale : 0.0f;
+            ubo.uNearMin = m_nearMinM; ubo.uNearStart = m_nearStartM; ubo.padNear = 0.0f;
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
             ubo.uOverlayK = m_flatMode ? 1.0f : std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 8.0f));
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
@@ -1379,7 +1472,7 @@ public:
             // Per-element depth (28/09): each run takes the depth of its HUD element (m_hudCellZ, see SceneDepthProbe),
             // just in front of what is behind it; cells then keep the NEAREST element and each run of cells is drawn
             // once with its element's plane. Off (Sega Rally, m2.hudPerElement=0): one plane as before.
-            const bool perElement = tiled && hudIso && hudNearRule && !hudFixed && !projected2d && arcadexr::config::GetInt("m2.hudPerElement", 1) != 0;
+            const bool perElement = tiled && hudIso && hudNearRule && !hudFixed && !projected2d && arcadexr::config::GetInt("m2.hudPerElement", 0) != 0;   // one plane (28/09 evening: per element "part dans tous les sens")
             std::vector<float> keyZ;               // distinct depths (arcade units), index = key
             std::vector<XrMatrix4x4f> keyMvp;
             std::vector<uint16_t> rectKey;
@@ -1610,7 +1703,8 @@ public:
             const float* a = &m_rawVerts[size_t(i0) * 5];
             const float* b = &m_rawVerts[size_t(i1) * 5];
             const float* c = &m_rawVerts[size_t(i2) * 5];
-            const float A0[3] = {a[0] / fx, a[1] / fy, a[2]}, B0[3] = {b[0] / fx, b[1] / fy, b[2]}, C0[3] = {c[0] / fx, c[1] / fy, c[2]};
+            float A0[3] = {a[0] / fx, a[1] / fy, a[2]}, B0[3] = {b[0] / fx, b[1] / fy, b[2]}, C0[3] = {c[0] / fx, c[1] / fy, c[2]};
+            if (m_nearOn) { NearComfortP(A0, A.s); NearComfortP(B0, A.s); NearComfortP(C0, A.s); }   // where it is DRAWN
             const float e1[3] = {B0[0] - A0[0], B0[1] - A0[1], B0[2] - A0[2]}, e2[3] = {C0[0] - A0[0], C0[1] - A0[1], C0[2] - A0[2]};
             const float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
             const float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
@@ -2159,6 +2253,32 @@ public:
     struct FxBox { uint32_t k; float x0, y0, x1, y1, z; uint32_t group; float scale = 1.0f; };
     std::vector<FxBox> m_fxPrims, m_fxGroups;
     bool m_nearFxOn = false;
+    // Near comfort on the CPU, the vertex stage's nearComfort (m2_vert.glsl): a distance in metres -> where it is drawn; a point
+    // of the board camera's space (a2w metres per unit) slid along its ray the same way.
+    bool m_nearOn = false;
+    float m_nearMinM = 0.5f, m_nearStartM = 1.0f;
+    float NearComfortM(float d) const {
+        if (!m_nearOn || d >= m_nearStartM || d <= 1e-6f) return d;
+        const float t = 1.0f - d / m_nearStartM;
+        return d + m_nearMinM * t * t;
+    }
+    void NearComfortP(float p[3], float a2w) const {
+        if (p[2] <= 0.0f) return;
+        const float d = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) * a2w;
+        if (d >= m_nearStartM || d <= 1e-6f) return;
+        const float k = NearComfortM(d) / d;
+        p[0] *= k; p[1] *= k; p[2] *= k;
+    }
+    std::chrono::steady_clock::time_point m_nearLogAt{};   // TCVR_NEAR, once a second
+    std::vector<float> m_nearTmp;
+    float m_lastHudZ = 0.0f;                                // the front HUD plane's depth (arcade units), left eye
+    struct Cls {                                            // TCVR_CLASS, one second of frames
+        unsigned frames = 0, secFrames = 0, secMax = 0, ovFrames = 0, fullMax = 0, bandMax = 0, fxFrames = 0, fxMax = 0;
+        float secBox[4] = {1e9f, 1e9f, -1e9f, -1e9f}, ovBox[4] = {1e9f, 1e9f, -1e9f, -1e9f}, fxBox[4] = {1e9f, 1e9f, -1e9f, -1e9f};
+        std::array<int, 6> secCam{}, mainCam{};
+        float ovZ = 0.0f, fxZ = 0.0f, fxScale = 1.0f;
+    } m_cls;
+    unsigned m_clsFrameSec = 0, m_clsFrameFull = 0, m_clsFrameBand = 0;
     // HUD zones moved into the 3D (profile hud.zones, 28/09): board rectangles + destination (0 gun, 1 panel)
     struct HudZone { int dest; float x0, y0, x1, y1; };
     std::vector<HudZone> m_hudZones;
