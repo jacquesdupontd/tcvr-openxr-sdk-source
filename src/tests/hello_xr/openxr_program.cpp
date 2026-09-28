@@ -2214,7 +2214,11 @@ struct OpenXrProgram : IOpenXrProgram {
                     XrPosef_Invert(&inv, &delta);
                     delta = inv;
                 }
-                sw.appSpaceDeltaPose = (arcadexr::config::GetInt("appsw_delta", 1) != 0)
+                // Default 0 (28/09): the documented, validated state is "camera delta cut" -- the motion vectors
+                // already carry every pixel's motion (scenery from the camera delta, objects from their matrices);
+                // sent as well, the delta moved the car -- fixed relative to the camera -- like scenery: the car
+                // blurred when turning (Guillaume). The prop had been released, and the code default was still 1.
+                sw.appSpaceDeltaPose = (arcadexr::config::GetInt("appsw_delta", 0) != 0)
                                            ? delta : XrPosef{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
                 sw.depthSubImage.swapchain = m_swDepthSwapchains[i].handle;   // real distances, low resolution
                 sw.depthSubImage.imageRect.offset = {0, 0};
