@@ -1607,7 +1607,10 @@ struct OpenXrProgram : IOpenXrProgram {
             m_lastTickDisplayTime = frameState.predictedDisplayTime;
             if (m_tickAcc > 3 * kTick) m_tickAcc = 3 * kTick;
             while (m_tickAcc >= kTick - 2000000) { arcadexr::mame::FrameTick(); m_tickAcc -= kTick; }
-            if (m_tickAcc < 0) m_tickAcc = 0;
+            // The 2 ms early margin is CARRIED, never dropped (28/09): dropping the negative remainder gave extra ticks
+            // as soon as the app's frames were irregular -- Virtua Cop at 107.8 %, Top Skater and Virtua Racing with
+            // 9-16 arcade frames a second never shown. Carried, the long-run rate is exactly 60 a second.
+            if (m_tickAcc < -2000000) m_tickAcc = -2000000;
         }
         const auto adpfStart = std::chrono::steady_clock::now();  // ADPF: measure the frame WORK (post-wait)
 

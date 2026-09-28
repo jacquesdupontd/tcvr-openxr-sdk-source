@@ -4375,8 +4375,13 @@ private:
   public:
     float LastInterp() const { return m_lastInterp; }
   private:
+    // HUD ISO for EVERY game by default (28/09, Guillaume: "les HUD sont devant la face et font loucher, il faut une
+    // solution applicable à tous les jeux, par défaut"). Off ISO, the HUD sat on a plane 2 m in front of the eyes
+    // (m2.hudDistance) over a scene 10-50 m away: the eyes converged on 2 m to read it, then diverged for the road.
+    // ISO puts each HUD pixel on the game camera's ray at the depth of the scene looked at (SceneDepthProbe), as
+    // validated on Sega Rally (25/09). immersive.hudIso=0 in a profile brings the 2 m plane back for that game.
     static bool HudIsoProfile() {
-        return arcadexr::profiles::GetInt("immersive.hudIso", arcadexr::profiles::CurrentGame() == "srallyc" ? 1 : 0) != 0;
+        return arcadexr::profiles::GetInt("immersive.hudIso", 1) != 0;
     }
     // A menu in ISO (26/09): its 2D page on the game camera's rays at the depth of its 3D, and its 3D (the cars in their
     // boxes) left in 3D at its true depth -- on the page's plane within 0.05 degree of disparity, with its depth test.

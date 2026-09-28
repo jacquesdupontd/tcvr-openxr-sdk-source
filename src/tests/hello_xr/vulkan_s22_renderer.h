@@ -927,6 +927,24 @@ public:
     uint32_t FlatWidth() const { return m_eye[2].w; }
     uint32_t FlatHeight() const { return m_eye[2].h; }
 
+    // Depth of the scene looked at (28/09, HUD ISO for every game): median board depth (arcade units, 0 = unknown) of a
+    // 16 x 10 grid over the central 60 % of the depth map the aim already reads back every frame. Nothing drawn there
+    // (sky, void) is skipped; fewer than 8 hits -> unknown.
+    float SceneDepthUnits() const {
+        if (m_depthCpu.empty() || m_depthCpuW == 0 || m_depthCpuH == 0) return 0.0f;
+        float v[160]; int n = 0;
+        for (int gy = 0; gy < 10; ++gy)
+            for (int gx = 0; gx < 16; ++gx) {
+                const int x = int((0.2f + 0.6f * (float(gx) + 0.5f) / 16.0f) * float(m_depthCpuW));
+                const int y = int((0.2f + 0.6f * (float(gy) + 0.5f) / 10.0f) * float(m_depthCpuH));
+                const float d = m_depthCpu[size_t(y) * m_depthCpuW + size_t(x)];
+                if (d > 0.0f && std::isfinite(d)) v[n++] = d;
+            }
+        if (n < 8) return 0.0f;
+        std::nth_element(v, v + n / 2, v + n);
+        return v[n / 2];
+    }
+
     // Depth-map depth at a board pixel (0 = nothing drawn there), for the aim self-test.
     float DepthAt(float sx, float sy, int screenW, int screenH) const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || sx < 0 || sy < 0 || sx >= screenW || sy >= screenH) return 0.0f;

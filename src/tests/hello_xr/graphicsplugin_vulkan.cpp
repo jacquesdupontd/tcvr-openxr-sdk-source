@@ -2150,11 +2150,29 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f_InvertRigidBody(&worldToEye, &eyeToWorld);
         XrMatrix4x4f_Multiply(&viewProjection, &projection, &worldToEye);
         XrMatrix4x4f_Multiply(&mvp, &viewProjection, &arcadeToWorld);
+        // HUD ISO for every game by default (28/09, Guillaume: "les HUD sont devant la face et font loucher"): the text
+        // layer and the HUD sprites were on the virtual screen 2 m away, over a scene tens of metres deep. Now on the
+        // camera's rays at the depth of the scene looked at (median of the aim's depth map, smoothed, updated once per
+        // frame so both eyes agree), same angular size: they sit where the scene is. immersive.hudIso=0: the 2 m plane.
+        float hudD = distance;
+        if (arcadexr::profiles::GetInt("immersive.hudIso", 1) != 0) {
+            if (viewIndex == 0) {
+                const float zu = m_s22.SceneDepthUnits();
+                if (zu > 0.0f) {
+                    const float m = zu * worldScale;
+                    m_s22HudDepth = (m_s22HudDepth > 0.0f) ? m_s22HudDepth + (m - m_s22HudDepth) * 0.1f : m;
+                }
+            }
+            if (m_s22HudDepth > 0.0f)
+                hudD = std::max(distance, std::min(arcadexr::config::GetFloat("s22.hudMaxDepth", 40.0f), m_s22HudDepth));
+        }
+        const float hk = hudD / distance;
+        const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudD, camera.y - screen.normal.y * hudD, camera.z - screen.normal.z * hudD};
         XrMatrix4x4f hudToWorld{};
-        hudToWorld.m[0] = screen.right.x * screen.width; hudToWorld.m[1] = screen.right.y * screen.width; hudToWorld.m[2] = screen.right.z * screen.width;
-        hudToWorld.m[4] = screen.up.x * screen.height; hudToWorld.m[5] = screen.up.y * screen.height; hudToWorld.m[6] = screen.up.z * screen.height;
+        hudToWorld.m[0] = screen.right.x * screen.width * hk; hudToWorld.m[1] = screen.right.y * screen.width * hk; hudToWorld.m[2] = screen.right.z * screen.width * hk;
+        hudToWorld.m[4] = screen.up.x * screen.height * hk; hudToWorld.m[5] = screen.up.y * screen.height * hk; hudToWorld.m[6] = screen.up.z * screen.height * hk;
         hudToWorld.m[8] = screen.normal.x; hudToWorld.m[9] = screen.normal.y; hudToWorld.m[10] = screen.normal.z;
-        hudToWorld.m[12] = screen.center.x; hudToWorld.m[13] = screen.center.y; hudToWorld.m[14] = screen.center.z; hudToWorld.m[15] = 1.0f;
+        hudToWorld.m[12] = hudCenter.x; hudToWorld.m[13] = hudCenter.y; hudToWorld.m[14] = hudCenter.z; hudToWorld.m[15] = 1.0f;
         XrMatrix4x4f hudMvp;
         XrMatrix4x4f_Multiply(&hudMvp, &viewProjection, &hudToWorld);
         arcadexr::vulkan::VulkanSystem22Renderer::Settings st;
@@ -2657,6 +2675,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     CmdBuffer m_cmdBuffer[4]{};
     CmdBuffer m_mvCmd{};
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
+    float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };
     uint32_t m_mvLogTick = 0;
     VkBuffer m_mvDiagBuf = VK_NULL_HANDLE;
