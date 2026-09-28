@@ -77,6 +77,10 @@ void main_body() {
         if (!projected(u, v, b)) discard;
         u = (b.x - 248.0) / 496.0; v = (192.0 - b.y) / 384.0;
     }
+    if (uKeyZero != 0 && uEyeArc.w < 0.0) {   // a HUD zone moved onto a 3D object (hud.zones): only its rectangle
+        float ux = u + 0.5, vy = 0.5 - v;
+        if (ux < uProj.x || vy < uProj.y || ux > uProj.z || vy > uProj.w) discard;
+    }
     bool inside = abs(u) <= 0.5 && abs(v) <= 0.5;
     if ((uKeyZero != 0 || uNoTile > 0.5) && !inside) discard;
     // Back layer beyond the arcade frame: repeated MIRRORED (identity inside the frame), so the edges meet

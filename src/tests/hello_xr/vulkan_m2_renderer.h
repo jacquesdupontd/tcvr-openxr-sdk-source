@@ -17,6 +17,7 @@
 #include "virtual_screen.h"
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_regions.h"
+#include "aim_state.h"
 
 #include "m2_vert_spv.h"
 #include "m2_vert_appsw_spv.h"
@@ -1307,7 +1308,14 @@ public:
             if (tiled) {
                 const float minZ = (m_a2wScale > 1e-6f) ? 1.2f / m_a2wScale : 1.0f;
                 const float sxg = (m_frontRunsW > 0) ? 496.0f / float(m_frontRunsW) : 1.0f, syg = (m_frontRunsH > 0) ? 384.0f / float(m_frontRunsH) : 1.0f;
+                const auto& zonesSkip = HudZones();
                 for (const FrontRun& r : m_frontRuns) {
+                    if (!zonesSkip.empty() && m_frontRunsW > 0 && m_frontRunsH > 0) {
+                        const float cxr = 0.5f * float(r.x0 + r.x1) / float(m_frontRunsW) * 496.0f, cyr = 0.5f * float(r.y0 + r.y1) / float(m_frontRunsH) * 384.0f;
+                        bool inZ = false;
+                        for (const HudZone& hz : zonesSkip) if (cxr >= hz.x0 && cxr <= hz.x1 && cyr >= hz.y0 && cyr <= hz.y1) { inZ = true; break; }
+                        if (inZ) continue;   // shown on its 3D object instead (below)
+                    }
                     const float* M = frontPc.uHudMvp;
                     uint16_t key = 0;
                     if (perElement) {
@@ -1391,6 +1399,91 @@ public:
             } else {
                 m_hudMvAll[eye & 1u] = true;   // the whole plane: no vector anywhere under it
                 vkCmdDraw(cmd, 3, 1, 0, 0);
+            }
+            // HUD zones on 3D objects (hud.zones, 28/09): the game's own pixels of each rectangle, live, on a small screen
+            // above the rear of the pistol (gun) or on a board under the action tilted like a control panel (panel).
+            // Never over the scene: nothing for the eyes to reconcile.
+            const auto& zones = HudZones();
+            if (!zones.empty() && !m_flatMode && !m_frontFullscreen) {
+                const auto guns = arcadexr::gun::GetGunPoses();
+                XrMatrix4x4f gunM{};
+                bool haveGun = guns.count > 0;
+                if (haveGun) {
+                    const float gs = std::max(0.5f, std::min(2.0f, arcadexr::config::GetFloat("gun.scale", 1.0f)));
+                    const XrVector3f unit{gs, gs, gs};
+                    XrMatrix4x4f_CreateTranslationRotationScale(&gunM, &guns.pose[guns.count - 1].position, &guns.pose[guns.count - 1].orientation, &unit);
+                }
+                const float panelTilt = 0.61f;   // 35 degrees: its face toward the player, like a cabinet's control panel
+                const float ct = std::cos(panelTilt), st = std::sin(panelTilt);
+                const float kPanel = screen.width / 496.0f * 0.85f;   // board pixel -> metres on the panel
+                for (const HudZone& hz : zones) {
+                    XrVector3f C, R, U;
+                    float w, h;
+                    const float zw = hz.x1 - hz.x0, zhh = hz.y1 - hz.y0;
+                    if (hz.dest == 0) {
+                        if (!haveGun) continue;
+                        // gun space: above the rear sight, facing the shooter, top leaning forward 25 degrees
+                        w = 0.070f; h = w * zhh / zw;
+                        const XrVector3f cg{0.0f, 0.050f, 0.004f}, rg{1.0f, 0.0f, 0.0f}, ug{0.0f, 0.906f, -0.423f};
+                        XrMatrix4x4f_TransformVector3f(&C, &gunM, &cg);
+                        XrVector3f o0{0, 0, 0}, rw, uw, oW;
+                        XrMatrix4x4f_TransformVector3f(&oW, &gunM, &o0);
+                        XrMatrix4x4f_TransformVector3f(&rw, &gunM, &rg);
+                        XrMatrix4x4f_TransformVector3f(&uw, &gunM, &ug);
+                        R = {rw.x - oW.x, rw.y - oW.y, rw.z - oW.z}; U = {uw.x - oW.x, uw.y - oW.y, uw.z - oW.z};
+                        const float lr = std::sqrt(R.x * R.x + R.y * R.y + R.z * R.z), lu = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
+                        if (lr < 1e-6f || lu < 1e-6f) continue;
+                        R = {R.x / lr, R.y / lr, R.z / lr}; U = {U.x / lu, U.y / lu, U.z / lu};
+                        w *= lr; h *= lr;   // gun.scale
+                    } else {
+                        // world: a board under the screen, closer to the player, face tilted toward them
+                        w = zw * kPanel; h = zhh * kPanel;
+                        const float cxBoard = 0.5f * (hz.x0 + hz.x1);
+                        const float xOff = (cxBoard / 496.0f - 0.5f) * screen.width * 0.85f;
+                        const float down = screen.height * 0.5f + 0.12f + h * 0.5f;
+                        C = {screen.center.x + screen.right.x * xOff - screen.up.x * down + screen.normal.x * 0.45f,
+                             screen.center.y + screen.right.y * xOff - screen.up.y * down + screen.normal.y * 0.45f,
+                             screen.center.z + screen.right.z * xOff - screen.up.z * down + screen.normal.z * 0.45f};
+                        R = {screen.right.x, screen.right.y, screen.right.z};
+                        U = {screen.up.x * ct - screen.normal.x * st, screen.up.y * ct - screen.normal.y * st, screen.up.z * ct - screen.normal.z * st};
+                    }
+                    // plane coordinates (u', v') of the zone -> this quad
+                    const float du = zw / 496.0f, dv = zhh / 384.0f;
+                    const float uc = 0.5f * (hz.x0 + hz.x1) / 496.0f - 0.5f, vc = 0.5f - 0.5f * (hz.y0 + hz.y1) / 384.0f;
+                    const XrVector3f A{R.x * w / du, R.y * w / du, R.z * w / du}, B{U.x * h / dv, U.y * h / dv, U.z * h / dv};
+                    const XrVector3f N{R.y * U.z - R.z * U.y, R.z * U.x - R.x * U.z, R.x * U.y - R.y * U.x};
+                    XrMatrix4x4f P{};
+                    P.m[0] = A.x; P.m[1] = A.y; P.m[2] = A.z;
+                    P.m[4] = B.x; P.m[5] = B.y; P.m[6] = B.z;
+                    P.m[8] = N.x; P.m[9] = N.y; P.m[10] = N.z;
+                    P.m[12] = C.x - uc * A.x - vc * B.x; P.m[13] = C.y - uc * A.y - vc * B.y; P.m[14] = C.z - uc * A.z - vc * B.z; P.m[15] = 1.0f;
+                    XrMatrix4x4f zoneMvp; XrMatrix4x4f_Multiply(&zoneMvp, &viewProjection, &P);
+                    // scissor: the quad's four corners on screen
+                    float sx0 = 1e9f, sy0 = 1e9f, sx1 = -1e9f, sy1 = -1e9f; bool ok = true;
+                    for (int c = 0; c < 4; ++c) {
+                        const float u = (c & 1) ? hz.x1 / 496.0f - 0.5f : hz.x0 / 496.0f - 0.5f;
+                        const float v = (c & 2) ? 0.5f - hz.y1 / 384.0f : 0.5f - hz.y0 / 384.0f;
+                        const float* M = zoneMvp.m;
+                        const float cx = M[0] * u + M[4] * v + M[12], cy = M[1] * u + M[5] * v + M[13], cw = M[3] * u + M[7] * v + M[15];
+                        if (cw <= 1e-4f) { ok = false; break; }
+                        const float sxx = (cx / cw * 0.5f + 0.5f) * outW, syy = (cy / cw * 0.5f + 0.5f) * outH;
+                        sx0 = std::min(sx0, sxx); sx1 = std::max(sx1, sxx); sy0 = std::min(sy0, syy); sy1 = std::max(sy1, syy);
+                    }
+                    if (!ok) continue;
+                    const int ix0 = std::max(0, int(sx0) - 2), iy0 = std::max(0, int(sy0) - 2);
+                    const int ix1 = std::min(int(outW), int(sx1) + 3), iy1 = std::min(int(outH), int(sy1) + 3);
+                    if (ix1 <= ix0 || iy1 <= iy0) continue;
+                    memcpy(frontPc.uHudMvp, zoneMvp.m, sizeof(zoneMvp.m));
+                    frontPc.uEyeArc[3] = -1.0f;   // zone mode: only its rectangle
+                    frontPc.uProj[0] = hz.x0 / 496.0f; frontPc.uProj[1] = hz.y0 / 384.0f;
+                    frontPc.uProj[2] = hz.x1 / 496.0f; frontPc.uProj[3] = hz.y1 / 384.0f;
+                    vkCmdPushConstants(cmd, m_planePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(frontPc), &frontPc);
+                    const VkRect2D rc{{ix0, iy0}, {uint32_t(ix1 - ix0), uint32_t(iy1 - iy0)}};
+                    vkCmdSetScissor(cmd, 0, 1, &rc);
+                    vkCmdDraw(cmd, 3, 1, 0, 0);
+                }
+                const VkRect2D full{{0, 0}, {uint32_t(outW), uint32_t(outH)}};
+                vkCmdSetScissor(cmd, 0, 1, &full);
             }
         }
 
@@ -1914,6 +2007,32 @@ public:
             }
             for (int t = 1; t + 1 < n; ++t) rasterTri(g[0], g[t], g[t + 1]);
         }
+    }
+    // HUD zones moved into the 3D (profile hud.zones, 28/09): board rectangles + destination (0 gun, 1 panel)
+    struct HudZone { int dest; float x0, y0, x1, y1; };
+    std::vector<HudZone> m_hudZones;
+    std::string m_hudZonesKey;
+    const std::vector<HudZone>& HudZones() {
+        const std::string z = arcadexr::profiles::GetString("hud.zones", "");
+        if (z != m_hudZonesKey) {
+            m_hudZonesKey = z; m_hudZones.clear();
+            size_t pos = 0;
+            while (pos < z.size()) {
+                size_t end = z.find(';', pos); if (end == std::string::npos) end = z.size();
+                const std::string item = z.substr(pos, end - pos);
+                const size_t colon = item.find(':');
+                if (colon != std::string::npos) {
+                    HudZone hz{}; float a, b, c, d;
+                    const std::string dest = item.substr(0, colon);
+                    if (std::sscanf(item.c_str() + colon + 1, "%f,%f,%f,%f", &a, &b, &c, &d) == 4 && c > a && d > b) {
+                        hz.dest = (dest == "gun") ? 0 : 1; hz.x0 = a; hz.y0 = b; hz.x1 = c; hz.y1 = d;
+                        m_hudZones.push_back(hz);
+                    }
+                }
+                pos = end + 1;
+            }
+        }
+        return m_hudZones;
     }
     float m_sceneDepth = 0.0f;
     float m_hudNear = 0.0f;   // nearest scene under the HUD (arcade units, 20th percentile, smoothed), 0 = none
