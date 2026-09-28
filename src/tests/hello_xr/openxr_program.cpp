@@ -2027,6 +2027,8 @@ struct OpenXrProgram : IOpenXrProgram {
                     // Menus: a squared response (26/09, Guillaume: "it jumps to the last one ultra fast, you have to be
                     // gentle to stay in the middle") -- gentle around the centre, full lock still at the stop.
                     if (menuScreen) x = x * std::fabs(x);
+                    // a squared response for a game whose stick reaches full lock (driving.stickCurve, Super GT)
+                    else if (arcadexr::profiles::GetInt("driving.stickCurve", 0) != 0) x = x * std::fabs(x);
                     steer = 0.5f + x * range;
                 }
             }
