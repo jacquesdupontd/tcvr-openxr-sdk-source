@@ -980,7 +980,13 @@ public:
         // game depth with the page left at 2 m, it was a parallax.
         const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f) && HudIsoProfile();
         if (hudIso) {
-            const float zh = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);
+            float zh = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);
+            // Just in front of the nearest thing behind the HUD (film subtitles), never nearer than 1.2 m (28/09).
+            // Sega Rally keeps its validated placement (immersive.hudNear=0).
+            if (arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0) {
+                if (m_hudNear > 0.0f) zh = std::min(zh, 0.9f * m_hudNear);
+                if (m_a2wScale > 1e-6f) zh = std::max(zh, 1.2f / m_a2wScale);
+            }
             const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
             XrMatrix4x4f H{};
             H.m[0] = 496.0f / focusX * zh;
@@ -1625,6 +1631,77 @@ public:
             for (int gy = gy0; gy <= gy1; ++gy)
                 for (int gx = gx0; gx <= gx1; ++gx) rayTest(A, e1, e2, gx, gy);
         }
+        // Nearest scene UNDER THE HUD (28/09, Guillaume: "je louche toujours" in House of the Dead). A flat HUD drawn
+        // over everything but placed behind a nearer object gives the eyes two contradictory depths. Rule of 3D film
+        // subtitles: the HUD sits just in front of the nearest thing behind it. Full-screen grid, only the cells the
+        // front 2D layer (the HUD) covers this frame (m_frontRuns), 20th percentile of their hits.
+        {
+            constexpr int kFX = 16, kFY = 12;
+            constexpr float kFW = 496.0f / kFX, kFH = 384.0f / kFY;
+            uint8_t under[kFX * kFY] = {};
+            int nUnder = 0;
+            if (m_frontRunsW > 0 && m_frontRunsH > 0) {
+                const float sx = 496.0f / float(m_frontRunsW), sy = 384.0f / float(m_frontRunsH);
+                for (const FrontRun& r : m_frontRuns) {
+                    const int x0 = std::max(0, int(float(r.x0) * sx / kFW)), x1 = std::min(kFX - 1, int(float(r.x1) * sx / kFW));
+                    const int y0 = std::max(0, int(float(r.y0) * sy / kFH)), y1 = std::min(kFY - 1, int(float(r.y1) * sy / kFH));
+                    for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) if (!under[y * kFX + x]) { under[y * kFX + x] = 1; ++nUnder; }
+                }
+            }
+            float nearBest[kFX * kFY];
+            for (float& b : nearBest) b = 1e30f;
+            if (nUnder > 0) {
+                auto rayTestAt = [&](const float* A, const float* e1, const float* e2, float px, float py, float& bb) {
+                    const float d[3] = {(px - fx) / ffx, (fy - py) / ffy, 1.0f};
+                    const float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+                    const float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+                    if (std::fabs(det) < 1e-12f) return;
+                    const float inv = 1.0f / det;
+                    const float tv[3] = {-A[0], -A[1], -A[2]};
+                    const float u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+                    if (u < 0.0f || u > 1.0f) return;
+                    const float qv[3] = {tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+                    const float v = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+                    if (v < 0.0f || u + v > 1.0f) return;
+                    const float t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+                    if (t > 0.05f && t < bb) bb = t;
+                };
+                for (size_t i = 0; i + 2 < end; i += 3) {
+                    const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
+                    if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+                    const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
+                    const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
+                    const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
+                    int gx0 = 0, gx1 = kFX - 1, gy0 = 0, gy1 = kFY - 1;
+                    if (a[2] > 0.05f && b[2] > 0.05f && c[2] > 0.05f) {
+                        const float ax = fx + a[0] / a[2], bx = fx + b[0] / b[2], cx = fx + c[0] / c[2];
+                        const float ay = fy - a[1] / a[2], by = fy - b[1] / b[2], cy = fy - c[1] / c[2];
+                        gx0 = std::max(0, int(std::floor(std::min(ax, std::min(bx, cx)) / kFW)));
+                        gx1 = std::min(kFX - 1, int(std::floor(std::max(ax, std::max(bx, cx)) / kFW)));
+                        gy0 = std::max(0, int(std::floor(std::min(ay, std::min(by, cy)) / kFH)));
+                        gy1 = std::min(kFY - 1, int(std::floor(std::max(ay, std::max(by, cy)) / kFH)));
+                        if (gx0 > gx1 || gy0 > gy1) continue;
+                    }
+                    const float A[3] = {a[0] / ffx, a[1] / ffy, a[2]};
+                    const float e1[3] = {b[0] / ffx - A[0], b[1] / ffy - A[1], b[2] - A[2]};
+                    const float e2[3] = {c[0] / ffx - A[0], c[1] / ffy - A[1], c[2] - A[2]};
+                    for (int gy = gy0; gy <= gy1; ++gy)
+                        for (int gx = gx0; gx <= gx1; ++gx)
+                            if (under[gy * kFX + gx]) rayTestAt(A, e1, e2, (float(gx) + 0.5f) * kFW, (float(gy) + 0.5f) * kFH, nearBest[gy * kFX + gx]);
+                }
+            }
+            float nh2[kFX * kFY]; int nn = 0;
+            for (int k = 0; k < kFX * kFY; ++k) if (under[k] && nearBest[k] < 1e29f) nh2[nn++] = nearBest[k];
+            if (nn > 0) {
+                std::nth_element(nh2, nh2 + nn / 5, nh2 + nn);
+                const float nearZ = nh2[nn / 5];
+                // nearer: follow fast (the HUD must get in front at once); farther: slowly
+                const float k = (m_hudNear <= 0.0f || nearZ < m_hudNear) ? 0.5f : 0.05f;
+                m_hudNear = (m_hudNear > 0.0f) ? m_hudNear + (nearZ - m_hudNear) * k : nearZ;
+            } else if (nUnder > 0) {
+                m_hudNear = 0.0f;   // HUD over nothing (sky, void): no constraint
+            }
+        }
         float hits[kGX * kGY]; int nh = 0;
         for (float bb : best) if (bb < 1e29f) hits[nh++] = bb;
         if (nh < 5) return;
@@ -1646,6 +1723,7 @@ public:
         return 1.0f / g;
     }
     float m_sceneDepth = 0.0f;
+    float m_hudNear = 0.0f;   // nearest scene under the HUD (arcade units, 20th percentile, smoothed), 0 = none
     float m_probeWorstMs = 0.0f;
     struct FrontRun { uint16_t x0, y0, x1, y1; };
     std::vector<FrontRun> m_frontRuns;

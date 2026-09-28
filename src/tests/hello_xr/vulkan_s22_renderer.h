@@ -945,6 +945,23 @@ public:
         return v[n / 2];
     }
 
+    // Nearest significant scene depth over the WHOLE picture (28/09): 10th percentile of a 32 x 24 grid of the depth
+    // map (arcade units, 0 = unknown). The HUD goes just in front of it (film subtitles): never behind something nearer.
+    float SceneNearUnits() const {
+        if (m_depthCpu.empty() || m_depthCpuW == 0 || m_depthCpuH == 0) return 0.0f;
+        float v[768]; int n = 0;
+        for (int gy = 0; gy < 24; ++gy)
+            for (int gx = 0; gx < 32; ++gx) {
+                const int x = int((float(gx) + 0.5f) / 32.0f * float(m_depthCpuW));
+                const int y = int((float(gy) + 0.5f) / 24.0f * float(m_depthCpuH));
+                const float d = m_depthCpu[size_t(y) * m_depthCpuW + size_t(x)];
+                if (d > 0.0f && std::isfinite(d)) v[n++] = d;
+            }
+        if (n < 16) return 0.0f;
+        std::nth_element(v, v + n / 10, v + n);
+        return v[n / 10];
+    }
+
     // Depth-map depth at a board pixel (0 = nothing drawn there), for the aim self-test.
     float DepthAt(float sx, float sy, int screenW, int screenH) const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || sx < 0 || sy < 0 || sx >= screenW || sy >= screenH) return 0.0f;

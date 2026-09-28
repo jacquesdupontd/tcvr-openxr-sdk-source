@@ -2162,9 +2162,20 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     const float m = zu * worldScale;
                     m_s22HudDepth = (m_s22HudDepth > 0.0f) ? m_s22HudDepth + (m - m_s22HudDepth) * 0.1f : m;
                 }
+                // Just in front of the nearest thing in the picture (film subtitles, 28/09: "je louche toujours"):
+                // nearer -> follow fast, farther -> slowly.
+                const float nu = m_s22.SceneNearUnits();
+                if (nu > 0.0f) {
+                    const float m = nu * worldScale;
+                    const float k = (m_s22HudNear <= 0.0f || m < m_s22HudNear) ? 0.5f : 0.05f;
+                    m_s22HudNear = (m_s22HudNear > 0.0f) ? m_s22HudNear + (m - m_s22HudNear) * k : m;
+                }
             }
-            if (m_s22HudDepth > 0.0f)
-                hudD = std::max(distance, std::min(arcadexr::config::GetFloat("s22.hudMaxDepth", 40.0f), m_s22HudDepth));
+            if (m_s22HudDepth > 0.0f) {
+                hudD = std::min(arcadexr::config::GetFloat("s22.hudMaxDepth", 40.0f), m_s22HudDepth);
+                if (m_s22HudNear > 0.0f) hudD = std::min(hudD, 0.9f * m_s22HudNear);
+                hudD = std::max(1.2f, hudD);
+            }
         }
         const float hk = hudD / distance;
         const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudD, camera.y - screen.normal.y * hudD, camera.z - screen.normal.z * hudD};
@@ -2676,6 +2687,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     CmdBuffer m_mvCmd{};
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
     float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
+    float m_s22HudNear = 0.0f;    // ... and of the nearest thing in the picture (m): the HUD stays just in front of it
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };
     uint32_t m_mvLogTick = 0;
     VkBuffer m_mvDiagBuf = VK_NULL_HANDLE;
