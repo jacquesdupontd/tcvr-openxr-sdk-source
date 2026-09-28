@@ -53,6 +53,8 @@ struct M2UniformBufferObject {
     float uNearMin;          // 4 bytes, offset 324: the nearest a point is drawn, metres
     float uNearStart;        // 4 bytes, offset 328: distances below this are compressed, metres
     float padNear;           // 4 bytes, offset 332
+    float uMvpCyc[16];       // 64 bytes, offset 336: near comfort, this eye's projection from the cyclopean eye
+    float uCycArc[4];        // 16 bytes, offset 400: near comfort, the cyclopean eye in the board camera's space
 };
 
 struct VoidPushConstants {

@@ -59,6 +59,9 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uNearA2w;     // (vertex stage) near comfort
     float uNearMin;
     float uNearStart;
+    float padNear;
+    mat4 uMvpCyc;
+    vec4 uCycArc;
 };
 
 struct Prim {

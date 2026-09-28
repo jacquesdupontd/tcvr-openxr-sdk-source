@@ -58,6 +58,9 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uNearA2w;     // near comfort: metres per arcade unit, 0 = off (28/09)
     float uNearMin;     // near comfort: the nearest a point is drawn, metres
     float uNearStart;   // near comfort: distances below this are compressed, metres
+    float padNear;
+    mat4 uMvpCyc;       // near comfort: this eye's projection seen from the CYCLOPEAN eye (between the two)
+    vec4 uCycArc;       // near comfort: the cyclopean eye in the board camera's space
 };
 
 struct Prim {
@@ -104,15 +107,19 @@ layout(location = 10) out vec3 vMv;
 
 // Near comfort (28/09, House of the Dead: "au sol près des escaliers on louche à fond"): the game's camera grazes stairs and
 // walls, 30 cm from the eyes in the headset -- nearer than eyes can fuse, the Quest focusing near 1.3 m. A point nearer than
-// uNearStart slides along its ray from the board camera to f(d) = d + uNearMin (1 - d / uNearStart)^2: 0 -> uNearMin,
-// uNearStart -> uNearStart with the same slope, monotonic. Same ray: the cabinet's picture is unchanged, only the depth.
-// The CPU aim (Aim) and the HUD's nearest rule use the same function (NearComfortM).
-vec3 nearComfort(vec3 p) {
-    if (uNearA2w <= 0.0 || p.z <= 0.0) return p;
-    float d = length(p) * uNearA2w;
-    if (d >= uNearStart || d < 1e-6) return p;
+// uNearStart keeps its place; only the DISPARITY between the eyes shrinks, to that of f(d) = d + uNearMin (1 - d/uNearStart)^2
+// (0 -> uNearMin, uNearStart -> uNearStart with the same slope): each eye's clip position moves towards the one the cyclopean
+// eye would give, by 1 - d/f(d). Each eye keeps a true perspective from a point a little nearer the centre, so textures do
+// not move. (First version slid the vertices themselves: a floor polygon with one near corner redistributed its texture
+// at every step -- "le sol fait un zoom dézoom bizarre".) The CPU aim and the HUD's nearest rule use f (NearComfortM).
+vec4 nearStereo(vec3 P) {
+    vec4 ce = uMvp * vec4(P, 1.0);
+    if (uNearA2w <= 0.0 || P.z <= 0.0) return ce;
+    float d = length(P - uCycArc.xyz) * uNearA2w;
+    if (d >= uNearStart || d < 1e-6) return ce;
     float t = 1.0 - d / uNearStart;
-    return p * ((d + uNearMin * t * t) / d);
+    float k = d / (d + uNearMin * t * t);
+    return mix(uMvpCyc * vec4(P, 1.0), ce, k);
 }
 
 void main() {
@@ -190,12 +197,12 @@ void main() {
                  : (p.textured != 0u) ? (1.0 / max(aParamI.x, 1e-7)) : max(aParamI.x, 1e-7);
         float X = (uRaw != 0) ? aPosI.x / max(uFocus.x, 1e-6) : (xs.x - uCrtc.x - float(p.center_x)) * z / max(uFocus.x, 1e-6);
         float Y = (uRaw != 0) ? aPosI.y / max(uFocus.y, 1e-6) : ((384.0 - float(p.center_y)) + uCrtc.y - xs.y) * z / max(uFocus.y, 1e-6);
-        gl_Position = uMvp * vec4(nearComfort(vec3(X, Y, z)), 1.0);
+        gl_Position = nearStereo(vec3(X, Y, z));
 #ifdef APPSW_MV
         if (uRaw != 0) {
             vec4 pp = prevPos[gl_VertexIndex];
             if (pp.w > 0.5) {
-                vec4 cp = uMvp * vec4(nearComfort(vec3(pp.x / max(uFocus.x, 1e-6), pp.y / max(uFocus.y, 1e-6), pp.z)), 1.0);
+                vec4 cp = nearStereo(vec3(pp.x / max(uFocus.x, 1e-6), pp.y / max(uFocus.y, 1e-6), pp.z));
                 if (cp.w > 1e-4 && gl_Position.w > 1e-4) vMv = gl_Position.xyz / gl_Position.w - cp.xyz / cp.w;
             }
         }

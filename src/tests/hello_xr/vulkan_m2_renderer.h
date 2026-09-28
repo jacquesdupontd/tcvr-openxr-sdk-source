@@ -1232,6 +1232,30 @@ public:
             hudMvpBack = plane;
         }
 
+        // Near comfort: the cyclopean eye (half the inter-eye distance towards the other eye, same orientation -- the Quest's
+        // eye views are parallel) and this eye's projection seen from it (m2_vert.glsl nearStereo).
+        XrMatrix4x4f nearCycMvp = viewProjection;
+        XrVector3f nearCycArc{0.0f, 0.0f, 0.0f};
+        if (viewIndex < 2) m_eyePosW[viewIndex] = layerView.pose.position;
+        if (m_nearOn && !m_flatMode && viewIndex < 2) {
+            const float ex = m_eyePosW[1].x - m_eyePosW[0].x, ey = m_eyePosW[1].y - m_eyePosW[0].y, ez = m_eyePosW[1].z - m_eyePosW[0].z;
+            const float ipd = std::sqrt(ex * ex + ey * ey + ez * ez);
+            const XrVector3f unitX{1.0f, 0.0f, 0.0f};
+            XrVector3f rightW; XrQuaternionf_RotateVector3f(&rightW, &layerView.pose.orientation, &unitX);
+            const float h = (viewIndex == 0 ? 0.5f : -0.5f) * ((ipd > 0.03f && ipd < 0.09f) ? ipd : 0.0f);
+            XrPosef cyc = layerView.pose;
+            cyc.position = {cyc.position.x + rightW.x * h, cyc.position.y + rightW.y * h, cyc.position.z + rightW.z * h};
+            XrMatrix4x4f cycToWorld, worldToCyc, vpCyc, toWorldArc;
+            XrMatrix4x4f_CreateFromRigidTransform(&cycToWorld, &cyc);
+            XrMatrix4x4f_InvertRigidBody(&worldToCyc, &cycToWorld);
+            XrMatrix4x4f_Multiply(&vpCyc, &projection, &worldToCyc);
+            XrMatrix4x4f_Multiply(&nearCycMvp, &vpCyc, &arcadeToWorld);
+            XrMatrix4x4f worldToArc; XrMatrix4x4f_Invert(&worldToArc, &arcadeToWorld);
+            XrMatrix4x4f_TransformVector3f(&nearCycArc, &worldToArc, &cyc.position);
+            (void)toWorldArc;
+        } else {
+            XrMatrix4x4f_Multiply(&nearCycMvp, &viewProjection, &arcadeToWorld);
+        }
         // Update UBO slices for this eye
         const uint32_t eye = (viewIndex < 2) ? viewIndex : 0;
         for (uint32_t pass = 0; pass < 2; ++pass) {
@@ -1293,6 +1317,8 @@ public:
             ubo.uLift = LiftExponent();
             ubo.uNearA2w = (m_nearOn && !m_flatMode) ? worldScale : 0.0f;
             ubo.uNearMin = m_nearMinM; ubo.uNearStart = m_nearStartM; ubo.padNear = 0.0f;
+            memcpy(ubo.uMvpCyc, nearCycMvp.m, sizeof(nearCycMvp.m));
+            ubo.uCycArc[0] = nearCycArc.x; ubo.uCycArc[1] = nearCycArc.y; ubo.uCycArc[2] = nearCycArc.z; ubo.uCycArc[3] = 0.0f;
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);
             ubo.uOverlayK = m_flatMode ? 1.0f : std::max(1.0f, arcadexr::config::GetFloat("m2.overlayScale", 8.0f));
             ubo.padEnd[1] = m_gammaFolded ? 1 : 0;   // = uGammaFolded
@@ -2256,6 +2282,7 @@ public:
     // Near comfort on the CPU, the vertex stage's nearComfort (m2_vert.glsl): a distance in metres -> where it is drawn; a point
     // of the board camera's space (a2w metres per unit) slid along its ray the same way.
     bool m_nearOn = false;
+    XrVector3f m_eyePosW[2]{};   // near comfort: the eyes' positions (the inter-eye distance for the cyclopean eye)
     float m_nearMinM = 0.5f, m_nearStartM = 1.0f;
     float NearComfortM(float d) const {
         if (!m_nearOn || d >= m_nearStartM || d <= 1e-6f) return d;
