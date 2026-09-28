@@ -1002,7 +1002,10 @@ public:
         // game depth with the page left at 2 m, it was a parallax.
         const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f) && HudIsoProfile();
         const bool hudNearRule = arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
-        const float hudSceneZ = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);   // before any "near" rule
+        // Before any "near" rule. Every game but Sega Rally: the scene's depth in "menu" state too -- House of the Dead
+        // flips menu/scene all the time and the jump to the farthest vertex made everything on this plane jump (28/09).
+        const float hudSceneZ = std::max(1.0f, (m_isMenuM1 && !hudNearRule) ? m_mainZMax
+                                                   : (m_sceneDepth > 0.0f ? m_sceneDepth : m_mainZMax));
         auto hudMvpAt = [&](float zh, XrMatrix4x4f& out) {
             const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
             XrMatrix4x4f H{}, toWorld;
@@ -1063,7 +1066,10 @@ public:
         hudToWorldBack.m[12] = backCenter.x; hudToWorldBack.m[13] = backCenter.y; hudToWorldBack.m[14] = backCenter.z; hudToWorldBack.m[15] = 1.0f;
         XrMatrix4x4f hudMvpBack;
         XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
-        if (hudIso && menuScreen) hudMvpBack = hudMvp;   // the page on the plane of its boxes (see hudIso)
+        if (hudIso && menuScreen) {   // the page on the plane of its boxes (see hudIso); stable for every game but Sega Rally
+            hudMvpBack = hudMvp;
+            if (hudNearRule) hudMvpAt(hudSceneZ, hudMvpBack);
+        }
         if (m_flatMode) {
             // FLAT: the board's own projection into the flat target (see RenderFlat), every view on the
             // screen plane mapped 1:1 onto it (plane (u,v) in -0.5..0.5 -> NDC (2u, -2v), Vulkan y down).
@@ -1079,7 +1085,13 @@ public:
         for (uint32_t pass = 0; pass < 2; ++pass) {
             M2UniformBufferObject& ubo = *m_uboMappedF[m_fs][eye][pass];
             memcpy(ubo.uMvp, mvp.m, sizeof(mvp.m));
-            memcpy(ubo.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
+            {   // The GEOMETRY's HUD plane (secondary views, screen overlays): stable -- the scene's depth, never the HUD's
+                // "nearest" rule (28/09, Guillaume: "3D elements separate, make you squint and come back": they rode the HUD
+                // plane, which jumped with every object passing under the HUD). Sega Rally: as validated.
+                XrMatrix4x4f geoHud = hudMvp;
+                if (hudIso && hudNearRule) hudMvpAt(hudSceneZ, geoHud);
+                memcpy(ubo.uHudMvp, geoHud.m, sizeof(geoHud.m));
+            }
             ubo.uViewport[0] = 496.0f; ubo.uViewport[1] = 384.0f;
             ubo.uFocus[0] = focusX; ubo.uFocus[1] = focusY;
             // The board's screen offsets (0 on Sega Rally, not on Virtua Cop): everything placed in board pixels (secondary
@@ -1308,14 +1320,10 @@ public:
             if (tiled) {
                 const float minZ = (m_a2wScale > 1e-6f) ? 1.2f / m_a2wScale : 1.0f;
                 const float sxg = (m_frontRunsW > 0) ? 496.0f / float(m_frontRunsW) : 1.0f, syg = (m_frontRunsH > 0) ? 384.0f / float(m_frontRunsH) : 1.0f;
-                const auto& zonesSkip = HudZones();
-                for (const FrontRun& r : m_frontRuns) {
-                    if (!zonesSkip.empty() && m_frontRunsW > 0 && m_frontRunsH > 0) {
-                        const float cxr = 0.5f * float(r.x0 + r.x1) / float(m_frontRunsW) * 496.0f, cyr = 0.5f * float(r.y0 + r.y1) / float(m_frontRunsH) * 384.0f;
-                        bool inZ = false;
-                        for (const HudZone& hz : zonesSkip) if (cxr >= hz.x0 && cxr <= hz.x1 && cyr >= hz.y0 && cyr <= hz.y1) { inZ = true; break; }
-                        if (inZ) continue;   // shown on its 3D object instead (below)
-                    }
+                ComputeMovedElements();
+                for (size_t ri = 0; ri < m_frontRuns.size(); ++ri) {
+                    const FrontRun& r = m_frontRuns[ri];
+                    if (ri < m_runZone.size() && m_runZone[ri] >= 0) continue;   // shown on its 3D object instead (below)
                     const float* M = frontPc.uHudMvp;
                     uint16_t key = 0;
                     if (perElement) {
@@ -1413,60 +1421,70 @@ public:
                     const XrVector3f unit{gs, gs, gs};
                     XrMatrix4x4f_CreateTranslationRotationScale(&gunM, &guns.pose[guns.count - 1].position, &guns.pose[guns.count - 1].orientation, &unit);
                 }
-                const float panelTilt = 0.61f;   // 35 degrees: its face toward the player, like a cabinet's control panel
-                const float ct = std::cos(panelTilt), st = std::sin(panelTilt);
-                const float kPanel = screen.width / 496.0f * std::max(0.3f, std::min(3.0f, arcadexr::config::GetFloat("hud.panelScale", 1.25f)));   // board pixel -> metres on the panel (live)
-                for (const HudZone& hz : zones) {
-                    XrVector3f C, R, U;
-                    float w, h;
-                    const float zw = hz.x1 - hz.x0, zhh = hz.y1 - hz.y0;
+                // PANEL: one mapping of the whole board picture, centred hud.panelAngle below the view's centre at
+                // hud.panelDistance, facing the viewer; elements keep their place relative to each other (x and y), at
+                // hud.panelScale times the board's apparent size. (28/09: under the screen's bottom edge it sat "under the
+                // headset" -- now in front, low in the view.)
+                const float dP = std::max(0.5f, arcadexr::config::GetFloat("hud.panelDistance", 1.4f));
+                const float ang = arcadexr::config::GetFloat("hud.panelAngle", 16.0f) * 0.0174533f;
+                const float kPanel = screen.width / 496.0f * (dP / std::max(0.25f, distance)) *
+                                     std::max(0.3f, std::min(3.0f, arcadexr::config::GetFloat("hud.panelScale", 1.2f)));
+                float gy0 = 1e9f, gy1 = -1e9f;
+                for (const HudZone& o : zones) if (o.dest == 1) { gy0 = std::min(gy0, o.y0); gy1 = std::max(gy1, o.y1); }
+                const float gyc = 0.5f * (gy0 + gy1);   // the panel zones' vertical centre on the board -> the panel's centre
+                const XrVector3f camP{screen.center.x + screen.normal.x * distance, screen.center.y + screen.normal.y * distance,
+                                      screen.center.z + screen.normal.z * distance};
+                const float ca = std::cos(ang), sa = std::sin(ang);
+                const XrVector3f dirP{-screen.normal.x * ca - screen.up.x * sa, -screen.normal.y * ca - screen.up.y * sa, -screen.normal.z * ca - screen.up.z * sa};
+                const XrVector3f RP{screen.right.x, screen.right.y, screen.right.z};
+                const XrVector3f UP{screen.up.x * ca - screen.normal.x * sa, screen.up.y * ca - screen.normal.y * sa, screen.up.z * ca - screen.normal.z * sa};
+                const XrVector3f CP{camP.x + dirP.x * dP, camP.y + dirP.y * dP, camP.z + dirP.z * dP};
+                // plane (u', v') -> world: board (bx, by) = ((u'+0.5) 496, (0.5-v') 384) -> CP + RP k (bx-248) - UP k (by-gyc)
+                XrMatrix4x4f Ppanel{};
+                {
+                    const XrVector3f A{RP.x * kPanel * 496.0f, RP.y * kPanel * 496.0f, RP.z * kPanel * 496.0f};
+                    const XrVector3f B{UP.x * kPanel * 384.0f, UP.y * kPanel * 384.0f, UP.z * kPanel * 384.0f};
+                    const float c0 = 192.0f - gyc;   // v' = 0 -> by = 192
+                    Ppanel.m[0] = A.x; Ppanel.m[1] = A.y; Ppanel.m[2] = A.z;
+                    Ppanel.m[4] = B.x; Ppanel.m[5] = B.y; Ppanel.m[6] = B.z;
+                    Ppanel.m[8] = -dirP.x; Ppanel.m[9] = -dirP.y; Ppanel.m[10] = -dirP.z;
+                    Ppanel.m[12] = CP.x - UP.x * kPanel * c0; Ppanel.m[13] = CP.y - UP.y * kPanel * c0; Ppanel.m[14] = CP.z - UP.z * kPanel * c0;
+                    Ppanel.m[15] = 1.0f;
+                }
+                for (const MovedElem& me : m_movedElems) {
+                    const HudZone& hz = zones[size_t(me.zone)];
+                    XrMatrix4x4f P{};
                     if (hz.dest == 0) {
                         if (!haveGun) continue;
                         // gun space: above the rear sight, facing the shooter, top leaning forward 25 degrees
-                        w = 0.070f; h = w * zhh / zw;
-                        const XrVector3f cg{0.0f, 0.050f, 0.004f}, rg{1.0f, 0.0f, 0.0f}, ug{0.0f, 0.906f, -0.423f};
+                        const float zw = hz.x1 - hz.x0, zhh = hz.y1 - hz.y0;
+                        float w = 0.070f, h = w * zhh / zw;
+                        const XrVector3f cg{0.0f, 0.050f, 0.004f}, rg{1.0f, 0.0f, 0.0f}, ug{0.0f, 0.906f, -0.423f}, o0{0, 0, 0};
+                        XrVector3f C, rw, uw, oW;
                         XrMatrix4x4f_TransformVector3f(&C, &gunM, &cg);
-                        XrVector3f o0{0, 0, 0}, rw, uw, oW;
                         XrMatrix4x4f_TransformVector3f(&oW, &gunM, &o0);
                         XrMatrix4x4f_TransformVector3f(&rw, &gunM, &rg);
                         XrMatrix4x4f_TransformVector3f(&uw, &gunM, &ug);
-                        R = {rw.x - oW.x, rw.y - oW.y, rw.z - oW.z}; U = {uw.x - oW.x, uw.y - oW.y, uw.z - oW.z};
+                        XrVector3f R{rw.x - oW.x, rw.y - oW.y, rw.z - oW.z}, U{uw.x - oW.x, uw.y - oW.y, uw.z - oW.z};
                         const float lr = std::sqrt(R.x * R.x + R.y * R.y + R.z * R.z), lu = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
                         if (lr < 1e-6f || lu < 1e-6f) continue;
                         R = {R.x / lr, R.y / lr, R.z / lr}; U = {U.x / lu, U.y / lu, U.z / lu};
-                        w *= lr; h *= lr;   // gun.scale
+                        w *= lr; h *= lr;
+                        const float du = zw / 496.0f, dv = zhh / 384.0f;
+                        const float uc = 0.5f * (hz.x0 + hz.x1) / 496.0f - 0.5f, vc = 0.5f - 0.5f * (hz.y0 + hz.y1) / 384.0f;
+                        const XrVector3f A{R.x * w / du, R.y * w / du, R.z * w / du}, B{U.x * h / dv, U.y * h / dv, U.z * h / dv};
+                        const XrVector3f N{R.y * U.z - R.z * U.y, R.z * U.x - R.x * U.z, R.x * U.y - R.y * U.x};
+                        P.m[0] = A.x; P.m[1] = A.y; P.m[2] = A.z; P.m[4] = B.x; P.m[5] = B.y; P.m[6] = B.z;
+                        P.m[8] = N.x; P.m[9] = N.y; P.m[10] = N.z;
+                        P.m[12] = C.x - uc * A.x - vc * B.x; P.m[13] = C.y - uc * A.y - vc * B.y; P.m[14] = C.z - uc * A.z - vc * B.z; P.m[15] = 1.0f;
                     } else {
-                        // world: a board under the screen, closer to the player, face tilted toward them. The zones keep their
-                        // place relative to each other on the board (x and y), scaled: they cannot overlap on the panel.
-                        w = zw * kPanel; h = zhh * kPanel;
-                        float yTop = 1e9f;
-                        for (const HudZone& o : zones) if (o.dest == 1) yTop = std::min(yTop, o.y0);
-                        R = {screen.right.x, screen.right.y, screen.right.z};
-                        U = {screen.up.x * ct - screen.normal.x * st, screen.up.y * ct - screen.normal.y * st, screen.up.z * ct - screen.normal.z * st};
-                        const float xOff = (0.5f * (hz.x0 + hz.x1) - 248.0f) * kPanel;
-                        const float yOff = (0.5f * (hz.y0 + hz.y1) - yTop) * kPanel;   // down the panel's surface
-                        const float drop = screen.height * 0.5f + arcadexr::config::GetFloat("hud.panelDrop", 0.10f);
-                        const float nearer = arcadexr::config::GetFloat("hud.panelNearer", 0.45f);
-                        C = {screen.center.x - screen.up.x * drop + screen.normal.x * nearer + R.x * xOff - U.x * yOff,
-                             screen.center.y - screen.up.y * drop + screen.normal.y * nearer + R.y * xOff - U.y * yOff,
-                             screen.center.z - screen.up.z * drop + screen.normal.z * nearer + R.z * xOff - U.z * yOff};
+                        P = Ppanel;
                     }
-                    // plane coordinates (u', v') of the zone -> this quad
-                    const float du = zw / 496.0f, dv = zhh / 384.0f;
-                    const float uc = 0.5f * (hz.x0 + hz.x1) / 496.0f - 0.5f, vc = 0.5f - 0.5f * (hz.y0 + hz.y1) / 384.0f;
-                    const XrVector3f A{R.x * w / du, R.y * w / du, R.z * w / du}, B{U.x * h / dv, U.y * h / dv, U.z * h / dv};
-                    const XrVector3f N{R.y * U.z - R.z * U.y, R.z * U.x - R.x * U.z, R.x * U.y - R.y * U.x};
-                    XrMatrix4x4f P{};
-                    P.m[0] = A.x; P.m[1] = A.y; P.m[2] = A.z;
-                    P.m[4] = B.x; P.m[5] = B.y; P.m[6] = B.z;
-                    P.m[8] = N.x; P.m[9] = N.y; P.m[10] = N.z;
-                    P.m[12] = C.x - uc * A.x - vc * B.x; P.m[13] = C.y - uc * A.y - vc * B.y; P.m[14] = C.z - uc * A.z - vc * B.z; P.m[15] = 1.0f;
                     XrMatrix4x4f zoneMvp; XrMatrix4x4f_Multiply(&zoneMvp, &viewProjection, &P);
-                    // scissor: the quad's four corners on screen
                     float sx0 = 1e9f, sy0 = 1e9f, sx1 = -1e9f, sy1 = -1e9f; bool ok = true;
                     for (int c = 0; c < 4; ++c) {
-                        const float u = (c & 1) ? hz.x1 / 496.0f - 0.5f : hz.x0 / 496.0f - 0.5f;
-                        const float v = (c & 2) ? 0.5f - hz.y1 / 384.0f : 0.5f - hz.y0 / 384.0f;
+                        const float u = ((c & 1) ? me.x1 + 2.0f : me.x0 - 2.0f) / 496.0f - 0.5f;
+                        const float v = 0.5f - ((c & 2) ? me.y1 + 2.0f : me.y0 - 2.0f) / 384.0f;
                         const float* M = zoneMvp.m;
                         const float cx = M[0] * u + M[4] * v + M[12], cy = M[1] * u + M[5] * v + M[13], cw = M[3] * u + M[7] * v + M[15];
                         if (cw <= 1e-4f) { ok = false; break; }
@@ -1478,9 +1496,9 @@ public:
                     const int ix1 = std::min(int(outW), int(sx1) + 3), iy1 = std::min(int(outH), int(sy1) + 3);
                     if (ix1 <= ix0 || iy1 <= iy0) continue;
                     memcpy(frontPc.uHudMvp, zoneMvp.m, sizeof(zoneMvp.m));
-                    frontPc.uEyeArc[3] = -1.0f;   // zone mode: only its rectangle
-                    frontPc.uProj[0] = hz.x0 / 496.0f; frontPc.uProj[1] = hz.y0 / 384.0f;
-                    frontPc.uProj[2] = hz.x1 / 496.0f; frontPc.uProj[3] = hz.y1 / 384.0f;
+                    frontPc.uEyeArc[3] = -1.0f;   // zone mode: only this element's rectangle
+                    frontPc.uProj[0] = (me.x0 - 1.0f) / 496.0f; frontPc.uProj[1] = (me.y0 - 1.0f) / 384.0f;
+                    frontPc.uProj[2] = (me.x1 + 1.0f) / 496.0f; frontPc.uProj[3] = (me.y1 + 1.0f) / 384.0f;
                     vkCmdPushConstants(cmd, m_planePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(frontPc), &frontPc);
                     const VkRect2D rc{{ix0, iy0}, {uint32_t(ix1 - ix0), uint32_t(iy1 - iy0)}};
                     vkCmdSetScissor(cmd, 0, 1, &rc);
@@ -2016,6 +2034,57 @@ public:
     struct HudZone { int dest; float x0, y0, x1, y1; };
     std::vector<HudZone> m_hudZones;
     std::string m_hudZonesKey;
+    // Elements of the front layer (runs that touch, 2 px): an element moves to a zone's 3D object only if it lies
+    // ENTIRELY inside the zone (28/09: on the title screen the zone cut the bottom of the logo, the panel showed a big
+    // rectangle of the title and the title missed it). m_runZone: per run, zone index or -1; m_movedElems: zone + board
+    // bbox of each moved element.
+    std::vector<int> m_runZone;
+    struct MovedElem { int zone; float x0, y0, x1, y1; };
+    std::vector<MovedElem> m_movedElems;
+    void ComputeMovedElements() {
+        m_runZone.assign(m_frontRuns.size(), -1);
+        m_movedElems.clear();
+        const auto& zones = HudZones();
+        const size_t n = m_frontRuns.size();
+        if (zones.empty() || n == 0 || n > 4000 || m_frontRunsW == 0 || m_frontRunsH == 0) return;
+        std::vector<int> parent(n), order(n);
+        for (size_t i = 0; i < n; ++i) { parent[i] = int(i); order[i] = int(i); }
+        auto find = [&](int x) { while (parent[size_t(x)] != x) { parent[size_t(x)] = parent[size_t(parent[size_t(x)])]; x = parent[size_t(x)]; } return x; };
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return m_frontRuns[size_t(a)].y0 < m_frontRuns[size_t(b)].y0; });
+        for (size_t oi = 0; oi < n; ++oi) {
+            const FrontRun& a = m_frontRuns[size_t(order[oi])];
+            for (size_t oj = oi + 1; oj < n; ++oj) {
+                const FrontRun& b = m_frontRuns[size_t(order[oj])];
+                if (int(b.y0) > int(a.y1) + 2) break;
+                if (int(a.x0) <= int(b.x1) + 2 && int(b.x0) <= int(a.x1) + 2) {
+                    const int ra = find(order[oi]), rb = find(order[oj]);
+                    if (ra != rb) parent[size_t(ra)] = rb;
+                }
+            }
+        }
+        const float sx = 496.0f / float(m_frontRunsW), sy = 384.0f / float(m_frontRunsH);
+        std::unordered_map<int, std::array<float, 4>> box;
+        for (size_t i = 0; i < n; ++i) {
+            const FrontRun& a = m_frontRuns[i];
+            const std::array<float, 4> q{float(a.x0) * sx, float(a.y0) * sy, float(a.x1) * sx, float(a.y1) * sy};
+            auto it = box.find(find(int(i)));
+            if (it == box.end()) box.emplace(find(int(i)), q);
+            else { auto& b = it->second; b[0] = std::min(b[0], q[0]); b[1] = std::min(b[1], q[1]); b[2] = std::max(b[2], q[2]); b[3] = std::max(b[3], q[3]); }
+        }
+        std::unordered_map<int, int> elemZone;
+        for (const auto& kv : box) {
+            const auto& q = kv.second;
+            for (size_t z = 0; z < zones.size(); ++z) {
+                const HudZone& hz = zones[z];
+                if (q[0] >= hz.x0 - 2.0f && q[1] >= hz.y0 - 2.0f && q[2] <= hz.x1 + 2.0f && q[3] <= hz.y1 + 2.0f) {
+                    elemZone.emplace(kv.first, int(z));
+                    m_movedElems.push_back({int(z), q[0], q[1], q[2], q[3]});
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < n; ++i) { auto it = elemZone.find(find(int(i))); if (it != elemZone.end()) m_runZone[i] = it->second; }
+    }
     const std::vector<HudZone>& HudZones() {
         const std::string z = arcadexr::profiles::GetString("hud.zones", "");
         if (z != m_hudZonesKey) {
