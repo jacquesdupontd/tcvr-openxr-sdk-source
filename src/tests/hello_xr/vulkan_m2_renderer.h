@@ -552,6 +552,24 @@ public:
                                         by1 >= float(p.clip_t) && by0 <= float(p.clip_b);
                     if (inFront && small && inside && zmax < 0.25f * m_sceneDepth && zmax * m_a2wScale < 0.5f) q.rgb |= 0x8000000u;
                 }
+                // Universal rule (29/09, same as the System 22's PrepareFrame): a FLAT polygon facing the camera and glued to it
+                // (< 40 cm in the headset, or 10x nearer than the scene), in the main view, neither a full-frame veil nor a band
+                // (flagged above) is screen content -- a HUD drawn in 3D: bit 28, moved onto the HUD plane (PushNearEffects).
+                if (m_nearFxOn && vc >= 3 && (q.rgb & 0xE000000u) == 0u && q.center_x == mainCx && q.center_y == mainCy && m_a2wScale > 1e-6f) {
+                    float z0 = 1e9f, z1 = -1e9f, sx0 = 1e9f, sx1 = -1e9f, sy0 = 1e9f, sy1 = -1e9f; bool inFront = true;
+                    for (std::uint32_t v = 0; v < vc; v++) {
+                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                        if (rv.z <= 1e-3f) { inFront = false; break; }
+                        z0 = std::min(z0, rv.z); z1 = std::max(z1, rv.z);
+                        const float sx = rv.x / rv.z, sy = rv.y / rv.z;
+                        sx0 = std::min(sx0, sx); sx1 = std::max(sx1, sx); sy0 = std::min(sy0, sy); sy1 = std::max(sy1, sy);
+                    }
+                    // at most half the picture: a HUD element is small; a wall the camera presses against is not (House of
+                    // the Dead's attract once gave 86 such polygons in a frame without this)
+                    const bool small = sx1 - sx0 <= 248.0f && sy1 - sy0 <= 192.0f;
+                    if (inFront && small && z1 - z0 <= 0.01f * z0 && (z0 * m_a2wScale < 0.40f || (m_sceneDepth > 0.0f && z0 < 0.1f * m_sceneDepth)))
+                        q.rgb |= 0x10000000u;
+                }
                 if (m_fireDiag > 0 && vc >= 3) {
                     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
                     for (std::uint32_t v = 0; v < vc; v++) {
@@ -812,7 +830,7 @@ public:
                     if (!m_nearTmp.empty()) {
                         const size_t k2 = m_nearTmp.size() / 50;
                         std::nth_element(m_nearTmp.begin(), m_nearTmp.begin() + long(k2), m_nearTmp.end());
-                        Log::Write(Log::Level::Info, Fmt("TCVR_NEAR geometry nearest %.2f m at board %d,%d (2%% %.2f m) | under HUD %.2f m | HUD plane %.2f m | scene %.2f m",
+                        Log::Write(Log::Level::Info, Fmt("TCVR_NEAR screen->HUD %u | geometry nearest %.2f m at board %d,%d (2%% %.2f m) | under HUD %.2f m | HUD plane %.2f m | scene %.2f m", m_screenMovedM2,
                             best * m_a2wScale, int((bx + 0.5f) * 496.0f / kArcW), int((by + 0.5f) * 384.0f / kArcH), m_nearTmp[k2] * m_a2wScale,
                             m_hudNear * m_a2wScale, m_lastHudZ * m_a2wScale, m_sceneDepth * m_a2wScale));
                     }
@@ -1727,7 +1745,7 @@ public:
             const std::uint32_t i0 = m_rawIdx[i], i1 = m_rawIdx[i + 1], i2 = m_rawIdx[i + 2];
             const std::uint32_t rank = m_rawPrimOfVertex[i0];
             if (rank > bestRank) continue;
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay: not in the room
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x1A000000u) != 0u) continue;   // screen overlay: not in the room
             const float* a = &m_rawVerts[size_t(i0) * 5];
             const float* b = &m_rawVerts[size_t(i1) * 5];
             const float* c = &m_rawVerts[size_t(i2) * 5];
@@ -2008,7 +2026,7 @@ public:
         };
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x1A000000u) != 0u) continue;   // screen overlay
             const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
             const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
             const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
@@ -2065,7 +2083,7 @@ public:
                 };
                 for (size_t i = 0; i + 2 < end; i += 3) {
                     const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-                    if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
+                    if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x1A000000u) != 0u) continue;   // screen overlay
                     const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
                     const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
                     const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
@@ -2193,7 +2211,7 @@ public:
         };
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x1A000000u) != 0u) continue;   // screen overlay
             float in[3][3], out[4][3]; int n = 0;
             for (int k = 0; k < 3; ++k) {
                 const float* q = &m_rawVerts[size_t(m_rawIdx[i + k]) * 5];
@@ -2224,6 +2242,31 @@ public:
     // eyes were on the zombie at 4 m, still a double image. Its pixels on the cabinet do not change, only its distance.
     void PushNearEffects(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy) {
         if (!m_nearFxOn || !m_haveMainView) return;
+        {   // screen content (bit 28): onto the HUD plane, perceived at its distance (the near comfort undone), same pixels
+            m_screenMovedM2 = 0;
+            const float hudM = m_lastHudZ * m_a2wScale;
+            if (hudM > 0.0f && m_a2wScale > 1e-6f) {
+                float g = hudM;
+                if (m_nearOn && hudM < m_nearStartM && m_nearMinM > 0.0f) {   // f^-1 of the near comfort
+                    const float qa = m_nearMinM / (m_nearStartM * m_nearStartM), qb = 1.0f - 2.0f * m_nearMinM / m_nearStartM, qc = m_nearMinM - hudM;
+                    const float disc = qb * qb - 4.0f * qa * qc;
+                    if (disc > 0.0f) g = std::max(0.01f, (-qb + std::sqrt(disc)) / (2.0f * qa));
+                }
+                const float zt = g / m_a2wScale;
+                for (uint32_t k = 0; k < m_rawPrims.size(); ++k) {
+                    const tcvr_m2_prim& q = m_rawPrims[k];
+                    if ((q.rgb & 0x10000000u) == 0u || q.vertex_count == 0) continue;
+                    const float z0 = m_rawVerts[size_t(q.first_vertex) * 5 + 2];
+                    if (z0 <= 1e-3f) continue;
+                    const float s = zt / z0;
+                    for (uint32_t v = 0; v < q.vertex_count; ++v) {
+                        float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
+                        d[0] *= s; d[1] *= s; d[2] *= s;
+                    }
+                    ++m_screenMovedM2;
+                }
+            }
+        }
         const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
         m_fxPrims.clear(); m_fxGroups.clear();
         if (!m_nearFxOn) m_fxPrevGroups.clear();
@@ -2288,6 +2331,7 @@ public:
     struct FxBox { uint32_t k; float x0, y0, x1, y1, z; uint32_t group; float scale = 1.0f; float zt = 0.0f; };
     std::vector<FxBox> m_fxPrims, m_fxGroups, m_fxPrevGroups;
     bool m_nearFxOn = false;
+    uint32_t m_screenMovedM2 = 0;   // flat camera-glued polygons moved onto the HUD plane this frame
     // Near comfort on the CPU, the vertex stage's nearComfort (m2_vert.glsl): a distance in metres -> where it is drawn; a point
     // of the board camera's space (a2w metres per unit) slid along its ray the same way.
     bool m_nearOn = false;
@@ -2431,7 +2475,7 @@ public:
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
             if (rank >= best && !diag) continue;
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x1A000000u) != 0u) continue;   // screen overlay
             const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
             const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
             const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
