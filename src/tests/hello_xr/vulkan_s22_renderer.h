@@ -64,6 +64,7 @@ public:
         uint32_t Mix2[4];
         uint32_t FadeColor[4];
         float Bias[4];
+        uint32_t Tex[4];      // texture address chain: VMask, RowMask, TileMask, ShadeMax (tcvr_scene_assets)
     };
 
     struct Settings {
@@ -147,16 +148,30 @@ public:
 
     bool UploadAssets(VkCommandBuffer cmd, const tcvr_scene_assets& a) {
         if (!a.tiledata || !a.tilemap || !a.tileattr || !a.ayx || a.tiledata_bytes < 256) return false;
-        std::vector<uint8_t> atlas(size_t(4096) * 4096, 0);
-        const uint32_t tiles = std::min<uint32_t>(a.tiledata_bytes / 256, 65536);
+        // Texture address chain (tcvr_scene_assets): 0 = the System 22's. The System 23 (Time Crisis II) has 8192
+        // tile rows, 17-bit tile numbers (131072 tiles, a 4096 x 8192 atlas) and an unwrapped v.
+        const bool wide = a.row_mask != 0;
+        m_painterOrder = a.painter_order != 0;
+        m_tex[0] = wide ? a.v_mask : 0xfffu;
+        m_tex[1] = wide ? a.row_mask : 0xfff00u;
+        m_tex[2] = wide ? a.tile_mask : 0xffffu;
+        m_tex[3] = wide ? a.shade_max : 0xffffffffu;
+        const uint32_t tiles = std::min<uint32_t>(a.tiledata_bytes / 256, m_tex[2] + 1u);
+        const uint32_t atlasH = std::max<uint32_t>(16u, ((tiles + 255u) / 256u) * 16u);
+        const uint32_t mapRows = std::max<uint32_t>(1u, std::min(a.tilemap_entries, a.tileattr_entries) / 256u);
+        if (atlasH > 16384u || mapRows > 16384u) {
+            Log::Write(Log::Level::Error, Fmt("TCVR_S22VK assets too large: atlas 4096x%u, maps 256x%u", atlasH, mapRows));
+            return false;
+        }
+        std::vector<uint8_t> atlas(size_t(4096) * atlasH, 0);
         for (uint32_t t = 0; t < tiles; ++t) {
             const uint8_t* src = a.tiledata + size_t(t) * 256;
             const size_t bx = size_t(t & 255) * 16, by = size_t(t >> 8) * 16;
             for (int row = 0; row < 16; ++row) std::memcpy(&atlas[(by + row) * 4096 + bx], src + row * 16, 16);
         }
-        m_tileAtlas = MakeImage(cmd, VK_FORMAT_R8_UINT, 4096, 4096, atlas.data(), 1);
-        m_tileMap = MakeImage(cmd, VK_FORMAT_R16_UINT, 256, 4096, a.tilemap, 2);
-        m_tileAttr = MakeImage(cmd, VK_FORMAT_R8_UINT, 256, 4096, a.tileattr, 1);
+        m_tileAtlas = MakeImage(cmd, VK_FORMAT_R8_UINT, 4096, atlasH, atlas.data(), 1);
+        m_tileMap = MakeImage(cmd, VK_FORMAT_R16_UINT, 256, mapRows, a.tilemap, 2);
+        m_tileAttr = MakeImage(cmd, VK_FORMAT_R8_UINT, 256, mapRows, a.tileattr, 1);
         m_ayx = MakeImage(cmd, VK_FORMAT_R8_UINT, 256, 16, a.ayx, 1);
         if (a.sprites && a.sprite_count > 0 && a.sprite_width > 0 && a.sprite_height > 0) {
             m_spriteW = int(a.sprite_width); m_spriteH = int(a.sprite_height);
@@ -181,10 +196,14 @@ public:
                               VK_SAMPLE_COUNT_1_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT, 16, kBankMips);
         Barrier(cmd, m_penBanks.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        StartBankWorker(a, tiles);
+        // The decoded banks follow the System 22's chain (4096 x 65536 address space): not for the System 23, whose
+        // polygons then all take the table chain (texPen), texel-exact like the board.
+        if (!wide) StartBankWorker(a, tiles);
+        else StopBankWorker(), m_bankReadyMask = 0;
         m_assetsReady = true;
         m_setsDirty = true;
-        Log::Write(Log::Level::Info, Fmt("TCVR_S22VK assets: tiles %u bytes, sprites %u (%ux%u)", a.tiledata_bytes, a.sprite_count,
+        Log::Write(Log::Level::Info, Fmt("TCVR_S22VK assets: tiles %u bytes (%u tiles, atlas 4096x%u, maps 256x%u, masks v %x row %x tile %x shade %x), sprites %u (%ux%u)",
+                                         a.tiledata_bytes, tiles, atlasH, mapRows, m_tex[0], m_tex[1], m_tex[2], m_tex[3], a.sprite_count,
                                          a.sprite_width, a.sprite_height));
         return true;
     }
@@ -572,9 +591,10 @@ public:
                 m_vertexData.insert(m_vertexData.end(), row, row + 8);
             }
             const bool hud = pr.kind != 0 || pr.direct != 0;
-            if (m_runs.empty() || m_runs.back().hud != hud) {
+            const bool full = !hud && pr.stencil != 0;   // the lean 3D shaders have no stencil test (no discard)
+            if (m_runs.empty() || m_runs.back().hud != hud || m_runs.back().full != full) {
                 if (!m_runs.empty()) m_runs.back().count = uint32_t(m_indexData.size()) - m_runs.back().first;
-                m_runs.push_back({uint32_t(m_indexData.size()), 0, hud});
+                m_runs.push_back({uint32_t(m_indexData.size()), 0, hud, full});
             }
             const uint32_t idx0 = uint32_t(m_indexData.size());
             for (uint32_t i = 1; i + 1 < pr.vertex_count; ++i) {
@@ -591,7 +611,7 @@ public:
                 pr.fade_r, pr.fade_g, pr.fade_b, float(pr.fadefactor),
                 float(pr.pfade_enabled), pr.poly_r, pr.poly_g, pr.poly_b,
                 float(pr.alpha_enabled), float(pr.alpha), float(pr.sprite_code), float(pr.flipx),
-                float(pr.flipy), spriteDepth, neighbourZoom, 0,
+                float(pr.flipy), spriteDepth, neighbourZoom, float(pr.stencil),
                 centreX, centreY, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
             m_primData.insert(m_primData.end(), row, row + 64);
@@ -604,7 +624,7 @@ public:
         if (m_altFix)
             for (size_t i = 0; i < m_altCarry.size(); ++i) emit(m_altCarry[i], m_altCarryVerts.data() + m_altCarryFirst[i], true);
         if (!m_runs.empty()) m_runs.back().count = uint32_t(m_indexData.size()) - m_runs.back().first;
-        if (m_reorder) ReorderOpaqueFrontToBack();
+        if (m_reorder && !m_painterOrder) ReorderOpaqueFrontToBack();   // a painter-order board keeps its order
         m_lastPrims = uint32_t(m_primData.size() / 64);
         m_lastIndices = uint32_t(m_indexData.size());
         const auto tCopy = std::chrono::steady_clock::now();
@@ -616,6 +636,8 @@ public:
         if (m_indexData.size() * 4 > kIboBytes || m_vertexData.size() * 4 > kVboBytes) m_lastIndices = 0;   // never draw truncated data
         put(S.pensMap, kPensBytes, f.pens, size_t(f.pen_count) * 4);
         if (f.czram && f.cz_entries == 0x2000) put(S.czMap, kCzBytes, f.czram, size_t(std::min<uint32_t>(f.cz_banks, 4)) * 0x2000);
+        // System 23 has no czram (no fog): its stencil SRAM rides in the same buffer, read only by stencil polygons.
+        if (f.stencil && f.stencil_words) put(S.czMap, kCzBytes, f.stencil, size_t(f.stencil_words) * 2);
         if (f.spotram) put(S.spotMap, kSpotBytes, f.spotram, 0x400 * 2);
         if (f.gamma_r && f.gamma_g && f.gamma_b) {
             uint8_t* g = static_cast<uint8_t*>(S.gammaMap);
@@ -730,7 +752,7 @@ public:
             for (const Run& r : m_runs) {
                 if (!r.count) continue;
                 VkPipeline pl = (r.hud || !st.depthTest) ? m_pSceneHud
-                               : (st.lean == 0 ? m_pScene3D : (st.texSamples > 1 ? m_pP3 : m_pP3NoAa));
+                               : ((st.lean == 0 || r.full) ? m_pScene3D : (st.texSamples > 1 ? m_pP3 : m_pP3NoAa));
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
                 vkCmdDrawIndexed(cmd, r.count, 1, r.first, 0, 0);
             }
@@ -829,7 +851,7 @@ public:
             for (const Run& r : m_runs) {
                 if (!r.count) continue;
                 VkPipeline pl = (r.hud || !st.depthTest) ? m_mSceneHud
-                               : (st.lean == 0 ? m_mScene3D : (st.texSamples > 1 ? m_mP3 : m_mP3NoAa));
+                               : ((st.lean == 0 || r.full) ? m_mScene3D : (st.texSamples > 1 ? m_mP3 : m_mP3NoAa));
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
                 vkCmdDrawIndexed(cmd, r.count, 1, r.first, 0, 0);
             }
@@ -876,7 +898,8 @@ public:
             // polygons are re-sorted front to back anyway); the board projection gives a monotonic depth.
             for (const Run& r : m_runs) {
                 if (!r.count) continue;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.hud ? m_pSceneHud : m_pScene3D);
+                // A painter-order board (System 23) is drawn like the board: in its order, no depth test.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (r.hud || m_painterOrder) ? m_pSceneHud : m_pScene3D);
                 vkCmdDrawIndexed(cmd, r.count, 1, r.first, 0, 0);
             }
         }
@@ -968,14 +991,14 @@ private:
     static constexpr size_t kIboBytes = 256 * 1024 * 4;
     static constexpr size_t kPrimBytes = 16384 * 64 * 4;       // 16k primitives x 16 vec4
     static constexpr size_t kPensBytes = 65536 * 4;
-    static constexpr size_t kCzBytes = 4 * 0x2000;
+    static constexpr size_t kCzBytes = 0x40000;   // System 22: 4 czram banks x 0x2000; System 23: the stencil SRAM (0x20000 u16)
     static constexpr size_t kSpotBytes = 0x400 * 2;
     static constexpr size_t kGammaBytes = 768;
     static constexpr size_t kTextBytes = 1024 * 1024 * 2;
     static constexpr size_t kPriBytes = 1024 * 1024;
 
     struct Img { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
-    struct Run { uint32_t first, count; bool hud; };
+    struct Run { uint32_t first, count; bool hud; bool full = false; };   // full: 3D but needs the full shader (stencil)
     struct Range { uint32_t first, count; bool opaque; };
     std::vector<Range> m_ranges;
     std::vector<uint32_t> m_reorderTmp;
@@ -1084,6 +1107,7 @@ private:
         u.FadeColor[0] = unsigned(f.mix_fade_r); u.FadeColor[1] = unsigned(f.mix_fade_g); u.FadeColor[2] = unsigned(f.mix_fade_b);
         u.Bias[0] = (mvp && m_settings.depthTest) ? m_settings.depthBias : 0.0f;
         u.Bias[3] = m_settings.nearClip;
+        for (int i = 0; i < 4; ++i) u.Tex[i] = m_tex[i];
     }
 
     void BindGeometry(VkCommandBuffer cmd, Slot& S) {
@@ -1588,6 +1612,8 @@ private:
                m_mP3NoAa = VK_NULL_HANDLE, m_mComp = VK_NULL_HANDLE;
     VkPipeline m_pInit = VK_NULL_HANDLE, m_pScene3D = VK_NULL_HANDLE, m_pP3 = VK_NULL_HANDLE, m_pP3NoAa = VK_NULL_HANDLE, m_pSceneHud = VK_NULL_HANDLE, m_pDepth = VK_NULL_HANDLE, m_pComp = VK_NULL_HANDLE;
     VkSampler m_nearest = VK_NULL_HANDLE, m_linear = VK_NULL_HANDLE;
+    uint32_t m_tex[4] = {0xfffu, 0xfff00u, 0xffffu, 0xffffffffu};   // texture chain masks (UploadAssets)
+    bool m_painterOrder = false;                                     // assets.painter_order (System 23)
     Img m_tileAtlas, m_tileMap, m_tileAttr, m_ayx, m_spriteAtlas, m_dummyU, m_dummyF, m_dummyArr, m_dummyU16, m_dmDepth, m_penBanks;
     std::vector<BufferAndMemory> m_stagings;
     int m_spriteW = 1, m_spriteH = 1, m_spritesPerRow = 1;

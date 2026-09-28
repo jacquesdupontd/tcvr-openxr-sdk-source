@@ -1281,8 +1281,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 m_m2Renderer.SetCameraDeltaWanted(appswGame);
                 m_m2Renderer.SetMotionVectorsWanted(appswGame && arcadexr::config::GetInt("appsw_mv", 1) != 0);
                 const int wantRate = (m2Cadence || appswGame) ? 120 : (m_smoothOn ? 90 : 0);
+                // Asserted every frame (a rate lost to the runtime is asked again, see RequestRateForGame); leaving
+                // for 90 Hz never while the System 22 cadence owns the rate (28/09: a Model 2 game followed by Time
+                // Crisis asked 90 "leaving" one frame after the System 22 asked 120 -- stuck at 90).
+                if (wantRate > 0 && wantRate == m_m2RateRequested)
+                    arcadexr::xr::RequestRateForGame(float(wantRate), "Model 2: rate kept");
                 if (wantRate != m_m2RateRequested) {
-                    if (wantRate > 0 || m_m2RateRequested > 0)
+                    if (wantRate > 0 || (m_m2RateRequested > 0 && !m_cadenceActive))
                         arcadexr::xr::RequestRateForGame(wantRate > 0 ? float(wantRate) : 90.0f,
                             appswGame ? "AppSW: 60 drawn + 60 synthesised" : (m2Cadence ? "Model 2 chain: 2 refreshes per arcade frame" : (m_smoothOn ? "smooth motion: every refresh at 90 Hz" : "leaving Model 2 cadence")));
                     m_m2RateRequested = wantRate;
@@ -1440,6 +1445,24 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             }
         }
 
+        // GPU time by section (debug.tcvr.gpu_pass=1, 28/09 -- The House of the Dead: ~16 ms of GPU that did not
+        // follow the resolution, and no pass inside the scene dominated): [start..A] uploads + preparation + flat,
+        // [A..B] the eye's scene pass (MSAA resolve included), [B..end] overlay, AppSW, dumps. Timestamps only OUTSIDE
+        // render passes: inside one, a tiler measures nothing meaningful.
+        const bool gpuPass = m_gpuQueryPool != VK_NULL_HANDLE && arcadexr::config::GetInt("gpu.pass", 0) != 0;
+        if (gpuPass && m_passQueryPool == VK_NULL_HANDLE) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 8;
+            if (vkCreateQueryPool(m_vkDevice, &qi, nullptr, &m_passQueryPool) != VK_SUCCESS) m_passQueryPool = VK_NULL_HANDLE;
+        }
+        const bool passProbe = gpuPass && m_passQueryPool != VK_NULL_HANDLE;
+        m_passWritten[v] = false;
+        if (passProbe) {
+            vkCmdResetQueryPool(cmd, m_passQueryPool, uint32_t(v * 2), 2);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_passQueryPool, uint32_t(v * 2));
+        }
+
         const XrRect2Di& r = layerView.subImage.imageRect;
         VkRect2D renderArea = {{r.offset.x, r.offset.y}, {uint32_t(r.extent.width), uint32_t(r.extent.height)}};
 
@@ -1472,6 +1495,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 m2ImmersiveDrawn = m_m2Renderer.RenderImmersive(viewIndex, layerView, cmd, {uint32_t(r.extent.width), uint32_t(r.extent.height)});
                 vkCmdEndRenderPass(cmd);
             }
+        }
+        if (passProbe) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_passQueryPool, uint32_t(v * 2 + 1));
+            m_passWritten[v] = true;
         }
         // The Model 2 / System 22 modules draw with their own transient depth: the depth swapchain image of this
         // view is not written, and must not be submitted (25/09: the car-select menu slid when the head moved).
@@ -2020,7 +2047,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22Active = false;
         m_viewportScale = 1.0f;
         m_s22Prepared = false;
-        const bool isS22 = arcadexr::profiles::IsSystem22() && s22::HaveSceneSource();
+        // Namco System 23 (Time Crisis II, 28/09): its driver records the same scene format (tcvr_scene.h, texture
+        // masks in the assets), this module draws it. Behind s23.vkFlat / s23.immersive until validated.
+        const bool s23 = arcadexr::profiles::IsSystem23();
+        const bool isS22 = (arcadexr::profiles::IsSystem22() || s23) && s22::HaveSceneSource();
         // Vulkan: System 22 is ALWAYS drawn by the GPU module, flat or immersive. The stored "render=cpu /
         // scene.cpuRaster=1" choice is a GL-era menu option (MAME rasterising the flat screen): in Vulkan it made
         // Time Crisis lag (30+ ms of CPU raster per frame, audio underruns, 23/09). s22.cpuRaster=1 (debug,
@@ -2029,13 +2059,18 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                           arcadexr::config::GetInt("s22.vk", 1) != 0;
         // SCREEN presentation drawn by the GPU too (s22.vkFlat=0 returns to MAME's CPU framebuffer).
         const bool wantFlat = isS22 && !want && arcadexr::profiles::GetString("presentation", "screen") != "immersive" &&
-                              arcadexr::config::GetInt("s22.vkFlat", 1) != 0;
+                              arcadexr::config::GetInt(s23 ? "s23.vkFlat" : "s22.vkFlat", s23 ? 0 : 1) != 0;
         m_s22FlatWanted = wantFlat;
         const int mode = (want || wantFlat) ? (arcadexr::config::GetInt("s22.cpuRaster", 0) ? 1 : 2) : 0;
         {   // Arcade cadence: 120 Hz display while a System 22 game is immersive, back to the baked rate after.
             const bool cadence = want && arcadexr::config::GetInt("s22.cadence", 1) != 0;
-            if (cadence && !m_cadenceRequested) { arcadexr::xr::RequestRateForGame(120.0f, "System 22: 2 refreshes per 60 Hz frame"); m_cadenceRequested = true; }
-            if (!cadence && m_cadenceRequested) { arcadexr::xr::RequestRateForGame(90.0f, "leaving System 22 immersive"); m_cadenceRequested = false; }
+            // Asserted every frame while wanted (asked again if lost); leaving for 90 Hz only if the Model 2 path does
+            // not want a rate of its own.
+            if (cadence) { arcadexr::xr::RequestRateForGame(120.0f, "System 22: 2 refreshes per 60 Hz frame"); m_cadenceRequested = true; }
+            if (!cadence && m_cadenceRequested) {
+                if (m_m2RateRequested == 0) arcadexr::xr::RequestRateForGame(90.0f, "leaving System 22 immersive");
+                m_cadenceRequested = false;
+            }
             m_cadenceActive = cadence;
         }
         if (isS22 && mode != m_s22SceneMode) {
@@ -2503,6 +2538,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             return;
         const double ms = (double(ts[1] - ts[0]) + double(ts[3] - ts[2])) * m_timestampPeriodNs * 1e-6;
         m_gpuSamples.push_back(float(ms));
+        if (m_passQueryPool != VK_NULL_HANDLE && m_passWritten[s0] && m_passWritten[s0 + 1]) {
+            uint64_t pt[4] = {};
+            if (vkGetQueryPoolResults(m_vkDevice, m_passQueryPool, s0 * 2, 4, sizeof(pt), pt, sizeof(uint64_t),
+                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                const double k = m_timestampPeriodNs * 1e-6;
+                // both eyes summed: preparation (+ uploads, eye 0), scene pass, after
+                m_passSamples[0].push_back(float((double(pt[0] - ts[0]) + double(pt[2] - ts[2])) * k));
+                m_passSamples[1].push_back(float((double(pt[1] - pt[0]) + double(pt[3] - pt[2])) * k));
+                m_passSamples[2].push_back(float((double(ts[1] - pt[1]) + double(ts[3] - pt[3])) * k));
+            }
+        }
         UpdateM2DynamicScale(float(ms));
         const auto now = std::chrono::steady_clock::now();
         if (now - m_gpuLogAt >= std::chrono::seconds(1) && !m_gpuSamples.empty()) {
@@ -2511,6 +2557,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             const float med = s[s.size() / 2], p90 = s[(s.size() * 9) / 10], mx = s.back();
             Log::Write(Log::Level::Info, Fmt("TCVR_VKGPU frames=%zu gpuMs med=%.2f p90=%.2f max=%.2f (both eyes) mode=%d",
                                              s.size(), med, p90, mx, m_m2SceneMode));
+            if (!m_passSamples[0].empty()) {
+                float pm[3];
+                for (int i = 0; i < 3; ++i) {
+                    std::vector<float> q = m_passSamples[i];
+                    std::sort(q.begin(), q.end());
+                    pm[i] = q.empty() ? 0.0f : q[q.size() / 2];
+                    m_passSamples[i].clear();
+                }
+                Log::Write(Log::Level::Info, Fmt("TCVR_GPUPASS med ms (both eyes): prep+uploads=%.2f scene=%.2f after=%.2f",
+                                                 pm[0], pm[1], pm[2]));
+            }
             m_gpuSamples.clear();
             m_gpuLogAt = now;
         }
@@ -2526,6 +2583,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_m2Renderer.Cleanup();
             m_overlay.Destroy();
             m_s22.Destroy();
+            if (m_passQueryPool != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(m_vkDevice, m_passQueryPool, nullptr);
+                m_passQueryPool = VK_NULL_HANDLE;
+            }
             if (m_gpuQueryPool != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(m_vkDevice, m_gpuQueryPool, nullptr);
                 m_gpuQueryPool = VK_NULL_HANDLE;
@@ -2681,6 +2742,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     std::map<const ISwapchainImageData*, std::vector<XrSwapchainImageFoveationVulkanFB>> m_fdmImages;
     VkQueryPool m_gpuQueryPool{VK_NULL_HANDLE};
     bool m_gpuQueryWritten[4]{false, false, false, false};
+    VkQueryPool m_passQueryPool{VK_NULL_HANDLE};                 // debug.tcvr.gpu_pass: GPU time by section
+    bool m_passWritten[4]{false, false, false, false};
+    std::vector<float> m_passSamples[3];
     float m_timestampPeriodNs{0.0f};
     std::vector<float> m_gpuSamples;
     std::chrono::steady_clock::time_point m_gpuLogAt{};

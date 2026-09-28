@@ -19,7 +19,7 @@ void main() {
     {   // Pack the polygon's constants once per vertex (the fragment stage of POLY3D reads no table).
         vec4 t2 = P(p, 2), t3 = P(p, 3), t4 = P(p, 4), t5 = P(p, 5), t6 = P(p, 6), t7 = P(p, 7), t8 = P(p, 8);
         vP0.x = (uint(t2.x + 0.5) & 0xffffu) | (u8(t2.z) << 16) | (u8(t2.w) << 24);
-        vP0.y = ((uint(t2.y + 0.5) >> 12) & 15u) | (uint(t3.x > 0.5) << 4) | (uint(t3.y > 0.5) << 5) | ((uint(t3.w + 0.5) & 3u) << 6) |
+        vP0.y = ((uint(t2.y + 0.5) >> 12) & 15u) | (((uint(t2.y + 0.5) >> 16) & 1u) << 19) | (uint(t3.x > 0.5) << 4) | (uint(t3.y > 0.5) << 5) | ((uint(t3.w + 0.5) & 3u) << 6) |
                 (u8(t3.z) << 8) | (uint(t7.x > 0.5) << 16) | (uint(t5.w > 0.5) << 17) | (uint(t8.x > 0.5) << 18) | (u8(t8.y) << 20);
         vP0.z = u8(t5.x) | (u8(t5.y) << 8) | (u8(t5.z) << 16) | (u8(t4.x) << 24);
         vP0.w = (uint(t4.z + 0.5) & 0xffu) | ((uint(int(floor(t4.y + 0.5))) & 0xffffu) << 8) | (u8(t4.w) << 24);

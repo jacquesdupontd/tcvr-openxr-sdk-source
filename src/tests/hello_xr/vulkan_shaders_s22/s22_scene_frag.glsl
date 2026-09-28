@@ -11,14 +11,27 @@ layout(location = 5) flat in uvec4 vP1;
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oPri;
 uint texPen(vec2 uv, int bn) {
+    // System 22: ty = (v & fff) | bank, row = (ty << 4) & fff00. System 23 (Tex masks): v is not wrapped before the
+    // bank is added, 8192 tile rows, and bit 0 of the attribute nibble is bit 16 of the tile number.
+    // (System 23: the board converts u, v with u32(), which saturates a negative value to 0 on the Quest's ARM)
+    if (Tex.x == 0xffffffffu) uv = max(uv, vec2(0.0));
     int tx = int(floor(uv.x)) & 0xfff;
-    int ty = (int(floor(uv.y)) & 0xfff) | bn;
-    int to = ((ty << 4) & 0xfff00) | (tx >> 4);
-    uint tile = texelFetch(TileMap, ivec2(to & 255, to >> 8), 0).r;
+    int ty = (int(floor(uv.y)) & int(Tex.x)) + bn;
+    int to = ((ty << 4) & int(Tex.y)) | (tx >> 4);
     uint attr = texelFetch(TileAttr, ivec2(to & 255, to >> 8), 0).r;
+    uint tile = (texelFetch(TileMap, ivec2(to & 255, to >> 8), 0).r | ((attr & 1u) << 16u)) & Tex.z;
     int ai = (int(attr) << 8) | ((ty << 4) & 0xf0) | (tx & 0xf);
     uint pix = texelFetch(Ayx, ivec2(ai & 255, ai >> 8), 0).r;
     return texelFetch(TileAtlas, ivec2(int(tile & 255u) * 16 + int(pix & 15u), int(tile >> 8u) * 16 + int(pix >> 4u)), 0).r;
+}
+// namcos23 stencil_lookup: a stencil polygon draws only where bit (u & 15) ^ 15 of the c412 SRAM word
+// ((v << 6) | (u >> 4)) & 0x1ffff is set -- u, v the texel BEFORE the bank. The SRAM rides in the czram buffer.
+bool stencilOn(vec2 uv) {
+    uvec2 t = uvec2(max(floor(uv), vec2(0.0)));
+    uint offs = ((t.y << 6u) | (t.x >> 4u)) & 0x1ffffu;
+    uint w = czram[offs >> 1u];
+    uint v16 = ((offs & 1u) == 0u) ? (w & 0xffffu) : (w >> 16u);
+    return ((v16 >> ((t.x & 15u) ^ 15u)) & 1u) != 0u;
 }
 // One level of the decoded bank, bilinear on the COLOURS of the 4 neighbouring indices (wraps like the
 // 12-bit address). Level l = the index mipmap (majority of each 2x2 block).
@@ -43,7 +56,7 @@ void main() {
 #ifdef POLY3D
     // Per-polygon constants packed by the vertex stage (s22_scene_vert): no primitive-table reads per pixel.
     uint pensOff = vP0.x & 0xffffu, pmask = (vP0.x >> 16) & 0xffu, pshift = vP0.x >> 24;
-    int bn = int(vP0.y & 15u) << 12;
+    int bn = int((vP0.y & 15u) | ((vP0.y >> 15u) & 16u)) << 12;   // bank bit 4 (System 23) rides in bit 19
     bool texEn = ((vP0.y >> 4) & 1u) != 0u, shadeEn = ((vP0.y >> 5) & 1u) != 0u;
     int fogMode = int((vP0.y >> 6) & 3u);
     float prio = float((vP0.y >> 8) & 0xffu);
@@ -82,6 +95,7 @@ void main() {
     uvec3 c; uint pen; float srcWeight = 1.0; float spriteCov = 1.0;
 #ifndef POLY3D
     if (t0.x < 0.5) {
+        if (t9.w > 0.5 && !stencilOn(vTex.xy)) discard;   // System 23 stencil polygon (never in the POLY3D runs)
 #else
     {
 #endif
@@ -150,7 +164,7 @@ void main() {
             c = penRGB(pensOff + ((pen >> pshift) & pmask));
         }
         if (shadeEn) {
-            uint shade = uint(max(floor(vTex.z), 0.0));
+            uint shade = min(uint(max(floor(vTex.z), 0.0)), Tex.w);   // System 23: clamped to 63
             c = min((c * (shade << 2u)) >> 8u, uvec3(255u));
         }
         if (fogMode == 2) {

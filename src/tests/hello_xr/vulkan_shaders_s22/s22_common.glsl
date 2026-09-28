@@ -15,6 +15,8 @@ layout(set = 0, binding = 0, std140) uniform S22 {
     uvec4 Mix2;           // AlphaCheck12, AlphaCheck13, HUD mode 3 (sharp text/sprites),
     uvec4 FadeColor;      // xyz fade colour, w: output linearised for an sRGB target (1) or raw (0)
     vec4 Bias;            // relative painter-order depth offset per primitive, EyeOffset, Convergence, near plane (m)
+    uvec4 Tex;            // texture address chain: VMask, RowMask, TileMask, ShadeMax (System 22: fff, fff00, ffff, ~0;
+                          // System 23: ~0, tile id mask, tile count - 1, 63 -- see tcvr_scene_assets)
 };
 layout(std430, set = 0, binding = 1) readonly buffer PrimTable { vec4 prim[]; };   // 16 vec4 per primitive
 layout(std430, set = 0, binding = 2) readonly buffer Pens { uint pens[]; };
