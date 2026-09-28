@@ -979,11 +979,21 @@ public:
         // far and large as on 25/09). Brought to the 2 m HUD plane it sat "right in front of the eyes"; boxes at the
         // game depth with the page left at 2 m, it was a parallax.
         const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f) && HudIsoProfile();
+        const bool hudNearRule = arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
+        const float hudSceneZ = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);   // before any "near" rule
+        auto hudMvpAt = [&](float zh, XrMatrix4x4f& out) {
+            const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
+            XrMatrix4x4f H{}, toWorld;
+            H.m[0] = 496.0f / focusX * zh; H.m[5] = 384.0f / focusY * zh; H.m[10] = 1.0f;
+            H.m[12] = (248.0f - fcx) / focusX * zh; H.m[13] = (fcy - 192.0f) / focusY * zh; H.m[14] = zh; H.m[15] = 1.0f;
+            XrMatrix4x4f_Multiply(&toWorld, &arcadeToWorld, &H);
+            XrMatrix4x4f_Multiply(&out, &viewProjection, &toWorld);
+        };
         if (hudIso) {
-            float zh = std::max(1.0f, m_isMenuM1 ? m_mainZMax : m_sceneDepth);
+            float zh = hudSceneZ;
             // Just in front of the nearest thing behind the HUD (film subtitles), never nearer than 1.2 m (28/09).
             // Sega Rally keeps its validated placement (immersive.hudNear=0).
-            if (arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0) {
+            if (hudNearRule) {
                 if (m_hudNear > 0.0f) zh = std::min(zh, 0.9f * m_hudNear);
                 if (m_a2wScale > 1e-6f) zh = std::max(zh, 1.2f / m_a2wScale);
             }
@@ -1243,9 +1253,36 @@ public:
             bool tiled = !m_frontFullscreen && !m_flatMode && !m_frontRuns.empty() && m_frontRunsW > 0 &&
                          arcadexr::config::GetInt("m2.hudTiles", 1) != 0;
             std::vector<VkRect2D> rects;
+            // Per-element depth (28/09): each run takes the depth of its HUD element (m_hudCellZ, see SceneDepthProbe),
+            // just in front of what is behind it; cells then keep the NEAREST element and each run of cells is drawn
+            // once with its element's plane. Off (Sega Rally, m2.hudPerElement=0): one plane as before.
+            const bool perElement = tiled && hudIso && hudNearRule && arcadexr::config::GetInt("m2.hudPerElement", 1) != 0;
+            std::vector<float> keyZ;               // distinct depths (arcade units), index = key
+            std::vector<XrMatrix4x4f> keyMvp;
+            std::vector<uint16_t> rectKey;
             if (tiled) {
-                const float* M = frontPc.uHudMvp;
+                const float minZ = (m_a2wScale > 1e-6f) ? 1.2f / m_a2wScale : 1.0f;
+                const float sxg = (m_frontRunsW > 0) ? 496.0f / float(m_frontRunsW) : 1.0f, syg = (m_frontRunsH > 0) ? 384.0f / float(m_frontRunsH) : 1.0f;
                 for (const FrontRun& r : m_frontRuns) {
+                    const float* M = frontPc.uHudMvp;
+                    uint16_t key = 0;
+                    if (perElement) {
+                        float ez = 0.0f;
+                        const int gx0 = std::max(0, int(float(r.x0) * sxg / 31.0f)), gx1 = std::min(15, int(float(r.x1) * sxg / 31.0f));
+                        const int gy0 = std::max(0, int(float(r.y0) * syg / 32.0f)), gy1 = std::min(11, int(float(r.y1) * syg / 32.0f));
+                        for (int gy = gy0; gy <= gy1; ++gy)
+                            for (int gx = gx0; gx <= gx1; ++gx) {
+                                const float cz = m_hudCellZ[size_t(gy * 16 + gx)];
+                                if (cz > 0.0f && (ez <= 0.0f || cz < ez)) ez = cz;
+                            }
+                        float zr = (ez > 0.0f) ? std::min(hudSceneZ, 0.9f * ez) : hudSceneZ;
+                        zr = std::max(zr, minZ);
+                        size_t k = 0;
+                        for (; k < keyZ.size(); ++k) if (std::fabs(keyZ[k] - zr) <= 0.02f * zr) break;
+                        if (k == keyZ.size()) { keyZ.push_back(zr); keyMvp.emplace_back(); hudMvpAt(zr, keyMvp.back()); }
+                        key = uint16_t(k);
+                        M = keyMvp[k].m;
+                    }
                     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
                     for (int c = 0; c < 4; ++c) {
                         // three arcade texels of margin: the HUD filter reads up to 2 texels around (measured: 1.5 lost pixels)
@@ -1260,7 +1297,7 @@ public:
                     if (!tiled) break;
                     const int ix0 = std::max(0, int(x0) - 2), iy0 = std::max(0, int(y0) - 2);
                     const int ix1 = std::min(int(outW), int(x1) + 3), iy1 = std::min(int(outH), int(y1) + 3);
-                    if (ix1 > ix0 && iy1 > iy0) rects.push_back({{ix0, iy0}, {uint32_t(ix1 - ix0), uint32_t(iy1 - iy0)}});
+                    if (ix1 > ix0 && iy1 > iy0) { rects.push_back({{ix0, iy0}, {uint32_t(ix1 - ix0), uint32_t(iy1 - iy0)}}); rectKey.push_back(key); }
                 }
             }
             if (tiled) {
@@ -1268,28 +1305,40 @@ public:
                 // anti-aliased HUD edge twice (measured: 4-7 k pixels off by up to 40). Snap them to a grid of
                 // disjoint 32 px cells of the eye image and draw each marked row run once.
                 const int cs = 32, gw = (int(outW) + cs - 1) / cs, gh = (int(outH) + cs - 1) / cs;
+                // cell value = key + 1 (0 = empty); a cell touched by two elements keeps the nearer one
                 m_hudCells.assign(size_t(gw) * size_t(gh), 0u);
-                for (const VkRect2D& rc : rects) {
+                for (size_t ri = 0; ri < rects.size(); ++ri) {
+                    const VkRect2D& rc = rects[ri];
+                    const uint8_t val = uint8_t(std::min<int>(254, int(rectKey[ri])) + 1);
                     const int cx0 = rc.offset.x / cs, cy0 = rc.offset.y / cs;
                     const int cx1 = std::min(gw - 1, (rc.offset.x + int(rc.extent.width) - 1) / cs);
                     const int cy1 = std::min(gh - 1, (rc.offset.y + int(rc.extent.height) - 1) / cs);
                     for (int cy = cy0; cy <= cy1; ++cy)
-                        for (int cx = cx0; cx <= cx1; ++cx) m_hudCells[size_t(cy) * size_t(gw) + size_t(cx)] = 1u;
+                        for (int cx = cx0; cx <= cx1; ++cx) {
+                            uint8_t& c = m_hudCells[size_t(cy) * size_t(gw) + size_t(cx)];
+                            if (c == 0u || (perElement && keyZ[val - 1] < keyZ[c - 1])) c = val;
+                        }
                 }
+                uint8_t pushedVal = 0u;
                 for (int cy = 0; cy < gh; ++cy) {
-                    int run = -1;
+                    int run = -1; uint8_t runVal = 0u;
                     for (int cx = 0; cx <= gw; ++cx) {
-                        const bool on = cx < gw && m_hudCells[size_t(cy) * size_t(gw) + size_t(cx)] != 0u;
-                        if (on && run < 0) run = cx;
-                        if (!on && run >= 0) {
+                        const uint8_t v = cx < gw ? m_hudCells[size_t(cy) * size_t(gw) + size_t(cx)] : uint8_t(0u);
+                        if (run >= 0 && v != runVal) {
                             const int x0 = run * cs, y0 = cy * cs;
                             const int x1 = std::min(int(outW), cx * cs), y1 = std::min(int(outH), (cy + 1) * cs);
                             const VkRect2D rc{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
                             m_hudMvRects[eye & 1u].push_back({float(x0) / outW, float(y0) / outH, float(x1) / outW, float(y1) / outH});
+                            if (perElement && runVal != pushedVal) {
+                                memcpy(frontPc.uHudMvp, keyMvp[runVal - 1].m, sizeof(frontPc.uHudMvp));
+                                vkCmdPushConstants(cmd, m_planePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(frontPc), &frontPc);
+                                pushedVal = runVal;
+                            }
                             vkCmdSetScissor(cmd, 0, 1, &rc);
                             vkCmdDraw(cmd, 3, 1, 0, 0);
                             run = -1;
                         }
+                        if (v != 0u && run < 0) { run = cx; runVal = v; }
                     }
                 }
                 const VkRect2D full{{0, 0}, {uint32_t(outW), uint32_t(outH)}};
@@ -1690,6 +1739,39 @@ public:
                             if (under[gy * kFX + gx]) rayTestAt(A, e1, e2, (float(gx) + 0.5f) * kFW, (float(gy) + 0.5f) * kFH, nearBest[gy * kFX + gx]);
                 }
             }
+            // Per ELEMENT (28/09): 8-connected groups of HUD cells; each group takes the nearest hit under it (gun sparks
+            // drawn by the game at the impact -> the impact's depth). Smoothed per cell: nearer fast, farther slowly.
+            {
+                int comp[kFX * kFY];
+                for (int& c : comp) c = -1;
+                int ncomp = 0;
+                int stack[kFX * kFY];
+                for (int k0 = 0; k0 < kFX * kFY; ++k0) {
+                    if (!under[k0] || comp[k0] >= 0) continue;
+                    int sp = 0; stack[sp++] = k0; comp[k0] = ncomp;
+                    float zmin = 1e30f;
+                    int members[kFX * kFY]; int nm = 0;
+                    while (sp > 0) {
+                        const int k = stack[--sp]; members[nm++] = k;
+                        if (nearBest[k] < zmin) zmin = nearBest[k];
+                        const int x = k % kFX, y = k / kFX;
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                const int xx = x + dx, yy = y + dy;
+                                if (xx < 0 || yy < 0 || xx >= kFX || yy >= kFY) continue;
+                                const int kk = yy * kFX + xx;
+                                if (under[kk] && comp[kk] < 0) { comp[kk] = ncomp; stack[sp++] = kk; }
+                            }
+                    }
+                    for (int m = 0; m < nm; ++m) {
+                        float& cz = m_hudCellZ[size_t(members[m])];
+                        if (zmin >= 1e29f) { cz = 0.0f; continue; }   // nothing behind this element
+                        cz = (cz <= 0.0f || zmin < cz) ? (cz <= 0.0f ? zmin : cz + (zmin - cz) * 0.5f) : cz + (zmin - cz) * 0.05f;
+                    }
+                    ++ncomp;
+                }
+                for (int k = 0; k < kFX * kFY; ++k) if (!under[k]) m_hudCellZ[size_t(k)] = 0.0f;
+            }
             float nh2[kFX * kFY]; int nn = 0;
             for (int k = 0; k < kFX * kFY; ++k) if (under[k] && nearBest[k] < 1e29f) nh2[nn++] = nearBest[k];
             if (nn > 0) {
@@ -1724,6 +1806,7 @@ public:
     }
     float m_sceneDepth = 0.0f;
     float m_hudNear = 0.0f;   // nearest scene under the HUD (arcade units, 20th percentile, smoothed), 0 = none
+    std::array<float, 16 * 12> m_hudCellZ{};   // per 31 x 32 arcade-pixel cell: its HUD element's nearest depth, 0 = none
     float m_probeWorstMs = 0.0f;
     struct FrontRun { uint16_t x0, y0, x1, y1; };
     std::vector<FrontRun> m_frontRuns;
