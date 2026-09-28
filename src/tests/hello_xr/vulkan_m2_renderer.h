@@ -1415,7 +1415,7 @@ public:
                 }
                 const float panelTilt = 0.61f;   // 35 degrees: its face toward the player, like a cabinet's control panel
                 const float ct = std::cos(panelTilt), st = std::sin(panelTilt);
-                const float kPanel = screen.width / 496.0f * 0.85f;   // board pixel -> metres on the panel
+                const float kPanel = screen.width / 496.0f * std::max(0.3f, std::min(3.0f, arcadexr::config::GetFloat("hud.panelScale", 1.25f)));   // board pixel -> metres on the panel (live)
                 for (const HudZone& hz : zones) {
                     XrVector3f C, R, U;
                     float w, h;
@@ -1436,16 +1436,20 @@ public:
                         R = {R.x / lr, R.y / lr, R.z / lr}; U = {U.x / lu, U.y / lu, U.z / lu};
                         w *= lr; h *= lr;   // gun.scale
                     } else {
-                        // world: a board under the screen, closer to the player, face tilted toward them
+                        // world: a board under the screen, closer to the player, face tilted toward them. The zones keep their
+                        // place relative to each other on the board (x and y), scaled: they cannot overlap on the panel.
                         w = zw * kPanel; h = zhh * kPanel;
-                        const float cxBoard = 0.5f * (hz.x0 + hz.x1);
-                        const float xOff = (cxBoard / 496.0f - 0.5f) * screen.width * 0.85f;
-                        const float down = screen.height * 0.5f + 0.12f + h * 0.5f;
-                        C = {screen.center.x + screen.right.x * xOff - screen.up.x * down + screen.normal.x * 0.45f,
-                             screen.center.y + screen.right.y * xOff - screen.up.y * down + screen.normal.y * 0.45f,
-                             screen.center.z + screen.right.z * xOff - screen.up.z * down + screen.normal.z * 0.45f};
+                        float yTop = 1e9f;
+                        for (const HudZone& o : zones) if (o.dest == 1) yTop = std::min(yTop, o.y0);
                         R = {screen.right.x, screen.right.y, screen.right.z};
                         U = {screen.up.x * ct - screen.normal.x * st, screen.up.y * ct - screen.normal.y * st, screen.up.z * ct - screen.normal.z * st};
+                        const float xOff = (0.5f * (hz.x0 + hz.x1) - 248.0f) * kPanel;
+                        const float yOff = (0.5f * (hz.y0 + hz.y1) - yTop) * kPanel;   // down the panel's surface
+                        const float drop = screen.height * 0.5f + arcadexr::config::GetFloat("hud.panelDrop", 0.10f);
+                        const float nearer = arcadexr::config::GetFloat("hud.panelNearer", 0.45f);
+                        C = {screen.center.x - screen.up.x * drop + screen.normal.x * nearer + R.x * xOff - U.x * yOff,
+                             screen.center.y - screen.up.y * drop + screen.normal.y * nearer + R.y * xOff - U.y * yOff,
+                             screen.center.z - screen.up.z * drop + screen.normal.z * nearer + R.z * xOff - U.z * yOff};
                     }
                     // plane coordinates (u', v') of the zone -> this quad
                     const float du = zw / 496.0f, dv = zhh / 384.0f;
