@@ -1378,7 +1378,8 @@ struct OpenXrProgram : IOpenXrProgram {
             m_loggedActionBindings = true;
         }
 
-        // Get pose and grab action state and start haptic vibrate when hand is 90% squeezed.
+        // Get pose and grab action state. (The hello_xr sample also started a haptic pulse EVERY FRAME while the grip
+        // was squeezed past 90 % -- 90 to 120 vibration requests a second to the controller, for nothing: removed 28/09.)
         for (auto hand : {Side::LEFT, Side::RIGHT}) {
             XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
             getInfo.action = m_input.grabAction;
@@ -1389,17 +1390,6 @@ struct OpenXrProgram : IOpenXrProgram {
             if (grabValue.isActive == XR_TRUE) {
                 // Scale the rendered hand by 1.0f (open) to 0.5f (fully squeezed).
                 m_input.handScale[hand] = 1.0f - 0.5f * grabValue.currentState;
-                if (grabValue.currentState > 0.9f) {
-                    XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
-                    vibration.amplitude = 0.5;
-                    vibration.duration = XR_MIN_HAPTIC_DURATION;
-                    vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
-
-                    XrHapticActionInfo hapticActionInfo{XR_TYPE_HAPTIC_ACTION_INFO};
-                    hapticActionInfo.action = m_input.vibrateAction;
-                    hapticActionInfo.subactionPath = m_input.handSubactionPath[hand];
-                    CHECK_XRCMD(xrApplyHapticFeedback(m_session, &hapticActionInfo, (XrHapticBaseHeader*)&vibration));
-                }
             }
 
             getInfo.action = m_input.poseAction;
