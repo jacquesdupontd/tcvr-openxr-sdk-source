@@ -395,6 +395,9 @@ public:
             if (!m_directColour && m_haveHorizon) { m_isMenuM1 = false; m_menuFrames = 0; }
             if (!looksMenu && m_menuFrames > 0) m_menuFrames = 0;
             if (looksMenu && m_menuFrames < 0) m_menuFrames = 0;
+            // Decided ONCE per frame (read per polygon by the routing, and by the shader's uMenuFlat).
+            m_menuIsoNow = m_isMenuM1 && m_mainZMax > 0.0f && HudIsoProfile();
+            m_menuFlatNow = m_isMenuM1 && !m_menuIsoNow && arcadexr::profiles::GetInt("immersive.menuFlat", 0) != 0;
         }
         m_mainClip[0] = mainL; m_mainClip[1] = mainT; m_mainClip[2] = mainR; m_mainClip[3] = mainB;
         m_mainCenter[0] = mainCx; m_mainCenter[1] = mainCy;
@@ -4378,10 +4381,16 @@ private:
     // A menu in ISO (26/09): its 2D page on the game camera's rays at the depth of its 3D, and its 3D (the cars in their
     // boxes) left in 3D at its true depth -- on the page's plane within 0.05 degree of disparity, with its depth test.
     // Flattened, the cars were painted face by face with no depth test: 17 ms of GPU in the car select.
-    bool MenuIso() const { return m_isMenuM1 && m_mainZMax > 0.0f && HudIsoProfile(); }
-    // Otherwise a menu is drawn flat on the screen plane: the vertex shader (uMenuFlat) and the pass routing (isMain)
-    // both read THIS.
-    bool MenuFlat() const { return m_isMenuM1 && !MenuIso(); }
+    bool MenuIso() const { return m_menuIsoNow; }
+    bool m_menuIsoNow = false, m_menuFlatNow = false;
+    // Otherwise a menu WAS drawn flat on the screen plane (the vertex shader's uMenuFlat and the pass routing's isMain
+    // both read THIS), painted face by face with no depth test. Since 28/09 only if the profile asks
+    // (immersive.menuFlat): "no horizon" is the only sign of a Model 2 menu, and Virtua Cop and The House of the Dead
+    // play indoors with none -- their 3D was taken for a menu and flattened: Virtua Cop 30 images/s for 25 s (33 ms of
+    // GPU, 2547 polygons), The House of the Dead 64 % of the time (16 ms against 12). No count or depth separates a
+    // menu from an indoor scene (Sega Rally's car select: 1350-2500 polygons at depth 28; The House of the Dead's
+    // rooms: depth 18-155). Now its 3D stays 3D, with its depth test; the HUD and the 2D page stay on their usual plane.
+    bool MenuFlat() const { return m_menuFlatNow; }
     float m_lastPitchTarget = 0.0f;
     float m_layerUvScaleX[2] = {496.0f / 512.0f, 496.0f / 512.0f};
 
