@@ -1240,12 +1240,26 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             }
             // Bench: debug.tcvr.m2_freeze=1 keeps re-drawing the last scene (no new acquire): the same
             // workload every frame, so an A/B of a render setting is not drowned in scene variance.
-            const bool freeze = arcadexr::config::GetInt("m2.freeze", 0) != 0 && m_lastM2Frame != nullptr;
+            // Bench (28/09): with an injected shot (debug.tcvr.fire=<tag>, openxr_program.cpp), debug.tcvr.fire_freeze=k stops the
+            // picture on the k-th new arcade frame after it -- a one-frame flash can then be dumped in both eyes.
+            {
+                const std::string ft = arcadexr::config::GetString("fire", "0");
+                if (ft != m_fireSeenTag) { m_fireSeenTag = ft; m_fireNewFrames = 0; m_fireFrozen = false; }
+            }
+            const int fireK = (m_fireSeenTag != "0") ? arcadexr::config::GetInt("fire.freeze", 0) : 0;
+            const bool freeze = (arcadexr::config::GetInt("m2.freeze", 0) != 0 || m_fireFrozen) && m_lastM2Frame != nullptr;
             if (freeze) {
                 m2Frame = m_lastM2Frame;
             } else if (M2SceneLive()) {
                 m2Frame = arcadexr::hardware::sega_model2::AcquireScene();
                 if (m2Frame) m_lastM2Frame = m2Frame;
+                if (m2Frame && fireK > 0 && m2Frame->sequence != m_fireLastSeq) {
+                    m_fireLastSeq = m2Frame->sequence;
+                    if (++m_fireNewFrames >= fireK) {
+                        m_fireFrozen = true;
+                        Log::Write(Log::Level::Info, Fmt("TCVR_FIRE frozen on arcade frame %d after the shot (seq %llu)", m_fireNewFrames, (unsigned long long)m2Frame->sequence));
+                    }
+                }
                 m_m2Renderer.SetSmooth(m_smoothOn);
                 if (m2Frame) {
                     const auto tp = clk::now();
@@ -2767,6 +2781,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkDeviceMemory m_dumpMem{VK_NULL_HANDLE};
     VkDeviceSize m_dumpSize{0};
     const tcvr_m2_frame* m_lastM2Frame{nullptr};
+    std::string m_fireSeenTag{"0"};   // bench: injected shot being followed (debug.tcvr.fire)
+    int m_fireNewFrames = 0;          // new arcade frames since it
+    unsigned long long m_fireLastSeq = 0;
+    bool m_fireFrozen = false;        // stopped on debug.tcvr.fire_freeze
     float m_cpuWaitMs{0}, m_cpuPrepMs{0}, m_cpuSubmitMs{0}, m_cpuViewMs{0}, m_cpuPeriodMs{0};
     uint32_t m_cpuFrames{0};
     std::chrono::steady_clock::time_point m_cpuLastFrame{}, m_cpuLogAt{};

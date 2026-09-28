@@ -277,6 +277,27 @@ public:
         if (!haveClipped && !haveRaw) return;
         m_built = true;
         m_overlayOn = arcadexr::profiles::GetInt("immersive.screenOverlay", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
+        m_nearFxOn = !m_flatMode && arcadexr::profiles::GetInt("immersive.nearEffects", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
+        {   // Bench (28/09): after an injected shot (debug.tcvr.fire), each of the next 24 frames logs its nearest polygons
+            // and its front layer (TCVR_FIREDIAG) -- what the game draws for a shot, and where. Logged one frame late.
+            if (!m_fireNear.empty()) {
+                std::sort(m_fireNear.begin(), m_fireNear.end(), [](const NearPoly& a, const NearPoly& b) { return a.z < b.z; });
+                std::string line;
+                for (size_t i = 0; i < m_fireNear.size() && i < 6; ++i) {
+                    const NearPoly& e = m_fireNear[i];
+                    line += Fmt(" [r%u z=%.2f box=%.0f,%.0f..%.0f,%.0f tex=%u tr=%u cb=%u %s]", e.k, e.z, e.x0, e.y0, e.x1, e.y1, e.tex, e.trans, e.cb,
+                                (e.rgb & 0x2000000u) ? "VOILE" : "");
+                }
+                uint32_t rx0 = 9999, ry0 = 9999, rx1 = 0, ry1 = 0;
+                for (const auto& r : m_frontRuns) { rx0 = std::min<uint32_t>(rx0, r.x0); ry0 = std::min<uint32_t>(ry0, r.y0); rx1 = std::max<uint32_t>(rx1, r.x1); ry1 = std::max<uint32_t>(ry1, r.y1); }
+                Log::Write(Log::Level::Info, Fmt("TCVR_FIREDIAG f%d polys=%zu front=%s runs=%zu box=%u,%u..%u,%u near:%s", 24 - m_fireDiag, m_fireNear.size(),
+                                                 m_frontFullscreen ? "PLEIN-BLANC" : "hud", m_frontRuns.size(), rx0, ry0, rx1, ry1, line.c_str()));
+            }
+            m_fireNear.clear();
+            const std::string ft = arcadexr::config::GetString("fire", "0");
+            if (ft != m_fireDiagTag) { m_fireDiagTag = ft; m_fireDiag = (ft != "0") ? 25 : 0; }
+            if (m_fireDiag > 0) --m_fireDiag;
+        }
 
         // Fan-triangulate and sort primitives
         const tcvr_m2_prim* kp = frame.raw_prim_count ? frame.raw_prims : frame.prims;
@@ -498,6 +519,35 @@ public:
                                 k, n, (fullW && fullH) ? "plein" : "bande", x0, y0, x1, y1, p.clip_l, p.clip_t, p.clip_r, p.clip_b, zmin, p.textured, p.translucent, p.colorbase));
                     }
                 }
+                // Camera-attached effects (28/09, House of the Dead: at every shot a burst of translucent sparks around the aim
+                // point, drawn by the game at z 0.7-0.9 -- a hand's breadth from its camera, the scene ten times farther. The
+                // cabinet's flat screen hides that; in the headset the burst hung a few centimetres from the eyes and was seen
+                // double at every shot: "toujours par 2 au même endroit, on louche"). Flagged (bit 27) when textured,
+                // translucent, in the main view, entirely nearer than half a metre in the headset AND than a quarter of the
+                // scene's depth (rain around the camera, 2 m away, stays in 3D): PushNearEffects()
+                // moves each burst along its camera rays onto what it covers. The depth probes and the aim skip them.
+                if (m_nearFxOn && vc >= 3 && q.textured != 0u && q.translucent != 0u && m_sceneDepth > 0.0f &&
+                    q.center_x == mainCx && q.center_y == mainCy) {
+                    float zmax = 0.0f; bool inFront = true;
+                    for (std::uint32_t v = 0; v < vc; v++) {
+                        const float z = frame.raw_vertices[p.first_vertex + v].z;
+                        if (z <= 1e-3f) { inFront = false; break; }
+                        zmax = std::max(zmax, z);
+                    }
+                    if (inFront && zmax < 0.25f * m_sceneDepth && zmax * m_a2wScale < 0.5f) q.rgb |= 0x8000000u;
+                }
+                if (m_fireDiag > 0 && vc >= 3) {
+                    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
+                    for (std::uint32_t v = 0; v < vc; v++) {
+                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                        if (rv.z <= 1e-3f) { zmin = -1.0f; break; }   // crosses the camera plane: a wall or floor, not an effect
+                        const float sx = float(frame.crtc_xoffset + p.center_x) + rv.x / rv.z;
+                        const float sy = float((384 - p.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                        zmin = std::min(zmin, rv.z);
+                    }
+                    if (zmin > 0.0f) m_fireNear.push_back({zmin, x0, y0, x1, y1, k, q.rgb, q.textured, q.translucent, q.colorbase});
+                }
                 m_rawPrims[k] = q;
                 if (m_rawPrimSrc.size() < m_rawPrims.size()) m_rawPrimSrc.resize(m_rawPrims.size());
                 m_rawPrimSrc[k] = 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu);   // capture index: its motion matrix
@@ -687,6 +737,7 @@ public:
             GroundProbe(frame, mainCx, mainCy, mainB);
             SceneDepthProbe(frame, mainCx, mainCy);
             RasterArcadeDepth(frame, mainCx, mainCy);
+            PushNearEffects(frame, mainCx, mainCy);
             // Smooth motion for a Model 2 game (25/09, profile immersive.smoothMotion2: Sega Rally first): polygons carry
             // their identity in the prim (object address, rank, copy) instead of Model 1's u/v.
             m_m2Smooth = !m_directColour && !m_flatMode &&
@@ -979,7 +1030,15 @@ public:
         // HUD at 2 m (23/09-24/09): at 10 m it was drawn OVER 3D much nearer (a car at 3 m), which the eyes read as
         // "behind yet in front" -- the texts made Guillaume squint, in Virtua Racing and Virtua Cop. Same apparent
         // size and the same angle above the gaze (m2.hudLift is metres at 10 m). The sky keeps its own distance.
-        const float hudDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 2.0f));
+        // ONE fixed HUD distance (28/09, Guillaume: "tout mettre le plus loin possible, pour qu'on voie si c'est une histoire de
+        // distance ou de panneau"; UEVR's "UI distance", 3D Vision's constant HUD depth): hud.distance > 0 (metres) puts the
+        // whole front 2D layer -- a menu's page with it, the screen overlays and secondary views, the panel -- at that one
+        // constant distance: no depth following the scene, no nearest rule, no per-element depth. Live
+        // (debug.tcvr.hud_distance). 0 = adaptive, as before. Gun games (every game not driven): 50 m for the test.
+        const float hudFixedM = arcadexr::config::GetFloat("hud.distance",
+            arcadexr::profiles::GetFloat("hud.distance", arcadexr::profiles::IsDriving() ? 0.0f : 50.0f));
+        const bool hudFixed = hudFixedM > 0.0f && !m_flatMode;
+        const float hudDistance = hudFixed ? std::max(0.5f, hudFixedM) : std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 2.0f));
         const float hudK = hudDistance / distance;
         const float hudLiftAt10 = arcadexr::config::GetFloat("m2.hudLift", 1.8f);
         const float hudLift = hudLiftAt10 * hudDistance / 10.0f;
@@ -1018,7 +1077,9 @@ public:
             float zh = hudSceneZ;
             // Just in front of the nearest thing behind the HUD (film subtitles), never nearer than 1.2 m (28/09).
             // Sega Rally keeps its validated placement (immersive.hudNear=0).
-            if (hudNearRule) {
+            if (hudFixed && m_a2wScale > 1e-6f) {
+                zh = hudFixedM / m_a2wScale;
+            } else if (hudNearRule) {
                 if (m_hudNear > 0.0f) zh = std::min(zh, 0.9f * m_hudNear);
                 if (m_a2wScale > 1e-6f) zh = std::max(zh, 1.2f / m_a2wScale);
             }
@@ -1068,7 +1129,7 @@ public:
         XrMatrix4x4f_Multiply(&hudMvpBack, &viewProjection, &hudToWorldBack);
         if (hudIso && menuScreen) {   // the page on the plane of its boxes (see hudIso); stable for every game but Sega Rally
             hudMvpBack = hudMvp;
-            if (hudNearRule) hudMvpAt(hudSceneZ, hudMvpBack);
+            if (hudNearRule && !hudFixed) hudMvpAt(hudSceneZ, hudMvpBack);
         }
         if (m_flatMode) {
             // FLAT: the board's own projection into the flat target (see RenderFlat), every view on the
@@ -1089,7 +1150,7 @@ public:
                 // "nearest" rule (28/09, Guillaume: "3D elements separate, make you squint and come back": they rode the HUD
                 // plane, which jumped with every object passing under the HUD). Sega Rally: as validated.
                 XrMatrix4x4f geoHud = hudMvp;
-                if (hudIso && hudNearRule) hudMvpAt(hudSceneZ, geoHud);
+                if (hudIso && hudNearRule && !hudFixed) hudMvpAt(hudSceneZ, geoHud);
                 memcpy(ubo.uHudMvp, geoHud.m, sizeof(geoHud.m));
             }
             ubo.uViewport[0] = 496.0f; ubo.uViewport[1] = 384.0f;
@@ -1263,7 +1324,12 @@ public:
 
         // 4. DrawPlaneLayer (Front 2D HUD)
         m_hudMvAll[eye & 1u] = false; m_hudMvRects[eye & 1u].clear();   // where the HUD covers the eye (AppSW vectors)
-        if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0 && !(skip & 32)) {
+        // The optical gun's white flash (the whole front layer lit for a frame, for the cabinet's photodiode): the aim is
+        // computed here, the flash is of no use, and in the headset it was a white wall "super close" at every shot
+        // (Guillaume, 28/09). Not drawn in immersive for gun games (immersive.gunFlash=1 brings it back).
+        const bool gunFlashHidden = m_frontFullscreen && !m_flatMode &&
+            arcadexr::profiles::GetInt("immersive.gunFlash", arcadexr::profiles::IsDriving() ? 1 : 0) == 0;
+        if (m_haveLayer[0] && arcadexr::config::GetInt("m2.hideHud", 0) == 0 && !(skip & 32) && !gunFlashHidden) {
             PlanePushConstants frontPc{};
             frontPc.uLift = LiftExponent();
             memcpy(frontPc.uHudMvp, hudMvp.m, sizeof(hudMvp.m));
@@ -1282,7 +1348,7 @@ public:
             // soit rien"): each pixel at the depth of the 3D behind it in the board's picture (plane_frag.glsl).
             // m2.hud2d: 1 projected, 0 per-element planes (default again, 28/09: projected, the HUD "redrew in waves, as if
             // seeing blurred" -- the 124 x 96 depth under moving 3D made letters jump between depths, differently per eye).
-            const bool projected2d = hudIso && hudNearRule && !m_frontFullscreen && m_arcDepthImage != VK_NULL_HANDLE &&
+            const bool projected2d = hudIso && hudNearRule && !hudFixed && !m_frontFullscreen && m_arcDepthImage != VK_NULL_HANDLE &&
                                      arcadexr::config::GetInt("m2.hud2d", 0) == 1;
             const float zNearArc = (m_a2wScale > 1e-6f) ? 1.2f / m_a2wScale : 1.0f;
             XrMatrix4x4f projNear{}, projFar{};
@@ -1313,7 +1379,7 @@ public:
             // Per-element depth (28/09): each run takes the depth of its HUD element (m_hudCellZ, see SceneDepthProbe),
             // just in front of what is behind it; cells then keep the NEAREST element and each run of cells is drawn
             // once with its element's plane. Off (Sega Rally, m2.hudPerElement=0): one plane as before.
-            const bool perElement = tiled && hudIso && hudNearRule && !projected2d && arcadexr::config::GetInt("m2.hudPerElement", 1) != 0;
+            const bool perElement = tiled && hudIso && hudNearRule && !hudFixed && !projected2d && arcadexr::config::GetInt("m2.hudPerElement", 1) != 0;
             std::vector<float> keyZ;               // distinct depths (arcade units), index = key
             std::vector<XrMatrix4x4f> keyMvp;
             std::vector<uint16_t> rectKey;
@@ -1425,7 +1491,7 @@ public:
                 // hud.panelDistance, facing the viewer; elements keep their place relative to each other (x and y), at
                 // hud.panelScale times the board's apparent size. (28/09: under the screen's bottom edge it sat "under the
                 // headset" -- now in front, low in the view.)
-                const float dP = std::max(0.5f, arcadexr::config::GetFloat("hud.panelDistance", 1.4f));
+                const float dP = std::max(0.5f, arcadexr::config::GetFloat("hud.panelDistance", hudFixed ? hudFixedM : 1.4f));
                 const float ang = arcadexr::config::GetFloat("hud.panelAngle", 16.0f) * 0.0174533f;
                 const float kPanel = screen.width / 496.0f * (dP / std::max(0.25f, distance)) *
                                      std::max(0.3f, std::min(3.0f, arcadexr::config::GetFloat("hud.panelScale", 1.2f)));
@@ -1540,7 +1606,7 @@ public:
             const std::uint32_t i0 = m_rawIdx[i], i1 = m_rawIdx[i + 1], i2 = m_rawIdx[i + 2];
             const std::uint32_t rank = m_rawPrimOfVertex[i0];
             if (rank > bestRank) continue;
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay: not in the room
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay: not in the room
             const float* a = &m_rawVerts[size_t(i0) * 5];
             const float* b = &m_rawVerts[size_t(i1) * 5];
             const float* c = &m_rawVerts[size_t(i2) * 5];
@@ -1820,7 +1886,7 @@ public:
         };
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
             const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
             const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
             const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
@@ -1877,7 +1943,7 @@ public:
                 };
                 for (size_t i = 0; i + 2 < end; i += 3) {
                     const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-                    if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+                    if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
                     const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
                     const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
                     const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
@@ -2005,7 +2071,7 @@ public:
         };
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
             float in[3][3], out[4][3]; int n = 0;
             for (int k = 0; k < 3; ++k) {
                 const float* q = &m_rawVerts[size_t(m_rawIdx[i + k]) * 5];
@@ -2030,6 +2096,69 @@ public:
             for (int t = 1; t + 1 < n; ++t) rasterTri(g[0], g[t], g[t + 1]);
         }
     }
+    // Camera-attached effects (flag bit 27, see BuildFrame): each burst -- flagged polygons whose boxes come within 16 px --
+    // is scaled along the camera rays onto the surface at its CENTRE -- where the bullet hits, where the player looks (the
+    // arcade depth map, effects excluded). Not the nearest surface under the whole burst: that was the floor at 1.3 m while the
+    // eyes were on the zombie at 4 m, still a double image. Its pixels on the cabinet do not change, only its distance.
+    void PushNearEffects(const tcvr_m2_frame& frame, int32_t mainCx, int32_t mainCy) {
+        if (!m_nearFxOn || !m_haveMainView) return;
+        const float fx = float(frame.crtc_xoffset + mainCx), fy = float((384 - mainCy) + frame.crtc_yoffset);
+        m_fxPrims.clear(); m_fxGroups.clear();
+        for (uint32_t k = 0; k < m_rawPrims.size(); ++k) {
+            const tcvr_m2_prim& q = m_rawPrims[k];
+            if ((q.rgb & 0x8000000u) == 0u) continue;
+            FxBox e{k, 1e9f, 1e9f, -1e9f, -1e9f, 1e9f, 0};
+            for (uint32_t v = 0; v < q.vertex_count; ++v) {
+                const float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
+                const float sx = fx + d[0] / d[2], sy = fy - d[1] / d[2];
+                e.x0 = std::min(e.x0, sx); e.x1 = std::max(e.x1, sx); e.y0 = std::min(e.y0, sy); e.y1 = std::max(e.y1, sy);
+                e.z = std::min(e.z, d[2]);
+            }
+            uint32_t g = 0;
+            for (; g < m_fxGroups.size(); ++g) {
+                FxBox& b = m_fxGroups[g];
+                if (e.x0 <= b.x1 + 16.0f && e.x1 >= b.x0 - 16.0f && e.y0 <= b.y1 + 16.0f && e.y1 >= b.y0 - 16.0f) {
+                    b.x0 = std::min(b.x0, e.x0); b.x1 = std::max(b.x1, e.x1); b.y0 = std::min(b.y0, e.y0); b.y1 = std::max(b.y1, e.y1);
+                    b.z = std::min(b.z, e.z);
+                    break;
+                }
+            }
+            if (g == m_fxGroups.size()) m_fxGroups.push_back(e);
+            e.group = g;
+            m_fxPrims.push_back(e);
+        }
+        const float kx = float(kArcW) / 496.0f, ky = float(kArcH) / 384.0f;
+        for (FxBox& b : m_fxGroups) {
+            const int cx = int(0.5f * (b.x0 + b.x1) * kx), cy = int(0.5f * (b.y0 + b.y1) * ky);
+            const int cx0 = std::max(0, cx - 2), cx1 = std::min(kArcW - 1, cx + 2);
+            const int cy0 = std::max(0, cy - 2), cy1 = std::min(kArcH - 1, cy + 2);
+            float zt = 0.0f;
+            for (int y = cy0; y <= cy1; ++y)
+                for (int x = cx0; x <= cx1; ++x) {
+                    const float d = m_arcDepthCpu[size_t(y) * kArcW + size_t(x)];
+                    if (d > 0.0f && (zt == 0.0f || d < zt)) zt = d;
+                }
+            if (zt <= 0.0f) zt = m_sceneDepth;
+            b.group = 0;
+            b.scale = (zt > 0.0f && b.z > 1e-3f) ? std::max(1.0f, 0.95f * zt / b.z) : 1.0f;
+        }
+        for (const FxBox& e : m_fxPrims) {
+            const float s = m_fxGroups[e.group].scale;
+            if (s == 1.0f) continue;
+            const tcvr_m2_prim& q = m_rawPrims[e.k];
+            for (uint32_t v = 0; v < q.vertex_count; ++v) {
+                float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
+                d[0] *= s; d[1] *= s; d[2] *= s;
+            }
+        }
+        if (m_fireDiag > 0 && !m_fxGroups.empty())
+            Log::Write(Log::Level::Info, Fmt("TCVR_NEARFX %zu polygons, %zu bursts (m/unit %.3f, scene z %.1f), first: box %.0f,%.0f..%.0f,%.0f z %.2f x%.1f",
+                                             m_fxPrims.size(), m_fxGroups.size(), m_a2wScale, m_sceneDepth, m_fxGroups[0].x0, m_fxGroups[0].y0,
+                                             m_fxGroups[0].x1, m_fxGroups[0].y1, m_fxGroups[0].z, m_fxGroups[0].scale));
+    }
+    struct FxBox { uint32_t k; float x0, y0, x1, y1, z; uint32_t group; float scale = 1.0f; };
+    std::vector<FxBox> m_fxPrims, m_fxGroups;
+    bool m_nearFxOn = false;
     // HUD zones moved into the 3D (profile hud.zones, 28/09): board rectangles + destination (0 gun, 1 panel)
     struct HudZone { int dest; float x0, y0, x1, y1; };
     std::vector<HudZone> m_hudZones;
@@ -2084,9 +2213,23 @@ public:
             }
         }
         for (size_t i = 0; i < n; ++i) { auto it = elemZone.find(find(int(i))); if (it != elemZone.end()) m_runZone[i] = it->second; }
+        if (arcadexr::config::GetInt("hud.zonesDiag", 0) != 0) {   // debug.tcvr.hud_zonesDiag=1: each change of the elements
+            std::vector<std::array<int, 5>> el;                      // and of where they go (zone index, or - = stays in the picture)
+            for (const auto& kv : box) {
+                auto it = elemZone.find(kv.first);
+                el.push_back({int(kv.second[1]), int(kv.second[0]), int(kv.second[2]), int(kv.second[3]), it == elemZone.end() ? -1 : it->second});
+            }
+            std::sort(el.begin(), el.end());
+            std::string sig;
+            for (const auto& e : el) sig += Fmt(" [%s %d,%d..%d,%d]", e[4] < 0 ? "-" : Fmt("Z%d", e[4]).c_str(), e[1], e[0], e[2], e[3]);
+            if (sig != m_zonesDiagSig) { m_zonesDiagSig = sig; Log::Write(Log::Level::Info, Fmt("TCVR_ZONES%s", sig.c_str())); }
+        }
     }
+    std::string m_zonesDiagSig;
     const std::vector<HudZone>& HudZones() {
-        const std::string z = arcadexr::profiles::GetString("hud.zones", "");
+        // Live override (debug.tcvr.hud_zones): "0" = no zone, everything stays in the picture (28/09: panel or not, A/B).
+        const std::string zc = arcadexr::config::GetString("hud.zones", "");
+        const std::string z = (zc == "0") ? std::string() : !zc.empty() ? zc : arcadexr::profiles::GetString("hud.zones", "");
         if (z != m_hudZonesKey) {
             m_hudZonesKey = z; m_hudZones.clear();
             size_t pos = 0;
@@ -2132,7 +2275,7 @@ public:
         for (size_t i = 0; i + 2 < end; i += 3) {
             const uint32_t rank = m_rawPrimOfVertex[m_rawIdx[i]];
             if (rank >= best && !diag) continue;
-            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0x2000000u) != 0u) continue;   // screen overlay
+            if (rank < m_rawPrims.size() && (m_rawPrims[rank].rgb & 0xA000000u) != 0u) continue;   // screen overlay
             const float* a = &m_rawVerts[size_t(m_rawIdx[i]) * 5];
             const float* b = &m_rawVerts[size_t(m_rawIdx[i + 1]) * 5];
             const float* c = &m_rawVerts[size_t(m_rawIdx[i + 2]) * 5];
@@ -4868,6 +5011,10 @@ private:
     uint32_t* m_layerStagingMappedF[kFrames][2] = {};
     bool m_haveLayer[2] = {false, false};
     bool m_frontFullscreen = false;
+    struct NearPoly { float z, x0, y0, x1, y1; std::uint32_t k, rgb, tex, trans, cb; };
+    std::vector<NearPoly> m_fireNear;       // bench: this frame's polygons after an injected shot (debug.tcvr.fire)
+    std::string m_fireDiagTag{"0"};
+    int m_fireDiag = 0;
     bool m_backNoTile = false;
     bool m_directColour = false;
     bool m_newGeometry = false;

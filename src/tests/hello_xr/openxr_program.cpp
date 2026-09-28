@@ -1402,7 +1402,16 @@ struct OpenXrProgram : IOpenXrProgram {
                                          m_input.handSubactionPath[Side::RIGHT]};
         XrActionStateFloat triggerValue{XR_TYPE_ACTION_STATE_FLOAT};
         CHECK_XRCMD(xrGetActionStateFloat(m_session, &triggerInfo, &triggerValue));
-        bool const triggerPressed = triggerValue.isActive == XR_TRUE && triggerValue.currentState > 0.5f;
+        bool triggerPressed = triggerValue.isActive == XR_TRUE && triggerValue.currentState > 0.5f;
+        // Bench (28/09): debug.tcvr.fire=<tag> fires ONE shot per new tag -- trigger held 6 frames, aimed at debug.tcvr.aim
+        // ("x,y", 0..1 of the arcade screen, centre by default) -- so what a game draws on a shot is captured without a
+        // player (with debug.tcvr.fire_freeze=k the picture stops k arcade frames later, see graphicsplugin_vulkan.cpp).
+        bool fireInjected = false;
+        {
+            const std::string ft = arcadexr::config::GetString("fire", "0");
+            if (ft != "0" && ft != m_fireTag) { m_fireTag = ft; m_fireFrames = 6; m_fireAim = 40; }
+            if (m_fireFrames > 0) { --m_fireFrames; triggerPressed = true; fireInjected = true; }
+        }
         if (!triggerPressed) m_blockTriggerUntilRelease = false;
         auto reportDigital = [](const char *id, bool pressed, bool &previous) {
             if (pressed != previous) {
@@ -1416,7 +1425,7 @@ struct OpenXrProgram : IOpenXrProgram {
         m_captureCalibration = m_calibrating && triggerPressed && !m_triggerHeld && !menuOpen;
         // Recoil: one hard pulse per shot, on the hand that holds the gun.
         const bool driving = arcadexr::profiles::IsDriving();
-        m_gunPull = (triggerValue.isActive == XR_TRUE) ? triggerValue.currentState : 0.0f;   // the 3D gun's trigger follows
+        m_gunPull = fireInjected ? 1.0f : (triggerValue.isActive == XR_TRUE) ? triggerValue.currentState : 0.0f;   // the 3D gun's trigger follows
         if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen && !driving) {
             m_gunShotAt = std::chrono::steady_clock::now();   // slide recoil + muzzle flash of the 3D gun (28/09)
             const int ms = arcadexr::profiles::GetInt("haptics.ms", 120);
@@ -2113,6 +2122,15 @@ struct OpenXrProgram : IOpenXrProgram {
             arcadexr::input::SetDigital("gun_offscreen",true);
             arcadexr::input::SetDigital("trigger",false);
         }
+        if (m_fireAim > 0) {   // injected shot (debug.tcvr.fire): its aim, and its trigger even with no controller tracked
+            --m_fireAim;
+            float ax = 0.5f, ay = 0.5f;
+            std::sscanf(arcadexr::config::GetString("aim", "0.5,0.5").c_str(), "%f,%f", &ax, &ay);
+            arcadexr::input::SetAnalog("gun_x", std::max(0.0f, std::min(1.0f, ax)));
+            arcadexr::input::SetAnalog("gun_y", std::max(0.0f, std::min(1.0f, ay)));
+            arcadexr::input::SetDigital("gun_offscreen", false);
+            arcadexr::input::SetDigital("trigger", m_fireFrames > 0);
+        }
 
         // Render view to the appropriate part of the swapchain image.
         for (uint32_t i = 0; i < viewCountOutput; i++) {
@@ -2269,6 +2287,8 @@ struct OpenXrProgram : IOpenXrProgram {
     XrTime m_lastTickDisplayTime{0}, m_tickAcc{0};
     XrPosef m_swDelta{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     float m_gunPull = 0.0f;                                   // 3D gun: analog trigger of the aiming hand
+    std::string m_fireTag;                                    // bench: last injected shot (debug.tcvr.fire)
+    int m_fireFrames = 0, m_fireAim = 0;                      // bench: frames left with the trigger held / the aim forced
     std::chrono::steady_clock::time_point m_gunShotAt{};      // 3D gun: last shot (slide recoil, muzzle flash)
     bool m_swDeltaOk{false};
     int m_bugBurst{0};
