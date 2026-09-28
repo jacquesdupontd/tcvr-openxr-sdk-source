@@ -2875,7 +2875,10 @@ private:
         createMappedBuffer(m_colorxlatBufferF[m_fs], m_colorxlatSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                            reinterpret_cast<void**>(&m_colorxlatMappedF[m_fs]));
 
-        m_lumaramSize = 4096 * sizeof(uint32_t);
+        // The whole luma RAM: 0x8000 bytes (lumabase = texheader[1] low byte << 7, up to 0x7ff8). Half of it (4096
+        // words) was uploaded until 28/09: every texture whose luma table sat in the upper half read past the buffer, 0,
+        // and came out BLACK (Super GT's minimap, the tail lights and rear panel of the cars).
+        m_lumaramSize = 0x8000;
         createMappedBuffer(m_lumaramBufferF[m_fs], m_lumaramSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                            reinterpret_cast<void**>(&m_lumaramMappedF[m_fs]));
 
