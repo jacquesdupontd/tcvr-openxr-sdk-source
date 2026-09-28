@@ -1267,9 +1267,10 @@ public:
             frontPc.uUvScaleX = m_layerUvScaleX[0];
             // Front 2D layer PROJECTED onto the 3D (28/09, Guillaume: one method for every 2D pixel, "soit tout bug,
             // soit rien"): each pixel at the depth of the 3D behind it in the board's picture (plane_frag.glsl).
-            // m2.hud2d: 1 projected (default, every game but Sega Rally), 0 per-element planes.
+            // m2.hud2d: 1 projected, 0 per-element planes (default again, 28/09: projected, the HUD "redrew in waves, as if
+            // seeing blurred" -- the 124 x 96 depth under moving 3D made letters jump between depths, differently per eye).
             const bool projected2d = hudIso && hudNearRule && !m_frontFullscreen && m_arcDepthImage != VK_NULL_HANDLE &&
-                                     arcadexr::config::GetInt("m2.hud2d", 1) == 1;
+                                     arcadexr::config::GetInt("m2.hud2d", 0) == 1;
             const float zNearArc = (m_a2wScale > 1e-6f) ? 1.2f / m_a2wScale : 1.0f;
             XrMatrix4x4f projNear{}, projFar{};
             if (projected2d) {
