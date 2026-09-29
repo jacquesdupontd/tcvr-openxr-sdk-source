@@ -2128,6 +2128,16 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 0) != 0);   // off: the arcade flicker is kept (Guillaume 23/09)
         m_s22.SetAltMaxGroup(arcadexr::config::GetInt("s22.altMaxGroup", 4096));
         m_s22.SetReorder(arcadexr::config::GetInt("s22.reorder", 1) != 0);
+        {   // the player's own shots trigger TCVR_S22FIRE: the 3D gun's muzzle flash (anim, bits 16+) rising = a shot
+            const auto gp = arcadexr::gun::GetGunPoses();
+            float flash = 0.0f;
+            for (int g = 0; g < gp.count && g < 2; ++g) flash = std::max(flash, std::floor(gp.anim[g] / 65536.0f));
+            if (flash > 128.0f && m_s22LastFlash <= 128.0f) {
+                const auto as = arcadexr::gun::GetAimState();
+                m_s22.TriggerShotDiag(as.on_screen ? as.normalized_x : 0.5f, as.on_screen ? as.normalized_y : 0.5f);
+            }
+            m_s22LastFlash = flash;
+        }
         m_s22.SetDropBands(want && arcadexr::profiles::GetInt("immersive.dropBands", 1) != 0, m_s22AnchorValid ? m_s22AnchorScale : 0.0f);
         m_s22.SetHudDepthM(m_s22LastHudD);   // camera-glued screen content goes to the HUD plane (last frame's distance)
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
@@ -2784,6 +2794,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool m_haveDepthResolve = false, m_viewWroteSwDepth = false, m_appswWanted = false;
     XrVector3f m_s22EyePosW[2]{};   // near comfort: the eyes' positions (inter-eye distance)
     float m_s22LastHudD = 0.0f;     // the HUD plane's distance (m), for camera-glued screen content
+    float m_s22LastFlash = 0.0f;    // the 3D gun's muzzle flash last frame (a rising edge = the player's shot)
     float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
     float m_s22HudNear = 0.0f;    // ... and of the nearest thing in the picture (m): the HUD stays just in front of it
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };

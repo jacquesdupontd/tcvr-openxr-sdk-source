@@ -197,12 +197,14 @@ void main() {
                  : (p.textured != 0u) ? (1.0 / max(aParamI.x, 1e-7)) : max(aParamI.x, 1e-7);
         float X = (uRaw != 0) ? aPosI.x / max(uFocus.x, 1e-6) : (xs.x - uCrtc.x - float(p.center_x)) * z / max(uFocus.x, 1e-6);
         float Y = (uRaw != 0) ? aPosI.y / max(uFocus.y, 1e-6) : ((384.0 - float(p.center_y)) + uCrtc.y - xs.y) * z / max(uFocus.y, 1e-6);
-        gl_Position = nearStereo(vec3(X, Y, z));
+        // bit 28 = moved onto the HUD plane (PushNearEffects): the HUD's true depth, out of the near comfort like the 2D HUD
+        gl_Position = ((p.rgb & 0x10000000u) != 0u) ? uMvp * vec4(X, Y, z, 1.0) : nearStereo(vec3(X, Y, z));
 #ifdef APPSW_MV
         if (uRaw != 0) {
             vec4 pp = prevPos[gl_VertexIndex];
             if (pp.w > 0.5) {
-                vec4 cp = nearStereo(vec3(pp.x / max(uFocus.x, 1e-6), pp.y / max(uFocus.y, 1e-6), pp.z));
+                vec3 pv = vec3(pp.x / max(uFocus.x, 1e-6), pp.y / max(uFocus.y, 1e-6), pp.z);
+                vec4 cp = ((p.rgb & 0x10000000u) != 0u) ? uMvp * vec4(pv, 1.0) : nearStereo(pv);
                 if (cp.w > 1e-4 && gl_Position.w > 1e-4) vMv = gl_Position.xyz / gl_Position.w - cp.xyz / cp.w;
             }
         }

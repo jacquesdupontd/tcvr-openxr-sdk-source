@@ -75,7 +75,8 @@ void main() {
         float cameraX = (aPos.x + (t0.z - ScreenSize.x * 0.5) * aPos.z) / zoom;
         float cameraY = (aPos.y + (ScreenSize.y * 0.5 - t0.w) * aPos.z) / zoom;
         vScreen = vec2(t0.z + aPos.x / max(aPos.z, 1e-6), t0.w - aPos.y / max(aPos.z, 1e-6));
-        gl_Position = nearStereo(vec3(cameraX, cameraY, aPos.z));
+        // moved onto the HUD plane (flag P(p,10).z): at the HUD's true depth, out of the near comfort like the 2D HUD
+        gl_Position = (P(p, 10).z > 0.5) ? ImmersiveMvp * vec4(cameraX, cameraY, aPos.z, 1.0) : nearStereo(vec3(cameraX, cameraY, aPos.z));
         gl_Position.z = Bias.w * (1.0 + Bias.x * float(p));   // reversed infinite depth, painter order as a relative offset
         vTex = aTex + 0.5;
         vOriginalDepth = aPos.z;

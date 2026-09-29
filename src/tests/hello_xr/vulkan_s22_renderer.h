@@ -337,6 +337,13 @@ public:
     uint32_t m_fxSec = 0, m_screenSecMax = 0, m_bandsSecMax = 0;   // over the second (TakeMoveDiag)
     float m_hudDepthM = 0.0f;                      // the HUD plane's distance (metres), from the last frame
     std::vector<tcvr_scene_vertex> m_moveVerts;
+    bool m_emitOnHud = false;   // emit(): this polygon was moved onto the HUD plane (prim row 42)
+    std::string m_fireTagS22{"0"};   // TCVR_S22FIRE: injected shot followed
+    bool m_diagAimSet = false; float m_diagAim[2] = {0.5f, 0.5f};
+    // A REAL shot of the player (29/09): the same 15 frames of TCVR_S22FIRE around his own aim -- what he sees, logged while
+    // he plays, read afterwards. (This section is public.)
+    void TriggerShotDiag(float ax, float ay) { m_fireNearFrames = 15; m_diagAimSet = true; m_diagAim[0] = ax; m_diagAim[1] = ay; }
+    int m_fireNearFrames = 0;
     float m_bandBox[5] = {}, m_bandSceneZ = 0.0f;
     void SetDropBands(bool on, float a2w = 0.0f) { m_dropBands = on; m_bandA2w = a2w; }
     float m_bandA2w = 0.0f;   // metres per unit (camera-attached test)
@@ -548,6 +555,51 @@ public:
         m_slot = slot & 1;
         Slot& S = m_slots[m_slot];
         const auto tBuild = std::chrono::steady_clock::now();
+        {   // TCVR_S22FIRE (29/09): after an injected shot (debug.tcvr.fire), 15 frames of every polygon nearer than 1 m in the
+            // picture -- flat or not, box, depth, alpha -- to see what Time Crisis II's shot impacts are made of
+            const std::string ft = arcadexr::config::GetString("fire", "0");
+            if (ft != m_fireTagS22) { m_fireTagS22 = ft; m_fireNearFrames = (ft != "0") ? 15 : 0; m_diagAimSet = false; }
+            if (m_fireNearFrames > 0 && m_bandA2w > 0.0f) {
+                --m_fireNearFrames;
+                std::string line; int n = 0;
+                for (uint32_t i = 0; i < f.prim_count && n < 10; ++i) {
+                    const tcvr_scene_prim& p = f.prims[i];
+                    if (p.kind != 0 || p.direct || p.vertex_count < 3) continue;
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                    for (uint32_t k = 0; k < p.vertex_count; ++k) {
+                        const tcvr_scene_vertex& v = f.vertices[p.first_vertex + k];
+                        const float zz = std::max(v.z, 1e-6f);
+                        const float sx = float(p.cx) + v.x / zz, sy = float(p.cy) - v.y / zz;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                        z0 = std::min(z0, v.z); z1 = std::max(z1, v.z);
+                    }
+                    if (z0 <= 0.0f || z1 * m_bandA2w >= 1.0f || x1 < 0.0f || y1 < 0.0f || x0 > float(f.width) || y0 > float(f.height)) continue;
+                    line += Fmt(" [#%u %.0f,%.0f..%.0f,%.0f %.0f..%.0fcm %s a%d/%u tex%u]", i, x0, y0, x1, y1, z0 * m_bandA2w * 100.0f, z1 * m_bandA2w * 100.0f,
+                                (z1 - z0 <= 0.01f * z0) ? "PLAT" : "3D", p.alpha, p.alpha_enabled, p.texture_enabled);
+                    ++n;
+                }
+                // and the 2D polygons (direct, sprites) within 80 px of the injected aim (debug.tcvr.aim, centre by default)
+                float ax = 0.5f, ay = 0.5f; std::sscanf(arcadexr::config::GetString("aim", "0.5,0.5").c_str(), "%f,%f", &ax, &ay);
+                if (m_diagAimSet) { ax = m_diagAim[0]; ay = m_diagAim[1]; }   // a real shot: the player's own aim
+                const float apx = ax * float(f.width), apy = ay * float(f.height);
+                std::string l2; int n2 = 0;
+                for (uint32_t i = 0; i < f.prim_count && n2 < 8; ++i) {
+                    const tcvr_scene_prim& p = f.prims[i];
+                    if ((p.kind == 0 && !p.direct) || p.vertex_count < 3) continue;
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (uint32_t k = 0; k < p.vertex_count; ++k) {
+                        const tcvr_scene_vertex& v = f.vertices[p.first_vertex + k];
+                        const float sx = float(p.cx) + v.x, sy = float(p.cy) - v.y;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                    }
+                    if (x1 < apx - 80.0f || x0 > apx + 80.0f || y1 < apy - 80.0f || y0 > apy + 80.0f) continue;
+                    l2 += Fmt(" [#%u k%u d%u %.0f,%.0f..%.0f,%.0f a%d/%u tex%u pens %u]", i, p.kind, p.direct, x0, y0, x1, y1, p.alpha, p.alpha_enabled,
+                              p.texture_enabled, p.pens_offset);
+                    ++n2;
+                }
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22FIRE f%d 3D<1m:%s | 2D autour de la visee %.0f,%.0f:%s", 15 - m_fireNearFrames, line.c_str(), apx, apy, l2.c_str()));
+            }
+        }
         if (arcadexr::config::GetInt("s22.polyDiag", 0) != 0 && tBuild - m_polyDiagAt > std::chrono::seconds(1)) {
             // TCVR_S22POLY (28/09, Time Crisis II's black boxes in front of the characters): the 8 largest polygons of this
             // frame on the board -- kind, direct, textured, depth, box, pens, alpha -- to find what draws them.
@@ -710,7 +762,7 @@ public:
                 float(pr.pfade_enabled), pr.poly_r, pr.poly_g, pr.poly_b,
                 float(pr.alpha_enabled), float(pr.alpha), float(pr.sprite_code), float(pr.flipx),
                 float(pr.flipy), spriteDepth, neighbourZoom, float(pr.stencil),
-                centreX, centreY, 0, 0,
+                centreX, centreY, m_emitOnHud ? 1.0f : 0.0f, 0,   // z: moved onto the HUD plane (no near comfort, s22_scene_vert)
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
             m_primData.insert(m_primData.end(), row, row + 64);
         };
@@ -759,12 +811,16 @@ public:
             const float disc = qb * qb - 4.0f * qa * qc;
             return disc > 0.0f ? std::max(0.01f, (-qb + std::sqrt(disc)) / (2.0f * qa)) : hudM;
         };
-        auto targetAt = [&](float cx, float cy) {   // what an effect covers: nearest depth >= 20 cm around its centre
+        // what an effect covers: the nearest depth >= 20 cm over its OWN box -- never pushed behind something it overlaps
+        // (29/09: with the centre alone, close-up props of the intro -- a hand 15 cm away -- went behind the body and
+        // "il manque plein de petits polygones dans l'intro")
+        auto targetBox = [&](float bx0, float by0, float bx1, float by1) {
             if (m_depthCpu.empty() || m_depthCpuW == 0 || a2w <= 0.0f) return sceneZ;
-            const int gx = int(cx * float(m_depthCpuW) / bw), gy = int(cy * float(m_depthCpuH) / bh);
+            const int gx0 = std::max(0, int(bx0 * float(m_depthCpuW) / bw)), gx1 = std::min(int(m_depthCpuW) - 1, int(bx1 * float(m_depthCpuW) / bw));
+            const int gy0 = std::max(0, int(by0 * float(m_depthCpuH) / bh)), gy1 = std::min(int(m_depthCpuH) - 1, int(by1 * float(m_depthCpuH) / bh));
             float best = 0.0f;
-            for (int yy = std::max(0, gy - 3); yy <= std::min(int(m_depthCpuH) - 1, gy + 3); ++yy)
-                for (int xx = std::max(0, gx - 3); xx <= std::min(int(m_depthCpuW) - 1, gx + 3); ++xx) {
+            for (int yy = gy0; yy <= gy1; ++yy)
+                for (int xx = gx0; xx <= gx1; ++xx) {
                     const float d = m_depthCpu[size_t(yy) * m_depthCpuW + size_t(xx)];
                     if (d > 0.0f && std::isfinite(d) && d * a2w >= 0.2f && (best == 0.0f || d < best)) best = d;
                 }
@@ -776,7 +832,7 @@ public:
             const tcvr_scene_vertex* v = f.vertices + pr.first_vertex;
             const bool half = m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0;
             if (isBand(pr, v)) { ++m_bandsDropped; continue; }
-            float k = 1.0f;
+            float k = 1.0f; bool onHud = false;
             if (m_dropBands && a2w > 0.0f && pr.kind == 0 && !pr.direct && pr.vertex_count <= 8) {
                 float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
                 for (uint32_t i = 0; i < pr.vertex_count; ++i) {
@@ -791,9 +847,11 @@ public:
                     const bool smallP = x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh;   // a HUD element, not a wall pressed on
                     // opaque only: a translucent flat quad near the camera is a particle (billboard), not a HUD element
                     if (flat && smallP && pr.alpha_enabled == 0 && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ)) && m_hudDepthM > 0.0f) {
-                        k = (nearInv(m_hudDepthM) / a2w) / z0; ++m_screenMoved;
+                        // the HUD's TRUE distance, flagged out of the near comfort (29/09: placed at f^-1 of it, the ammo matched
+                        // its container in disparity but not in head parallax -- it slid out of it when the head moved)
+                        k = (m_hudDepthM / a2w) / z0; ++m_screenMoved; onHud = true;
                     } else if (!flat && z1 * a2w < 0.20f && x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh) {   // hits: 128-192 px
-                        const float zt = targetAt(0.5f * (x0 + x1), 0.5f * (y0 + y1));
+                        const float zt = targetBox(x0, y0, x1, y1);
                         if (zt > z1) { k = 0.95f * zt / z0; ++m_fxMoved; }
                     }
                 }
@@ -801,7 +859,9 @@ public:
             if (k != 1.0f) {
                 m_moveVerts.assign(v, v + pr.vertex_count);
                 for (auto& mv : m_moveVerts) { mv.x *= k; mv.y *= k; mv.z *= k; }
+                m_emitOnHud = onHud;
                 emit(pr, m_moveVerts.data(), half);
+                m_emitOnHud = false;
             } else {
                 emit(pr, v, half);
             }

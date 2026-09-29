@@ -2257,13 +2257,8 @@ public:
             m_scrBox[0] = m_scrBox[1] = 1e9f; m_scrBox[2] = m_scrBox[3] = -1e9f; m_scrZ[0] = 1e9f; m_scrZ[1] = 0.0f;
             const float hudM = m_lastHudZ * m_a2wScale;
             if (hudM > 0.0f && m_a2wScale > 1e-6f) {
-                float g = hudM;
-                if (m_nearOn && hudM < m_nearStartM && m_nearMinM > 0.0f) {   // f^-1 of the near comfort
-                    const float qa = m_nearMinM / (m_nearStartM * m_nearStartM), qb = 1.0f - 2.0f * m_nearMinM / m_nearStartM, qc = m_nearMinM - hudM;
-                    const float disc = qb * qb - 4.0f * qa * qc;
-                    if (disc > 0.0f) g = std::max(0.01f, (-qb + std::sqrt(disc)) / (2.0f * qa));
-                }
-                const float zt = g / m_a2wScale;
+                // the HUD's TRUE distance; the vertex stage leaves bit-28 polygons out of the near comfort (head parallax)
+                const float zt = hudM / m_a2wScale;
                 for (uint32_t k = 0; k < m_rawPrims.size(); ++k) {
                     const tcvr_m2_prim& q = m_rawPrims[k];
                     if ((q.rgb & 0x10000000u) == 0u || q.vertex_count == 0) continue;
@@ -2328,8 +2323,11 @@ public:
             if (zt <= 0.0f) zt = m_sceneDepth;
             // The same burst as last frame (boxes overlapping): keep ITS depth for its whole life (28/09 evening: "les impacts
             // semblent faire un peu loucher" -- re-measured every frame, a burst on a moving zombie hopped in depth).
+            // ... but only while the fresh measurement agrees within 25 % (29/09: in rapid fire every new burst inherited the
+            // first target's depth -- "les impacts sont toujours sur un plan devant nous, au même plan tous")
             for (const FxBox& o : m_fxPrevGroups)
-                if (b.x0 <= o.x1 + 16.0f && b.x1 >= o.x0 - 16.0f && b.y0 <= o.y1 + 16.0f && b.y1 >= o.y0 - 16.0f && o.zt > 0.0f) { zt = o.zt; break; }
+                if (b.x0 <= o.x1 + 16.0f && b.x1 >= o.x0 - 16.0f && b.y0 <= o.y1 + 16.0f && b.y1 >= o.y0 - 16.0f && o.zt > 0.0f &&
+                    std::fabs(o.zt - zt) <= 0.25f * zt) { zt = o.zt; break; }
             b.zt = zt;
             b.group = 0;
             b.scale = (zt > 0.0f && b.z > 1e-3f) ? std::max(1.0f, 0.95f * zt / b.z) : 1.0f;
