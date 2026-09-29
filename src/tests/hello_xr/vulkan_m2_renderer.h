@@ -555,7 +555,9 @@ public:
                 // Universal rule (29/09, same as the System 22's PrepareFrame): a FLAT polygon facing the camera and glued to it
                 // (< 40 cm in the headset, or 10x nearer than the scene), in the main view, neither a full-frame veil nor a band
                 // (flagged above) is screen content -- a HUD drawn in 3D: bit 28, moved onto the HUD plane (PushNearEffects).
-                if (m_nearFxOn && vc >= 3 && (q.rgb & 0xE000000u) == 0u && q.center_x == mainCx && q.center_y == mainCy && m_a2wScale > 1e-6f) {
+                // OPAQUE only (29/09): House of the Dead's rain -- translucent billboards, flat by construction, 25-36 cm from
+                // the camera -- passed the test; its title logo (opaque, 86-103 polygons) is screen content and still does.
+                if (m_nearFxOn && vc >= 3 && q.translucent == 0u && (q.rgb & 0xE000000u) == 0u && q.center_x == mainCx && q.center_y == mainCy && m_a2wScale > 1e-6f) {
                     float z0 = 1e9f, z1 = -1e9f, sx0 = 1e9f, sx1 = -1e9f, sy0 = 1e9f, sy1 = -1e9f; bool inFront = true;
                     for (std::uint32_t v = 0; v < vc; v++) {
                         const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
@@ -567,7 +569,11 @@ public:
                     // at most half the picture: a HUD element is small; a wall the camera presses against is not (House of
                     // the Dead's attract once gave 86 such polygons in a frame without this)
                     const bool small = sx1 - sx0 <= 248.0f && sy1 - sy0 <= 192.0f;
-                    if (inFront && small && z1 - z0 <= 0.01f * z0 && (z0 * m_a2wScale < 0.40f || (m_sceneDepth > 0.0f && z0 < 0.1f * m_sceneDepth)))
+                    // in the game's picture (29/09: flat pieces of floor just under the camera, outside it, passed the test --
+                    // in the headset they are seen too, moved they would come off the floor). sx, sy are relative to the view's centre.
+                    const float hw = 0.5f * float(p.clip_r - p.clip_l + 1), hh = 0.5f * float(p.clip_b - p.clip_t + 1);
+                    const bool inPic = sx1 >= -hw && sx0 <= hw && sy1 >= -hh && sy0 <= hh;
+                    if (inFront && small && inPic && z1 - z0 <= 0.01f * z0 && (z0 * m_a2wScale < 0.40f || (m_sceneDepth > 0.0f && z0 < 0.1f * m_sceneDepth)))
                         q.rgb |= 0x10000000u;
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
@@ -830,6 +836,10 @@ public:
                     if (!m_nearTmp.empty()) {
                         const size_t k2 = m_nearTmp.size() / 50;
                         std::nth_element(m_nearTmp.begin(), m_nearTmp.begin() + long(k2), m_nearTmp.end());
+                        if (m_screenMovedM2 > 0)
+                            Log::Write(Log::Level::Info, Fmt("TCVR_SCREENHUD %u polygones plats colles a la camera -> plan du HUD : box %.0f,%.0f..%.0f,%.0f a %.2f..%.2f m (tex %u tr %u cb %u), HUD a %.2f m",
+                                m_screenMovedM2, m_scrBox[0], m_scrBox[1], m_scrBox[2], m_scrBox[3], m_scrZ[0], m_scrZ[1], m_scrTex, m_scrTrans, m_scrCb,
+                                m_lastHudZ * m_a2wScale));
                         Log::Write(Log::Level::Info, Fmt("TCVR_NEAR screen->HUD %u | geometry nearest %.2f m at board %d,%d (2%% %.2f m) | under HUD %.2f m | HUD plane %.2f m | scene %.2f m", m_screenMovedM2,
                             best * m_a2wScale, int((bx + 0.5f) * 496.0f / kArcW), int((by + 0.5f) * 384.0f / kArcH), m_nearTmp[k2] * m_a2wScale,
                             m_hudNear * m_a2wScale, m_lastHudZ * m_a2wScale, m_sceneDepth * m_a2wScale));
@@ -2244,6 +2254,7 @@ public:
         if (!m_nearFxOn || !m_haveMainView) return;
         {   // screen content (bit 28): onto the HUD plane, perceived at its distance (the near comfort undone), same pixels
             m_screenMovedM2 = 0;
+            m_scrBox[0] = m_scrBox[1] = 1e9f; m_scrBox[2] = m_scrBox[3] = -1e9f; m_scrZ[0] = 1e9f; m_scrZ[1] = 0.0f;
             const float hudM = m_lastHudZ * m_a2wScale;
             if (hudM > 0.0f && m_a2wScale > 1e-6f) {
                 float g = hudM;
@@ -2258,6 +2269,16 @@ public:
                     if ((q.rgb & 0x10000000u) == 0u || q.vertex_count == 0) continue;
                     const float z0 = m_rawVerts[size_t(q.first_vertex) * 5 + 2];
                     if (z0 <= 1e-3f) continue;
+                    {   // what was moved (TCVR_NEAR): board box, depth (m), texture of the moved polygons, for the log
+                        for (uint32_t v = 0; v < q.vertex_count; ++v) {
+                            const float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
+                            const float sx = float(frame.crtc_xoffset + mainCx) + d[0] / d[2], sy = float((384 - mainCy) + frame.crtc_yoffset) - d[1] / d[2];
+                            m_scrBox[0] = std::min(m_scrBox[0], sx); m_scrBox[1] = std::min(m_scrBox[1], sy);
+                            m_scrBox[2] = std::max(m_scrBox[2], sx); m_scrBox[3] = std::max(m_scrBox[3], sy);
+                        }
+                        m_scrZ[0] = std::min(m_scrZ[0], z0 * m_a2wScale); m_scrZ[1] = std::max(m_scrZ[1], z0 * m_a2wScale);
+                        m_scrTex = q.textured; m_scrTrans = q.translucent; m_scrCb = q.colorbase;
+                    }
                     const float s = zt / z0;
                     for (uint32_t v = 0; v < q.vertex_count; ++v) {
                         float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
@@ -2332,6 +2353,8 @@ public:
     std::vector<FxBox> m_fxPrims, m_fxGroups, m_fxPrevGroups;
     bool m_nearFxOn = false;
     uint32_t m_screenMovedM2 = 0;   // flat camera-glued polygons moved onto the HUD plane this frame
+    float m_scrBox[4] = {0, 0, 0, 0}, m_scrZ[2] = {0, 0};   // ... their board box and depth range (m), for TCVR_NEAR
+    uint32_t m_scrTex = 0, m_scrTrans = 0, m_scrCb = 0;
     // Near comfort on the CPU, the vertex stage's nearComfort (m2_vert.glsl): a distance in metres -> where it is drawn; a point
     // of the board camera's space (a2w metres per unit) slid along its ray the same way.
     bool m_nearOn = false;

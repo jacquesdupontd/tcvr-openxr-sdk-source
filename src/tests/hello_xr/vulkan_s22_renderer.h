@@ -789,7 +789,8 @@ public:
                 if (z0 > 0.0f && inPicture) {
                     const bool flat = z1 - z0 <= 0.01f * z0;
                     const bool smallP = x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh;   // a HUD element, not a wall pressed on
-                    if (flat && smallP && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ)) && m_hudDepthM > 0.0f) {
+                    // opaque only: a translucent flat quad near the camera is a particle (billboard), not a HUD element
+                    if (flat && smallP && pr.alpha_enabled == 0 && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ)) && m_hudDepthM > 0.0f) {
                         k = (nearInv(m_hudDepthM) / a2w) / z0; ++m_screenMoved;
                     } else if (!flat && z1 * a2w < 0.20f && x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh) {   // hits: 128-192 px
                         const float zt = targetAt(0.5f * (x0 + x1), 0.5f * (y0 + y1));
