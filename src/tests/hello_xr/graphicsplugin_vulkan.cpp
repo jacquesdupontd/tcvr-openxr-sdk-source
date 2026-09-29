@@ -2429,7 +2429,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     static bool S22AimTrampoline(const XrVector3f& o, const XrVector3f& d, float& nx, float& ny, XrVector3f& hit) {
         if (!s_s22Self) return false;
         arcadexr::gun::SetSceneAimOnPlane(false);
-        if (s_s22Self->S22Aim(o, d, nx, ny, hit)) return true;
+        if (s_s22Self->S22Aim(o, d, nx, ny, hit)) {
+            arcadexr::gun::SetSceneAimOnPlane(s_s22Self->m_s22.AimLastInfinity());   // no 3D under it: on the 2D plane (menus)
+            return true;
+        }
         const bool ok = s_s22Self->m_m2AimLive && s_s22Self->m_m2Renderer.Aim(o, d, nx, ny, hit);
         if (ok) arcadexr::gun::SetSceneAimOnPlane(s_s22Self->m_m2Renderer.AimOnPlane());
         return ok;

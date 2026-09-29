@@ -1572,10 +1572,14 @@ public:
         if (t >= 1e30f && nearT < 1e30f) { t = nearT; ++m_aimDiag.nearFallback; }
         else if (bestT < 1e30f && nearT < bestT) ++m_aimDiag.nearSkipped;
         const float zoom = m_aimTrisZoom;
-        if (t >= 1e30f) {   // nothing met: the direction at infinity, like the cabinet pointed off the scene
+        if (t >= 1e30f) {   // no 3D under the ray
             if (d[2] <= 1e-4f) return false;
             ++m_aimDiag.infinity;
-            const float far = 1.0e7f;
+            // on the 2D plane, where the menus and the HUD are drawn (CONTINUE? YES/NO...), like the Model 2's m_aimHud; beyond
+            // it (no plane yet) the direction at infinity -- off the picture the game reloads, as on the cabinet
+            const float planeZ = (a2w > 0.0f && m_hudDepthM > 0.0f) ? m_hudDepthM / a2w : 0.0f;
+            const float tp = planeZ > 0.0f ? (planeZ - o[2]) / d[2] : -1.0f;
+            const float far = tp > 0.0f ? tp : 1.0e7f;
             hit[0] = o[0] + far * d[0]; hit[1] = o[1] + far * d[1]; hit[2] = o[2] + far * d[2];
             sx = screenW * 0.5f + zoom * hit[0] / hit[2]; sy = screenH * 0.5f - zoom * hit[1] / hit[2];
             m_aimLastInfinity = true;
