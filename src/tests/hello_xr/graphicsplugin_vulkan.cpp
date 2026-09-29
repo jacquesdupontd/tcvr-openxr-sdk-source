@@ -2147,6 +2147,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         {
             const int req = arcadexr::config::GetInt("s22.dumpPrims", 0);
             if (req != 0 && req != m_primDumpDone) { m_primDumpDone = req; m_s22.RequestPrimDump(); }
+            const int reqG = arcadexr::config::GetInt("s22.glassDump", 0);
+            if (reqG != 0 && reqG != m_glassDumpDone) { m_glassDumpDone = reqG; m_s22.RequestGlassDump(); }
         }
         m_s22.SetDiagAlternating(arcadexr::config::GetInt("s22.diagAlt", 0) != 0);
         m_s22.SetAltFix(arcadexr::config::GetInt("s22.altFix", 0) != 0);   // off: the arcade flicker is kept (Guillaume 23/09)
@@ -2236,9 +2238,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // fixe les trucs"): the whole 2D -- text layer, HUD sprites, what goes on the glass, the cinema frame -- at one
         // constant distance, whatever passes under it. The plane that followed the nearest thing (fast in, slow out) and the
         // cinema frame's 2 m, re-decided at every image, made it jump between ~0.6 m and 2 m. Same key as the Model 2's fixed
-        // HUD (hud.distance, live debug.tcvr.hud_distance); 0 = the adaptive plane below. Default 0.65 m: where the adaptive
-        // plane settled in play (0.63 m, just in front of the cover), so nothing under the 2D is perceived nearer than it.
-        const float s22FixedHud = arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 0.65f));
+        // HUD (hud.distance, live debug.tcvr.hud_distance); 0 = the adaptive plane below. Default 2 m: at 0.65 m (where the
+        // adaptive plane settled in play) the plane sat AT the gun's muzzle -- held 46-66 cm in front of the eyes, measured on
+        // 15 real shots -- "5 cm entre le pane des impacts et le flingue ... t'as tout rapproché au lieu d'éloigner" (29/09).
+        const float s22FixedHud = arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 2.0f));
         if (s22FixedHud > 0.0f) {
             hudD = std::max(0.3f, s22FixedHud);
         } else if (arcadexr::profiles::GetInt("immersive.hudIso", 1) != 0) {
@@ -2286,8 +2289,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 if (nowH - s_at > std::chrono::seconds(1)) {
                     s_at = nowH;
                     const auto ad = m_s22.TakeAimDiag();
-                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m%s | visee : %u rayons, %u passes au-dela d'une surface a portee de bras, %u sur elle faute d'autre chose | %s",
-                                                     zoomS, bw, bh, hudD, s22FixedHud > 0.0f ? " (fixe)" : " (adaptatif)", ad.rays, ad.nearSkipped, ad.nearFallback, m_s22.TakeMoveDiag().c_str()));
+                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m%s | visee exacte : %u rayons, %u passes au-dela d'une surface a portee de bras, %u sur elle faute d'autre chose, %u vers l'infini | %s",
+                                                     zoomS, bw, bh, hudD, s22FixedHud > 0.0f ? " (fixe)" : " (adaptatif)", ad.rays, ad.nearSkipped, ad.nearFallback, ad.infinity, m_s22.TakeMoveDiag().c_str()));
                 }
             }
             // Only with a REAL game camera: a focal length is hundreds of pixels (Time Crisis II 772.5; 28 would already be a 170
@@ -2336,7 +2339,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 st.nearCyc[0] = cycArc.x; st.nearCyc[1] = cycArc.y; st.nearCyc[2] = cycArc.z; st.nearCyc[3] = worldScale;
             }
             m_s22.SetAimNear(nearOn ? worldScale : 0.0f, nearMinM, nearStartM);
-            m_s22.SetAimIgnoreNear(worldScale, arcadexr::config::GetFloat("aim.ignoreNear", arcadexr::profiles::GetFloat("aim.ignoreNear", 1.0f)));
+            m_s22.SetAimIgnoreNear(worldScale, arcadexr::config::GetFloat("aim.ignoreNear", arcadexr::profiles::GetFloat("aim.ignoreNear", 0.0f)));   // exact aim: off (the Model 2 has no such rule)
         }
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");
@@ -2363,7 +2366,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const float o[3] = {dot(rel, m_s22AnchorRight) / m_s22AnchorScale, dot(rel, m_s22AnchorUp) / m_s22AnchorScale, -dot(rel, m_s22AnchorNormal) / m_s22AnchorScale};
         const float d[3] = {dot(direction, m_s22AnchorRight), dot(direction, m_s22AnchorUp), -dot(direction, m_s22AnchorNormal)};
         float sx = 0, sy = 0, hit[3] = {0, 0, 0};
-        if (!m_s22.RayCast(o, d, m_s22Frame->width, m_s22Frame->height, sx, sy, hit)) return false;
+        // exact aim on the world's triangles (29/09 evening); the depth-map march only before the first frame's triangles
+        if (!m_s22.RayCastTris(o, d, m_s22Frame->width, m_s22Frame->height, sx, sy, hit) &&
+            !m_s22.RayCast(o, d, m_s22Frame->width, m_s22Frame->height, sx, sy, hit)) return false;
         nx = sx / float(m_s22Frame->width);
         ny = sy / float(m_s22Frame->height);
         const float sc = m_s22AnchorScale;
@@ -2430,6 +2435,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         return ok;
     }
     bool m_m2AimLive = false;
+    int m_glassDumpDone = 0;
     bool m_m2CadenceRequested = false, m_m2CadenceActive = false;
     bool m_smoothOn = false;
     int m_m2RateRequested = 0;

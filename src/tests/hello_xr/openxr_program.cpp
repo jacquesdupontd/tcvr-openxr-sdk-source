@@ -1409,7 +1409,12 @@ struct OpenXrProgram : IOpenXrProgram {
         bool fireInjected = false;
         {
             const std::string ft = arcadexr::config::GetString("fire", "0");
-            if (ft != "0" && ft != m_fireTag) { m_fireTag = ft; m_fireFrames = 6; m_fireAim = 40; }
+            if (ft != "0" && ft != m_fireTag) {
+                m_fireTag = ft; m_fireFrames = 6; m_fireAim = 40;
+                float ax = 0.5f, ay = 0.5f;   // where the injected shot lands: its impact is recognised like a real one's
+                std::sscanf(arcadexr::config::GetString("aim", "0.5,0.5").c_str(), "%f,%f", &ax, &ay);
+                arcadexr::gun::NoteShot(ax, ay);
+            }
             if (m_fireFrames > 0) { --m_fireFrames; triggerPressed = true; fireInjected = true; }
         }
         if (!triggerPressed) m_blockTriggerUntilRelease = false;
@@ -1428,6 +1433,7 @@ struct OpenXrProgram : IOpenXrProgram {
         m_gunPull = fireInjected ? 1.0f : (triggerValue.isActive == XR_TRUE) ? triggerValue.currentState : 0.0f;   // the 3D gun's trigger follows
         if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen && !driving) {
             m_gunShotAt = std::chrono::steady_clock::now();   // slide recoil + muzzle flash of the 3D gun (28/09)
+            if (!fireInjected && m_lastAim.valid && m_lastAim.onScreen) arcadexr::gun::NoteShot(m_lastAim.nx, m_lastAim.ny);   // its impact
             if (!fireInjected && m_lastAim.valid) {   // TCVR_SHOT: one line per real shot (29/09, "tire sur une vitre à 20 cm")
                 const LastAim& a = m_lastAim;
                 const auto rel = [&](const XrVector3f& P, float& lat, float& ver, float& fwd) {

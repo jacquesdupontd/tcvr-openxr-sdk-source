@@ -28,6 +28,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include "aim_state.h"
 #include <vector>
 
 #include "vulkan_utils.h"
@@ -337,6 +338,9 @@ public:
     void SetHudSharp(int bits) { m_hudSharp = bits; }
     void SetTextDiag(int on) { m_textDiag = on; }
     void RequestPrimDump() { m_dumpPrims = true; }
+    // one frame's objects nearer than 40 cm, each with its place in the picture (s22.glassDump=<n>, 29/09: which one is the impact)
+    void RequestGlassDump() { m_dumpGlass = true; }
+    bool m_dumpGlass = false;
     bool m_dumpPrims = false;
     std::chrono::steady_clock::time_point m_polyDiagAt{};   // TCVR_S22POLY, once a second (s22.polyDiag)
     bool m_dropBands = false;      // immersive: letterbox bands of cutscenes not drawn (SetDropBands)
@@ -351,7 +355,9 @@ public:
     std::map<std::string, int> m_census;   // TCVR_GLASSCENSUS: objects nearer than 40 cm this second, by kind and decision
     // The glass, per object (29/09): tcvr_scene_prim.object, one model instance or one immediate polygon of the board
     struct GlassObjS { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmin = 1e9f, zmax = 0.0f, ex0 = 1e9f, ex1 = -1e9f, ey0 = 1e9f, ey1 = -1e9f;
-                       uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false, veil = false, drop = false; };
+                       uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false, veil = false, drop = false, impact = false; };
+    arcadexr::gun::RecentShot m_shots[16];   // the player's shots of the last second (impacts, 29/09)
+    int m_shotCount = 0;
     bool m_screenEffects = true;   // immersive.screenEffects: the effects glued to the camera are drawn (on the glass)
     float m_hudScale = 1.0f;       // immersive.hudMinFov: the HUD's lateral enlargement (text layer and 3D HUD alike)
     uint32_t m_fxDroppedSec = 0, m_veilSec = 0;
@@ -967,6 +973,7 @@ public:
         const bool glassOn = m_dropBands && a2w > 0.0f && m_hudDepthM > 0.0f;
         m_primBand.assign(f.prim_count, 0);
         m_glassObj.clear();
+        m_shotCount = arcadexr::gun::RecentShots(m_shots, 16, 1.0f);
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
             if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
@@ -1013,15 +1020,31 @@ public:
             o.veil = o.glass && sheet && o.x0 <= 0.03f * bw && o.x1 >= 0.97f * bw && o.y0 <= 0.03f * bh && o.y1 >= 0.97f * bh;
             // the screen EFFECTS (translucent, glued to the camera: impacts on the cabinet's glass) can be switched off
             // (immersive.screenEffects=0, Time Crisis II by default: "on peut enlever les impacts, ils sont inutiles")
-            o.drop = o.glass && (effect || (debris && !sheet)) && !o.veil && !m_screenEffects;
+            // IMPACTS (29/09 evening, Guillaume: "tu la vois cette putain d'impact ?" -- Time Crisis II's orange star with its
+            // hole, a 2-quad sheet glued 25-30 cm from the camera, opaque): a sprite glued to the camera WHERE THE PLAYER JUST
+            // FIRED is the game's shot feedback. One rule for every gun game: on the glass, over a shot of the last second.
+            bool impact = false;
+            if (o.glass && !o.veil && m_shotCount > 0) {
+                for (int i = 0; i < m_shotCount && !impact; ++i) {
+                    const float px = m_shots[i].nx * bw, py = m_shots[i].ny * bh, m = 0.08f * bw;
+                    impact = px >= o.x0 - m && px <= o.x1 + m && py >= o.y0 - m && py <= o.y1 + m;
+                }
+            }
+            o.impact = impact;
+            o.drop = o.glass && (effect || (debris && !sheet) || impact) && !o.veil && !m_screenEffects;
+            if (m_dumpGlass && o.zmin * a2w < 0.40f)
+                Log::Write(Log::Level::Info, Fmt("TCVR_GLASSOBJ %s(%s) %u poly tr %u, %.1f-%.1f cm, taille %.1f cm, image x %.0f-%.0f y %.0f-%.0f (board %.0fx%.0f)",
+                                                 o.glass ? "VITRE" : "monde", o.glass ? (o.drop ? "masque" : o.veil ? "voile" : sheet ? "feuille" : effect ? "effet" : "debris") : "monde",
+                                                 o.polys, o.tr, o.zmin * a2w * 100.0f, o.zmax * a2w * 100.0f, realM * 100.0f, o.x0, o.x1, o.y0, o.y1, bw, bh));
             if (o.zmin * a2w < 0.40f && m_census.size() < 48) {   // TCVR_GLASSCENSUS: every object nearer than 40 cm, and why it is where it is
-                const char* pourquoi = o.glass ? (o.drop ? "masque" : o.veil ? "voile" : sheet ? "feuille" : effect ? "effet" : "debris")
+                const char* pourquoi = o.glass ? (o.drop ? (o.impact ? "impact-masque" : "masque") : o.veil ? "voile" : o.impact ? "impact" : sheet ? "feuille" : effect ? "effet" : "debris")
                                      : !o.ok ? "sommet-derriere-camera" : !near ? "pas-entier-40cm" : (sheet && !inPic) ? "feuille-hors-image" : "volume";
                 m_census[Fmt("%s(%s) %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %% taille %.0f cm", o.glass ? "VITRE" : "monde", pourquoi,
                              o.polys, o.imm, o.tr, o.tex, std::floor(o.zmin * a2w * 20.0f) * 5.0f, std::ceil(o.zmax * a2w * 20.0f) * 5.0f,
                              std::round(relief * 20.0f) * 5.0f, std::min(999.0f, realM * 100.0f))]++;
             }
         }
+        m_dumpGlass = false;
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
             if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
@@ -1094,8 +1117,17 @@ public:
                 m_emitOnHud = false;
             } else {
                 emit(pr, v, half);
+                // THE AIM'S WORLD (29/09 evening): the opaque polygons of the world, in the game camera's space where the
+                // immersive view draws them (s22_scene_vert), for an EXACT ray/triangle aim like the Model 2's
+                if (pr.kind == 0 && !pr.direct && !(pr.alpha_enabled && pr.alpha > 0) && pr.zoom > 1e-3f) AddAimPolygon(pr, v, float(f.width), float(f.height));
             }
         }
+        {   // publish this frame's aim triangles (the aim runs between frames)
+            std::lock_guard<std::mutex> lk(m_aimMutex);
+            m_aimTris.swap(m_aimTrisBuild);
+            m_aimTrisZoom = m_lastZoom; m_aimTrisW = float(f.width); m_aimTrisH = float(f.height);
+        }
+        m_aimTrisBuild.clear();
         m_fxSec += m_fxMoved; m_screenSecMax = std::max(m_screenSecMax, m_screenMoved); m_bandsSecMax = std::max(m_bandsSecMax, m_bandsDropped);
         if (m_altFix)
             for (size_t i = 0; i < m_altCarry.size(); ++i) emit(m_altCarry[i], m_altCarryVerts.data() + m_altCarryFirst[i], true);
@@ -1475,11 +1507,86 @@ public:
     // sees OVER. A surface nearer than `metres` from the eyes (arm's reach) does not stop the shot when the ray goes on to
     // something the eyes see behind it; it is the target only when nothing is found beyond it (aiming at it on purpose).
     void SetAimIgnoreNear(float a2w, float metres) { m_aimIgnore[0] = a2w; m_aimIgnore[1] = metres; }
-    struct AimDiag { uint32_t rays = 0, nearSkipped = 0, nearFallback = 0; };
+    struct AimDiag { uint32_t rays = 0, nearSkipped = 0, nearFallback = 0, infinity = 0; };
     AimDiag TakeAimDiag() const { AimDiag d = m_aimDiag; m_aimDiag = {}; return d; }
     float m_aimNear[3] = {0.0f, 0.5f, 1.0f};
     float m_aimIgnore[2] = {0.0f, 0.0f};   // a2w, metres: nearer surfaces do not stop the gun (SetAimIgnoreNear)
+    mutable std::mutex m_aimMutex;
+    std::vector<float> m_aimTris, m_aimTrisBuild;   // exact aim: world triangles, game camera space (9 floats each)
+    float m_aimTrisZoom = 0.0f, m_aimTrisW = 640.0f, m_aimTrisH = 480.0f;
+    mutable bool m_aimLastInfinity = false;
     mutable AimDiag m_aimDiag;
+    // EXACT AIM (29/09 evening, Guillaume: "l'impact d'un tir doit être là où est chaque ennemi ... je pensais qu'on avait réglé
+    // ça dans les autres jeux de tir"). The depth-map march stopped wherever the ray was HIDDEN from the eyes: a ray from a
+    // hand held below and in front of the eyes, passing behind a door frame as the eyes see it, "hit" the frame -- and a ray
+    // that met no texel went to the flat screen 2 m away. Now the Model 2's method (vulkan_m2_renderer.h, Aim): the ray
+    // against the world's opaque triangles, the nearest it really meets; a surface within arm's reach only when nothing is
+    // met beyond it; nothing met at all = the direction at infinity (off the picture, the game reloads, as on the cabinet).
+    void AddAimPolygon(const tcvr_scene_prim& pr, const tcvr_scene_vertex* v, float W, float H) {
+        float P[8][3];
+        const uint32_t n = std::min<uint32_t>(pr.vertex_count, 8);
+        for (uint32_t i = 0; i < n; ++i) {
+            const float z = v[i].z;
+            P[i][0] = ((float(pr.cx) - W * 0.5f) * z + v[i].x) / pr.zoom;
+            P[i][1] = ((H * 0.5f - float(pr.cy)) * z + v[i].y) / pr.zoom;
+            P[i][2] = z;
+            if (m_aimNear[0] > 0.0f) {   // near comfort: where it is PERCEIVED (f along the cyclops ray), like the Model 2
+                const float dist = std::sqrt(P[i][0] * P[i][0] + P[i][1] * P[i][1] + P[i][2] * P[i][2]) * m_aimNear[0];
+                if (dist < m_aimNear[2] && dist > 1e-6f) {
+                    const float u = 1.0f - dist / m_aimNear[2], k = (dist + m_aimNear[1] * u * u) / dist;
+                    P[i][0] *= k; P[i][1] *= k; P[i][2] *= k;
+                }
+            }
+        }
+        for (uint32_t i = 1; i + 1 < n; ++i)   // fan
+            for (const float* q : {P[0], P[i], P[i + 1]}) m_aimTrisBuild.insert(m_aimTrisBuild.end(), q, q + 3);
+    }
+    bool RayCastTris(const float o[3], const float d[3], int screenW, int screenH, float& sx, float& sy, float hit[3]) const {
+        std::lock_guard<std::mutex> lk(m_aimMutex);
+        if (m_aimTris.empty() || m_aimTrisZoom <= 0.0f) return false;
+        ++m_aimDiag.rays;
+        const float a2w = m_aimIgnore[0], reach = m_aimIgnore[1];
+        float bestT = 1e30f, nearT = 1e30f;
+        const size_t nt = m_aimTris.size() / 9;
+        for (size_t i = 0; i < nt; ++i) {
+            const float* A0 = &m_aimTris[i * 9]; const float* B0 = A0 + 3; const float* C0 = A0 + 6;
+            const float e1[3] = {B0[0] - A0[0], B0[1] - A0[1], B0[2] - A0[2]}, e2[3] = {C0[0] - A0[0], C0[1] - A0[1], C0[2] - A0[2]};
+            const float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+            const float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if (std::fabs(det) < 1e-12f) continue;
+            const float inv = 1.0f / det;
+            const float tv[3] = {o[0] - A0[0], o[1] - A0[1], o[2] - A0[2]};
+            const float u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+            if (u < 0.0f || u > 1.0f) continue;
+            const float qv[3] = {tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+            const float w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+            if (w < 0.0f || u + w > 1.0f) continue;
+            const float t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+            if (t <= 0.0f) continue;
+            const float p[3] = {o[0] + t * d[0], o[1] + t * d[1], o[2] + t * d[2]};
+            if (p[2] <= 1.0f) continue;   // behind the game camera's plane
+            const bool inReach = reach > 0.0f && a2w > 0.0f && std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) * a2w < reach;
+            if (inReach) nearT = std::min(nearT, t); else bestT = std::min(bestT, t);
+        }
+        float t = bestT;
+        if (t >= 1e30f && nearT < 1e30f) { t = nearT; ++m_aimDiag.nearFallback; }
+        else if (bestT < 1e30f && nearT < bestT) ++m_aimDiag.nearSkipped;
+        const float zoom = m_aimTrisZoom;
+        if (t >= 1e30f) {   // nothing met: the direction at infinity, like the cabinet pointed off the scene
+            if (d[2] <= 1e-4f) return false;
+            ++m_aimDiag.infinity;
+            const float far = 1.0e7f;
+            hit[0] = o[0] + far * d[0]; hit[1] = o[1] + far * d[1]; hit[2] = o[2] + far * d[2];
+            sx = screenW * 0.5f + zoom * hit[0] / hit[2]; sy = screenH * 0.5f - zoom * hit[1] / hit[2];
+            m_aimLastInfinity = true;
+            return true;
+        }
+        hit[0] = o[0] + t * d[0]; hit[1] = o[1] + t * d[1]; hit[2] = o[2] + t * d[2];
+        sx = screenW * 0.5f + zoom * hit[0] / hit[2]; sy = screenH * 0.5f - zoom * hit[1] / hit[2];
+        m_aimLastInfinity = false;
+        return true;
+    }
+    bool AimLastInfinity() const { return m_aimLastInfinity; }
     bool RayCast(const float o[3], const float d[3], int screenW, int screenH, float& sx, float& sy, float hit[3]) const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || d[2] <= 1e-6f) return false;
         const float zoom = m_lastZoom > 0.0f ? m_lastZoom : 1.0f;
