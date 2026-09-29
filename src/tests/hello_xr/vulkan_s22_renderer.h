@@ -230,9 +230,17 @@ public:
         StopBankWorker();
         m_bankCancel = false;
         m_bankReadyMask = 0;
-        const tcvr_scene_assets A = a;
+        // The worker decodes from ITS OWN COPY of the tables (29/09). It used to read MAME's memory for many seconds, and
+        // a machine restarted meanwhile (the same game relaunched, a switch from the menu) left it decoding FREED memory:
+        // garbage banks marked ready -- Time Crisis II's intro with its decor missing ("le boss vole") and its textures in
+        // a coloured checkerboard. ~40 MB copied once per game load.
+        auto tiledata = std::make_shared<std::vector<uint8_t>>(a.tiledata, a.tiledata + size_t(tiles) * 256);
+        auto tilemap = std::make_shared<std::vector<uint16_t>>(a.tilemap, a.tilemap + a.tilemap_entries);
+        auto tileattr = std::make_shared<std::vector<uint8_t>>(a.tileattr, a.tileattr + a.tileattr_entries);
+        auto ayx = std::make_shared<std::vector<uint8_t>>(a.ayx, a.ayx + a.ayx_entries);
         const uint32_t rowMask = m_tex[1], tileMask = m_tex[2], banks = m_bankCount;
-        m_bankWorker = std::thread([this, A, tiles, wide, rowMask, tileMask, banks] {
+        m_bankWorker = std::thread([this, tiledata, tilemap, tileattr, ayx, tiles, wide, rowMask, tileMask, banks] {
+            const uint32_t mapN = uint32_t(tilemap->size()), attrN = uint32_t(tileattr->size()), ayxN = uint32_t(ayx->size());
             for (uint32_t bank = 0; bank < banks && !m_bankCancel; ++bank) {
                 std::vector<uint8_t> img(size_t(4096) * 4096, 0);
                 for (uint32_t y = 0; y < 4096; ++y) {
@@ -240,12 +248,12 @@ public:
                     uint8_t* row = &img[size_t(y) * 4096];
                     for (uint32_t tx = 0; tx < 4096; ++tx) {
                         const uint32_t to = ((ty << 4) & rowMask) | (tx >> 4);
-                        if (to >= A.tilemap_entries || to >= A.tileattr_entries) continue;
-                        const uint32_t tile = (uint32_t(A.tilemap[to]) | (wide ? ((uint32_t(A.tileattr[to]) & 1u) << 16) : 0u)) & tileMask;
-                        const uint32_t ai = (uint32_t(A.tileattr[to]) << 8) | ((ty << 4) & 0xf0u) | (tx & 0xfu);
-                        if (ai >= A.ayx_entries || tile >= tiles) continue;
-                        const uint32_t pix = A.ayx[ai];
-                        row[tx] = A.tiledata[size_t(tile) * 256 + (pix >> 4) * 16 + (pix & 15u)];
+                        if (to >= mapN || to >= attrN) continue;
+                        const uint32_t tile = (uint32_t((*tilemap)[to]) | (wide ? ((uint32_t((*tileattr)[to]) & 1u) << 16) : 0u)) & tileMask;
+                        const uint32_t ai = (uint32_t((*tileattr)[to]) << 8) | ((ty << 4) & 0xf0u) | (tx & 0xfu);
+                        if (ai >= ayxN || tile >= tiles) continue;
+                        const uint32_t pix = (*ayx)[ai];
+                        row[tx] = (*tiledata)[size_t(tile) * 256 + (pix >> 4) * 16 + (pix & 15u)];
                     }
                 }
                 // Index mipmaps: a palette index cannot be averaged (each polygon picks its own palette), so

@@ -2108,9 +2108,32 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (f) m_s22Frame = f;
         }
         if (!m_s22Frame || m_s22Frame->width <= 0 || m_s22Frame->height <= 0) return;
-        if (!m_s22.AssetsReady()) {
-            tcvr_scene_assets assets{};
-            if (!s22::SceneAssets(assets) || !m_s22.UploadAssets(cmd, assets)) return;
+        {   // A NEW MACHINE, NOT A NEW GAME NAME (29/09). The textures were reloaded only when the game's NAME changed: the same
+            // game relaunched (a bench switch to the running game, a restart) and a switch from the menu whose name changed
+            // before the new machine published its textures both kept tables of another machine -- Time Crisis II's intro
+            // with its decor missing and its textures in a checkerboard. The published tables' identity (addresses, sizes,
+            // sampled content) is compared at every frame; any change reloads them.
+            tcvr_scene_assets cur{};
+            if (s22::SceneAssets(cur)) {
+                uint64_t id = 1469598103934665603ull;
+                auto mix = [&id](uint64_t v) { id ^= v; id *= 1099511628211ull; };
+                mix(uint64_t(uintptr_t(cur.tiledata))); mix(cur.tiledata_bytes); mix(uint64_t(uintptr_t(cur.tilemap))); mix(cur.tilemap_entries);
+                mix(uint64_t(uintptr_t(cur.tileattr))); mix(cur.tileattr_entries); mix(cur.row_mask); mix(cur.tile_mask);
+                if (cur.tiledata && cur.tiledata_bytes >= 4096)
+                    for (uint32_t i = 0; i < 16; ++i) mix(cur.tiledata[(size_t(cur.tiledata_bytes - 1) / 16) * i]);
+                if (cur.tilemap && cur.tilemap_entries >= 16)
+                    for (uint32_t i = 0; i < 16; ++i) mix(cur.tilemap[(size_t(cur.tilemap_entries - 1) / 16) * i]);
+                if (m_s22.AssetsReady() && id != m_s22AssetsId) {
+                    Log::Write(Log::Level::Info, Fmt("TCVR_S22VK textures of ANOTHER machine (%s): reloaded", game.c_str()));
+                    m_s22.ResetAssets();
+                }
+                if (!m_s22.AssetsReady()) {
+                    if (!m_s22.UploadAssets(cmd, cur)) return;
+                    m_s22AssetsId = id;
+                }
+            } else if (!m_s22.AssetsReady()) {
+                return;
+            }
         }
         m_s22.PumpBanks(cmd);
         m_s22.SetFilter(arcadexr::config::GetInt("s22.filter", 3));   // 0 texel-exact, 1 bilinear, 2 + index mipmaps, 3 sharp + anisotropic
@@ -2817,6 +2840,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     float m_s22LastHudD = 0.0f;     // the HUD plane's distance (m), for camera-glued screen content
     float m_s22LastFlash = 0.0f;    // the 3D gun's muzzle flash last frame (a rising edge = the player's shot)
     float m_s22HudScale = 1.0f;     // immersive.hudMinFov: the HUD's enlargement (PrepareSystem22 -> HUD ISO plane)
+    uint64_t m_s22AssetsId = 0;     // identity of the uploaded texture tables (a new machine = new identity)
     float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
     float m_s22HudNear = 0.0f;    // ... and of the nearest thing in the picture (m): the HUD stays just in front of it
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };
