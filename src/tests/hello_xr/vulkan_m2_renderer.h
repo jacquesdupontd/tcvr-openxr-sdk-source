@@ -530,34 +530,16 @@ public:
                 // translucent, in the main view, entirely nearer than half a metre in the headset AND than a quarter of the
                 // scene's depth (rain around the camera, 2 m away, stays in 3D): PushNearEffects()
                 // moves each burst along its camera rays onto what it covers. The depth probes and the aim skip them.
-                // Only a small thing in the picture (28/09 evening: without that, rain drops grazing the camera at 2 cm
-                // and the fountain's translucent water as the camera ran along it were pushed too -- "un bout de la fontaine se
-                // sépare en deux"). A spark polygon is at most ~70 px; a world surface that close projects far off the frame.
-                if (m_nearFxOn && vc >= 3 && q.textured != 0u && q.translucent != 0u && m_sceneDepth > 0.0f &&
-                    q.center_x == mainCx && q.center_y == mainCy) {
-                    float zmax = 0.0f; bool inFront = true;
-                    float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
-                    for (std::uint32_t v = 0; v < vc; v++) {
-                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
-                        if (rv.z <= 1e-3f) { inFront = false; break; }
-                        zmax = std::max(zmax, rv.z);
-                        const float sx = float(frame.crtc_xoffset + p.center_x) + rv.x / rv.z;
-                        const float sy = float((384 - p.center_y) + frame.crtc_yoffset) - rv.y / rv.z;
-                        bx0 = std::min(bx0, sx); bx1 = std::max(bx1, sx); by0 = std::min(by0, sy); by1 = std::max(by1, sy);
-                    }
-                    const bool small = bx1 - bx0 <= 128.0f && by1 - by0 <= 128.0f;
-                    // touching the picture is enough: a shot near an edge throws half its burst past it (x down to -70 on
-                    // the left edge, 28/09) -- those streaks stayed at 9.5 cm. The size alone keeps world surfaces out.
-                    const bool inside = bx1 >= float(p.clip_l) && bx0 <= float(p.clip_r) &&
-                                        by1 >= float(p.clip_t) && by0 <= float(p.clip_b);
-                    if (inFront && small && inside && zmax < 0.25f * m_sceneDepth && zmax * m_a2wScale < 0.5f) q.rgb |= 0x8000000u;
-                }
+                // (29/09 midday) The former "effects" rule (bit 27: translucent near bursts pushed onto their target) is gone:
+                // Guillaume wants ONE rule -- whatever the game glues to its camera is on the glass, on the HUD plane (below).
                 // Universal rule (29/09, same as the System 22's PrepareFrame): a FLAT polygon facing the camera and glued to it
                 // (< 40 cm in the headset, or 10x nearer than the scene), in the main view, neither a full-frame veil nor a band
                 // (flagged above) is screen content -- a HUD drawn in 3D: bit 28, moved onto the HUD plane (PushNearEffects).
-                // OPAQUE only (29/09): House of the Dead's rain -- translucent billboards, flat by construction, 25-36 cm from
-                // the camera -- passed the test; its title logo (opaque, 86-103 polygons) is screen content and still does.
-                if (m_nearFxOn && vc >= 3 && q.translucent == 0u && (q.rgb & 0xE000000u) == 0u && q.center_x == mainCx && q.center_y == mainCy && m_a2wScale > 1e-6f) {
+                // ONE rule, both boards (29/09 midday, Guillaume: "tous les éléments 2D à 100 %, au même plan, rien un par un"):
+                // in the picture, and entirely nearer than 15 cm (the sparks at 9.5 cm, flat or not) or flat (< 5 %) nearer
+                // than 40 cm / 10x nearer than the scene and at most half the picture. ANY opacity (Time Crisis II's screen
+                // impacts are translucent; the rain goes to the glass too).
+                if (m_nearFxOn && vc >= 3 && (q.rgb & 0x6000000u) == 0u && q.center_x == mainCx && q.center_y == mainCy && m_a2wScale > 1e-6f) {
                     float z0 = 1e9f, z1 = -1e9f, sx0 = 1e9f, sx1 = -1e9f, sy0 = 1e9f, sy1 = -1e9f; bool inFront = true;
                     for (std::uint32_t v = 0; v < vc; v++) {
                         const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
@@ -573,8 +555,11 @@ public:
                     // in the headset they are seen too, moved they would come off the floor). sx, sy are relative to the view's centre.
                     const float hw = 0.5f * float(p.clip_r - p.clip_l + 1), hh = 0.5f * float(p.clip_b - p.clip_t + 1);
                     const bool inPic = sx1 >= -hw && sx0 <= hw && sy1 >= -hh && sy0 <= hh;
-                    if (inFront && small && inPic && z1 - z0 <= 0.01f * z0 && (z0 * m_a2wScale < 0.40f || (m_sceneDepth > 0.0f && z0 < 0.1f * m_sceneDepth)))
-                        q.rgb |= 0x10000000u;
+                    const bool flat = z1 - z0 <= 0.05f * z0;
+                    const bool glued = flat && small && (z0 * m_a2wScale < 0.40f || (m_sceneDepth > 0.0f && z0 < 0.1f * m_sceneDepth));
+                    // TEXTURED: what a game puts on its glass (icons, text, impacts, logos) is textured; a flat-shaded mesh part
+                    // brushing the camera is a body (House of the Dead: 394 untextured polygons of a character, 29/09)
+                    if (inFront && inPic && glued && q.textured != 0u) q.rgb |= 0x10000000u;
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
                     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
@@ -2073,6 +2058,22 @@ public:
                     for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) if (!under[y * kFX + x]) { under[y * kFX + x] = 1; ++nUnder; }
                 }
             }
+            // ... and the polygons glued to the camera (bit 28): they are on the same glass (29/09)
+            for (uint32_t k = 0; k < m_rawPrims.size() && k < frame.raw_prim_count; ++k) {
+                const tcvr_m2_prim& q = m_rawPrims[k];
+                if ((q.rgb & 0x10000000u) == 0u || q.vertex_count == 0) continue;
+                float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+                for (uint32_t v = 0; v < q.vertex_count; ++v) {
+                    const float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
+                    if (d[2] <= 1e-3f) continue;
+                    const float px = float(frame.crtc_xoffset + q.center_x) + d[0] / d[2], py = float((384 - q.center_y) + frame.crtc_yoffset) - d[1] / d[2];
+                    bx0 = std::min(bx0, px); bx1 = std::max(bx1, px); by0 = std::min(by0, py); by1 = std::max(by1, py);
+                }
+                if (bx1 < 0.0f || by1 < 0.0f || bx0 > 496.0f || by0 > 384.0f) continue;
+                const int x0 = std::max(0, int(bx0 / kFW)), x1 = std::min(kFX - 1, int(bx1 / kFW));
+                const int y0 = std::max(0, int(by0 / kFH)), y1 = std::min(kFY - 1, int(by1 / kFH));
+                for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) if (!under[y * kFX + x]) { under[y * kFX + x] = 1; ++nUnder; }
+            }
             float nearBest[kFX * kFY];
             for (float& b : nearBest) b = 1e30f;
             if (nUnder > 0) {
@@ -2262,7 +2263,8 @@ public:
                 for (uint32_t k = 0; k < m_rawPrims.size(); ++k) {
                     const tcvr_m2_prim& q = m_rawPrims[k];
                     if ((q.rgb & 0x10000000u) == 0u || q.vertex_count == 0) continue;
-                    const float z0 = m_rawVerts[size_t(q.first_vertex) * 5 + 2];
+                    float z0 = 1e9f, z1 = 0.0f;
+                    for (uint32_t v = 0; v < q.vertex_count; ++v) { const float zz = m_rawVerts[size_t(q.first_vertex + v) * 5 + 2]; z0 = std::min(z0, zz); z1 = std::max(z1, zz); }
                     if (z0 <= 1e-3f) continue;
                     {   // what was moved (TCVR_NEAR): board box, depth (m), texture of the moved polygons, for the log
                         for (uint32_t v = 0; v < q.vertex_count; ++v) {
@@ -2274,7 +2276,7 @@ public:
                         m_scrZ[0] = std::min(m_scrZ[0], z0 * m_a2wScale); m_scrZ[1] = std::max(m_scrZ[1], z0 * m_a2wScale);
                         m_scrTex = q.textured; m_scrTrans = q.translucent; m_scrCb = q.colorbase;
                     }
-                    const float s = zt / z0;
+                    const float s = zt / (0.5f * (z0 + z1));
                     for (uint32_t v = 0; v < q.vertex_count; ++v) {
                         float* d = &m_rawVerts[size_t(q.first_vertex + v) * 5];
                         d[0] *= s; d[1] *= s; d[2] *= s;

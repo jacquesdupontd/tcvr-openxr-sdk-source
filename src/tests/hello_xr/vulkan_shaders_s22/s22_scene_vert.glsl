@@ -76,13 +76,19 @@ void main() {
         float cameraY = (aPos.y + (ScreenSize.y * 0.5 - t0.w) * aPos.z) / zoom;
         vScreen = vec2(t0.z + aPos.x / max(aPos.z, 1e-6), t0.w - aPos.y / max(aPos.z, 1e-6));
         // moved onto the HUD plane (flag P(p,10).z): at the HUD's true depth, out of the near comfort like the 2D HUD
-        gl_Position = (P(p, 10).z > 0.5) ? ImmersiveMvp * vec4(cameraX, cameraY, aPos.z, 1.0) : nearStereo(vec3(cameraX, cameraY, aPos.z));
+        bool glass = P(p, 10).z > 0.5;
+        gl_Position = glass ? ImmersiveMvp * vec4(cameraX, cameraY, aPos.z, 1.0) : nearStereo(vec3(cameraX, cameraY, aPos.z));
         gl_Position.z = Bias.w * (1.0 + Bias.x * float(p));   // reversed infinite depth, painter order as a relative offset
+        // the glass is IN FRONT of the world, like the cabinet's (29/09: moved to the HUD's distance and depth-tested, glued
+        // pieces went behind nearer geometry); among themselves the painter's order
+        if (glass) gl_Position.z = gl_Position.w * (0.999 + 1e-7 * float(min(p, 9000)));
         vTex = aTex + 0.5;
         vOriginalDepth = aPos.z;
         vPrim = p;
         return;
     } else {
+        // the board-space passes (depth map, flat): a polygon moved onto the HUD plane is part of the glass, not of the world
+        if (P(p, 10).z > 0.5) { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); vTex = vec3(0.0); vOriginalDepth = 0.0; vPrim = p; return; }
         float z = max(aPos.z, 1e-6);
         float x = aPos.x - Bias.y * aMeta.x;
         sx = t0.z + x / z; sy = t0.w - aPos.y / z;

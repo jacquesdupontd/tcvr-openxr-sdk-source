@@ -234,12 +234,6 @@ void main() {
         srcWeight *= spriteCov;
     }
 #endif
-#ifndef POLY3D
-    // Immersive (28/09, Time Crisis II): the game's flat BLACK boxes behind its story text -- untextured 2D polygons on
-    // the arcade plane -- were edges of a flat screen; in the room they were black rectangles in front of the characters.
-    // Discarded (the text layer's black areas likewise, s22_mix.glsl).
-    if (Immersive != 0 && (t0.x > 0.5 || t0.y > 0.5) && !texEn && max(c.r, max(c.g, c.b)) <= 8u) discard;
-#endif
     oColor = vec4(vec3(c) / 255.0, srcWeight);
     oPri = vec4(prio / 255.0, 0.0, 0.0, 1.0);
 }

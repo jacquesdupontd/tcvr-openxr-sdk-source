@@ -333,7 +333,9 @@ public:
     std::chrono::steady_clock::time_point m_polyDiagAt{};   // TCVR_S22POLY, once a second (s22.polyDiag)
     bool m_dropBands = false;      // immersive: letterbox bands of cutscenes not drawn (SetDropBands)
     uint32_t m_bandsDropped = 0, m_bandNear = 0;   // bands dropped; facing polygons near enough to be one (diag)
-    uint32_t m_screenMoved = 0, m_fxMoved = 0;     // camera-glued polygons moved to the HUD plane / onto what they cover
+    uint32_t m_screenMoved = 0, m_fxMoved = 0;     // camera-glued polygons moved to the HUD plane / (unused since 29/09)
+    std::vector<uint8_t> m_hudCover = std::vector<uint8_t>(32 * 24, 0);   // board cells under the glass's content
+    int m_letterTop = 0, m_letterBottom = 1 << 20;  // text-layer letterbox rows (black pixels there are transparent)
     uint32_t m_fxSec = 0, m_screenSecMax = 0, m_bandsSecMax = 0;   // over the second (TakeMoveDiag)
     float m_hudDepthM = 0.0f;                      // the HUD plane's distance (metres), from the last frame
     std::vector<tcvr_scene_vertex> m_moveVerts;
@@ -781,9 +783,8 @@ public:
                 x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
                 z0 = std::min(z0, v[k].z); z1 = std::max(z1, v[k].z);
             }
-            // camera-attached: nearer than 15 cm in the headset, or twenty times nearer than the scene
-            const bool nearCam = (m_bandA2w > 0.0f && z0 * m_bandA2w < 0.15f) || (sceneZ > 0.0f && z0 < 0.05f * sceneZ);
-            if (z0 <= 0.0f || z1 - z0 > 0.01f * z0 || !nearCam) return false;
+            // at ANY depth (29/09: one of the intro's "2 gros rectangles" was a full-width band at 3.5 m): facing the camera
+            if (z0 <= 0.0f || z1 - z0 > 0.01f * z0) return false;
             // the VISIBLE part: a band polygon runs past the screen's edge (Time Crisis II's: y 415..656 of 480)
             x0 = std::max(x0, 0.0f); y0 = std::max(y0, 0.0f); x1 = std::min(x1, bw); y1 = std::min(y1, bh);
             if (x1 <= x0 || y1 <= y0) return false;
@@ -803,29 +804,51 @@ public:
         //    it covers (depth map around its centre, what is nearer than 20 cm ignored).
         //  - everything else: real 3D (with the near comfort).
         m_bandsDropped = 0; m_bandNear = 0; m_bandSceneZ = sceneZ; m_screenMoved = 0; m_fxMoved = 0;   // this frame
-        const float a2w = m_bandA2w;
-        auto nearInv = [&](float hudM) {   // geometric distance nearStereo perceives at hudM (f^-1)
-            const float mn = m_settings.nearParams[0], st = m_settings.nearParams[1];
-            if (m_settings.nearCyc[3] <= 0.0f || hudM >= st || mn <= 0.0f) return hudM;
-            const float qa = mn / (st * st), qb = 1.0f - 2.0f * mn / st, qc = mn - hudM;
-            const float disc = qb * qb - 4.0f * qa * qc;
-            return disc > 0.0f ? std::max(0.01f, (-qb + std::sqrt(disc)) / (2.0f * qa)) : hudM;
-        };
-        // what an effect covers: the nearest depth >= 20 cm over its OWN box -- never pushed behind something it overlaps
-        // (29/09: with the centre alone, close-up props of the intro -- a hand 15 cm away -- went behind the body and
-        // "il manque plein de petits polygones dans l'intro")
-        auto targetBox = [&](float bx0, float by0, float bx1, float by1) {
-            if (m_depthCpu.empty() || m_depthCpuW == 0 || a2w <= 0.0f) return sceneZ;
-            const int gx0 = std::max(0, int(bx0 * float(m_depthCpuW) / bw)), gx1 = std::min(int(m_depthCpuW) - 1, int(bx1 * float(m_depthCpuW) / bw));
-            const int gy0 = std::max(0, int(by0 * float(m_depthCpuH) / bh)), gy1 = std::min(int(m_depthCpuH) - 1, int(by1 * float(m_depthCpuH) / bh));
-            float best = 0.0f;
-            for (int yy = gy0; yy <= gy1; ++yy)
-                for (int xx = gx0; xx <= gx1; ++xx) {
-                    const float d = m_depthCpu[size_t(yy) * m_depthCpuW + size_t(xx)];
-                    if (d > 0.0f && std::isfinite(d) && d * a2w >= 0.2f && (best == 0.0f || d < best)) best = d;
+        // What the glass covers (32 x 24 cells of the board): visible non-black text, 2D polygons and sprites, and (in the loop)
+        // the glued polygons -- the HUD plane goes just in front of the WORLD under them (HudNearUnits), not of whatever is
+        // nearest anywhere (29/09: the partner at the edge, 90 cm away, pulled Time Crisis II's HUD "trop proche").
+        std::fill(m_hudCover.begin(), m_hudCover.end(), uint8_t(0));
+        if (f.text && f.pri && f.pens)
+            for (int y = 0; y < f.height; y += 4)
+                for (int x = 0; x < f.width; x += 4) {
+                    if ((f.pri[size_t(y) * f.pri_stride + size_t(x)] & 4) == 0) continue;
+                    const uint16_t tv = f.text[size_t(y) * f.text_stride + size_t(x)];
+                    const uint32_t c = tv < f.pen_count ? f.pens[tv] : 0u;
+                    if (((c >> 16) & 255u) <= 8u && ((c >> 8) & 255u) <= 8u && (c & 255u) <= 8u) continue;
+                    m_hudCover[size_t(std::min(23, int(float(y) / bh * 24.0f))) * 32 + size_t(std::min(31, int(float(x) / bw * 32.0f)))] = 1;
                 }
-            return best > 0.0f ? best : sceneZ;
-        };
+        for (uint32_t p = 0; p < f.prim_count; ++p) {
+            const tcvr_scene_prim& pr = f.prims[p];
+            if ((pr.kind == 0 && !pr.direct) || pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
+            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+            for (uint32_t i = 0; i < pr.vertex_count; ++i) {
+                const tcvr_scene_vertex& vv = f.vertices[pr.first_vertex + i];
+                const float sx = float(pr.cx) + vv.x, sy = float(pr.cy) - vv.y;
+                x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+            }
+            if (x1 < 0.0f || y1 < 0.0f || x0 > bw || y0 > bh) continue;
+            const int cx0 = std::max(0, int(x0 / bw * 32.0f)), cx1 = std::min(31, int(x1 / bw * 32.0f));
+            const int cy0 = std::max(0, int(y0 / bh * 24.0f)), cy1 = std::min(23, int(y1 / bh * 24.0f));
+            for (int cy = cy0; cy <= cy1; ++cy) for (int cx = cx0; cx <= cx1; ++cx) m_hudCover[size_t(cy) * 32 + size_t(cx)] = 1;
+        }
+        // Letterbox of the TEXT layer: the rows at the top and at the bottom where every visible text pixel is black. Only
+        // their black pixels become transparent (s22_mix.glsl) -- a subtitle written in the band stays; nothing else is
+        // touched (the former "black areas" rule also removed black details of the intro's graphics).
+        m_letterTop = 0; m_letterBottom = f.height;
+        if (m_dropBands && f.text && f.pri && f.pens) {
+            auto bandRow = [&](int y) {
+                for (int x = 0; x < f.width; ++x) {
+                    if ((f.pri[size_t(y) * f.pri_stride + size_t(x)] & 4) == 0) continue;
+                    const uint16_t tv = f.text[size_t(y) * f.text_stride + size_t(x)];
+                    const uint32_t c = tv < f.pen_count ? f.pens[tv] : 0u;
+                    if (((c >> 16) & 255u) > 8u || ((c >> 8) & 255u) > 8u || (c & 255u) > 8u) return false;
+                }
+                return true;
+            };
+            while (m_letterTop < f.height / 3 && bandRow(m_letterTop)) ++m_letterTop;
+            while (m_letterBottom > f.height * 2 / 3 && bandRow(m_letterBottom - 1)) --m_letterBottom;
+        }
+        const float a2w = m_bandA2w;
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
             if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
@@ -842,17 +865,24 @@ public:
                     z0 = std::min(z0, v[i].z); z1 = std::max(z1, v[i].z);
                 }
                 const bool inPicture = x1 >= 0.0f && y1 >= 0.0f && x0 <= bw && y0 <= bh;
-                if (z0 > 0.0f && inPicture) {
-                    const bool flat = z1 - z0 <= 0.01f * z0;
-                    const bool smallP = x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh;   // a HUD element, not a wall pressed on
-                    // opaque only: a translucent flat quad near the camera is a particle (billboard), not a HUD element
-                    if (flat && smallP && pr.alpha_enabled == 0 && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ)) && m_hudDepthM > 0.0f) {
-                        // the HUD's TRUE distance, flagged out of the near comfort (29/09: placed at f^-1 of it, the ammo matched
-                        // its container in disparity but not in head parallax -- it slid out of it when the head moved)
-                        k = (m_hudDepthM / a2w) / z0; ++m_screenMoved; onHud = true;
-                    } else if (!flat && z1 * a2w < 0.20f && x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh) {   // hits: 128-192 px
-                        const float zt = targetBox(x0, y0, x1, y1);
-                        if (zt > z1) { k = 0.95f * zt / z0; ++m_fxMoved; }
+                if (z0 > 0.0f && inPicture && m_hudDepthM > 0.0f) {
+                    // ONE rule (29/09 midday, Guillaume: "scanner TOUS les éléments 2D à 100 %, tous au même plan, rien un par
+                    // un"). Glued to the camera = on the glass: entirely nearer than 15 cm (nothing of the world is that near --
+                    // the screen impacts at 5 cm, flat or not), or flat (< 5 % of depth) nearer than 40 cm or 10x nearer than
+                    // the scene and at most half the picture (the HUD at 25 cm; a wall the camera presses on is bigger). ANY
+                    // opacity (the impacts are translucent). All of it on the HUD plane, at the HUD's true distance, out of
+                    // the near comfort (head parallax, see s22_scene_vert).
+                    const bool flat = z1 - z0 <= 0.05f * z0;
+                    const bool smallP = x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh;
+                    // textured, like everything a game puts on its glass (a flat-shaded mesh part brushing the camera is a body)
+                    // (no "anything nearer than 15 cm" clause: it took the faces and hands of the intro's close-ups, 351 polygons
+                    // a second, which then went behind their own bodies -- "il manque plein de petits polygones", 29/09)
+                    const bool glued = pr.texture_enabled != 0 && flat && smallP && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ));
+                    if (glued) {
+                        k = (m_hudDepthM / a2w) / (0.5f * (z0 + z1)); ++m_screenMoved; onHud = true;
+                        const int cx0 = std::max(0, int(x0 / bw * 32.0f)), cx1 = std::min(31, int(x1 / bw * 32.0f));
+                        const int cy0 = std::max(0, int(y0 / bh * 24.0f)), cy1 = std::min(23, int(y1 / bh * 24.0f));
+                        for (int cy = cy0; cy <= cy1; ++cy) for (int cx = cx0; cx <= cx1; ++cx) m_hudCover[size_t(cy) * 32 + size_t(cx)] = 1;
                     }
                 }
             }
@@ -1197,6 +1227,22 @@ public:
 
     // Nearest significant scene depth over the WHOLE picture (28/09): 10th percentile of a 32 x 24 grid of the depth
     // map (arcade units, 0 = unknown). The HUD goes just in front of it (film subtitles): never behind something nearer.
+    // The nearest WORLD under the glass's content (29/09): 20th percentile of the depth map over the covered cells (the depth
+    // map holds the world only: glued polygons are left out of it). Whole picture when nothing covers anything.
+    float HudNearUnits() const {
+        if (m_depthCpu.empty() || m_depthCpuW == 0 || m_depthCpuH == 0) return 0.0f;
+        std::vector<float> v; v.reserve(768);
+        for (int cy = 0; cy < 24; ++cy)
+            for (int cx = 0; cx < 32; ++cx) {
+                if (!m_hudCover[size_t(cy) * 32 + size_t(cx)]) continue;
+                const int x = int((float(cx) + 0.5f) / 32.0f * float(m_depthCpuW)), y = int((float(cy) + 0.5f) / 24.0f * float(m_depthCpuH));
+                const float d = m_depthCpu[size_t(y) * m_depthCpuW + size_t(x)];
+                if (d > 0.0f && std::isfinite(d)) v.push_back(d);
+            }
+        if (v.size() < 4) return SceneNearUnits();
+        std::nth_element(v.begin(), v.begin() + long(v.size() / 5), v.end());
+        return v[v.size() / 5];
+    }
     float SceneNearUnits() const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || m_depthCpuH == 0) return 0.0f;
         float v[768]; int n = 0;
@@ -1387,6 +1433,7 @@ private:
         // (0 texel-exact like the board, 1 bilinear). The composite overwrites both with its own meaning.
         u.Sprite[2] = int(m_bankReadyMask); u.Sprite[3] = m_filter;
         u.FilterCfg[0] = m_anisoTaps;
+        u.FilterCfg[1] = m_letterTop; u.FilterCfg[2] = m_letterBottom;
         if (mvp && m_settings.voidMode == 2) {
             u.Bg[0] = m_settings.voidRGB[0]; u.Bg[1] = m_settings.voidRGB[1]; u.Bg[2] = m_settings.voidRGB[2];
         } else if (mvp && m_settings.voidMode == 1) {

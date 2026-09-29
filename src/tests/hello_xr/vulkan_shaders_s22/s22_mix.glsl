@@ -52,13 +52,13 @@ uvec3 mixText(ivec2 p, uvec3 dest, int prival) {
         // black bars): the text layer's big BLACK areas -- letterbox bands, story boxes -- were the edges of a flat screen.
         // A black texel whose four neighbours 3 texels away are black too lies inside such an area: transparent. The
         // text and its thin outline stay.
-        // A neighbour with NO text (priority bit 4 clear) counts as black too: otherwise the black texels along a box's
-        // outer edge stayed -- "une ligne noire en pointillés" at the start of a 2P game (29/09).
+        // The glass is emissive: black lights nothing. A WIDE black area of the text layer (the texel and its four neighbours
+        // 3 texels away black or without text) is empty glass, transparent -- letterbox, subtitle boxes ("2 gros rectangles");
+        // thin black outlines of letters stay.
         if (Flags.x != 0 && Flags.y != 0 && max(rgb.r, max(rgb.g, rgb.b)) <= 8u) {
             ivec2 hi = ivec2(OutText.zw) - 1;
-            ivec2 q0 = clamp(p + ivec2(3, 0), ivec2(0), hi), q1 = clamp(p - ivec2(3, 0), ivec2(0), hi);
-            ivec2 q2 = clamp(p + ivec2(0, 3), ivec2(0), hi), q3 = clamp(p - ivec2(0, 3), ivec2(0), hi);
-            if (darkOrNoText(q0) && darkOrNoText(q1) && darkOrNoText(q2) && darkOrNoText(q3)) return dest;
+            if (darkOrNoText(clamp(p + ivec2(3, 0), ivec2(0), hi)) && darkOrNoText(clamp(p - ivec2(3, 0), ivec2(0), hi)) &&
+                darkOrNoText(clamp(p + ivec2(0, 3), ivec2(0), hi)) && darkOrNoText(clamp(p - ivec2(0, 3), ivec2(0), hi))) return dest;
         }
     }
     if (spot && pen >= 0x80u) {

@@ -2199,7 +2199,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 }
                 // Just in front of the nearest thing in the picture (film subtitles, 28/09: "je louche toujours"):
                 // nearer -> follow fast, farther -> slowly.
-                const float nu = m_s22.SceneNearUnits();
+                const float nu = m_s22.HudNearUnits();   // the world under the glass's content (29/09)
                 if (nu > 0.0f) {
                     const float m = nu * worldScale;
                     const float k = (m_s22HudNear <= 0.0f || m < m_s22HudNear) ? 0.5f : 0.05f;
