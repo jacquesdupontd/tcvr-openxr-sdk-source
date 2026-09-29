@@ -468,6 +468,62 @@ public:
             std::vector<std::uint32_t> rawSecIdx;     // secondary views (other cameras, on the screen plane)
             std::vector<std::uint32_t> leanFallbackIdx;   // opaque, textured, no region image nor layer
 
+            // THE GLASS, per OBJECT (29/09 afternoon, Guillaume: "tout ce qui est en 2D sur le même pane, toute la 3D ne
+            // bouge pas"). Part of a game's 2D is drawn as 3D polygons glued to its camera: House of the Dead's shot sparks
+            // are ten models of 20 polygons at 8-20 cm (0x80709f..0x807e94), Time Crisis II's HUD and screen impacts are quads
+            // at 5-25 cm. Decided polygon by polygon (flat or not, textured or not, 10x nearer than the scene), a burst was
+            // split -- 30 % on the glass, 70 % before the eyes, measured -- and flat pieces of a far ship left holes. Now an
+            // OBJECT (the board's own model instance: polygon data address + copy + view; a direct-data polygon is its own
+            // object) goes on the glass WHOLE when every vertex of it is nearer than 40 cm in the headset, it shows in the
+            // picture, in the main view, and it is a sheet (flat) or an effect (all translucent). Nothing else moves, ever.
+            m_glassObj.clear();
+            if (m_nearFxOn && m_a2wScale > 1e-6f) {
+                const float zLim = 0.40f / m_a2wScale;
+                for (std::uint32_t i = 0; i < n; i++) {
+                    const tcvr_m2_prim& p = frame.raw_prims[i];
+                    const std::uint32_t vc = std::min<std::uint32_t>(p.vertex_count, frame.raw_vertex_count - std::min(p.first_vertex, frame.raw_vertex_count));
+                    GlassObj& o = m_glassObj[GlassKey(p, i)];
+                    if (vc < 3) continue;
+                    o.addr = p.motion_addr; o.polys++;
+                    if (p.translucent) o.translucent++;
+                    if (p.textured) o.textured++;
+                    if (p.center_x != mainCx || p.center_y != mainCy) o.ok = false;
+                    const float hw = 0.5f * float(p.clip_r - p.clip_l + 1), hh = 0.5f * float(p.clip_b - p.clip_t + 1);
+                    float sx0 = 1e9f, sx1 = -1e9f, sy0 = 1e9f, sy1 = -1e9f; bool front = true;
+                    for (std::uint32_t v = 0; v < vc; v++) {
+                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
+                        if (rv.z <= 1e-3f) { front = false; break; }
+                        o.zmin = std::min(o.zmin, rv.z); o.zmax = std::max(o.zmax, rv.z);
+                        const float sx = rv.x / rv.z, sy = rv.y / rv.z;
+                        sx0 = std::min(sx0, sx); sx1 = std::max(sx1, sx); sy0 = std::min(sy0, sy); sy1 = std::max(sy1, sy);
+                    }
+                    if (!front || o.zmax >= zLim) o.ok = false;
+                    if (front && sx1 >= -hw && sx0 <= hw && sy1 >= -hh && sy0 <= hh) o.inPic = true;
+                }
+                // What is glued to the camera is either a SHEET -- flat, its depth within 5 % of its distance: HUD, text, icons --
+                // or an EFFECT -- every polygon of it translucent: shot sparks, screen impacts, splashes. A volume the camera is
+                // close to is neither (29/09 afternoon, TCVR_GLASSCENSUS): House of the Dead's attract office, one 300-polygon
+                // model modelled in miniature 4-15 cm away, relief 286 %, partly translucent; a face in a close-up of Time Crisis
+                // II's intro, opaque. No threshold on the effects' shape: House of the Dead's sparks have a relief of 19 to 41 %
+                // from one frame of their animation to the next -- a limit there split the animation between two planes.
+                for (auto& kv : m_glassObj) {
+                    GlassObj& o = kv.second;
+                    const bool sheet = o.zmax - o.zmin <= 0.05f * o.zmin, effect = o.translucent == o.polys;
+                    if (!sheet && !effect) o.ok = false;
+                }
+                // TCVR_GLASSCENSUS: every object that comes nearer than 40 cm, glass or not, summed over the second
+                for (const auto& kv : m_glassObj) {
+                    const GlassObj& o = kv.second;
+                    if (o.polys == 0 || o.zmin >= zLim) continue;
+                    const bool glass = o.ok && o.inPic;
+                    CensusObj& c = m_censusGlass[(std::uint64_t(glass) << 32) | o.addr];
+                    c.frames++; c.polys += o.polys; c.tr += o.translucent; c.tex += o.textured;
+                    c.zmin = std::min(c.zmin, o.zmin * m_a2wScale * 100.0f); c.zmax = std::max(c.zmax, o.zmax * m_a2wScale * 100.0f);
+                    const float relief = o.zmin > 0.0f ? (o.zmax - o.zmin) / o.zmin : 99.0f;
+                    c.reliefMin = std::min(c.reliefMin, relief); c.reliefMax = std::max(c.reliefMax, relief);
+                }
+            }
+
             std::size_t vo = 0, io = 0;
             std::uint32_t last_zsort = 0xffffffffu;
             std::uint32_t intra_bucket_rank = 0;
@@ -523,43 +579,11 @@ public:
                                 k, n, (fullW && fullH) ? "plein" : "bande", x0, y0, x1, y1, p.clip_l, p.clip_t, p.clip_r, p.clip_b, zmin, p.textured, p.translucent, p.colorbase));
                     }
                 }
-                // Camera-attached effects (28/09, House of the Dead: at every shot a burst of translucent sparks around the aim
-                // point, drawn by the game at z 0.7-0.9 -- a hand's breadth from its camera, the scene ten times farther. The
-                // cabinet's flat screen hides that; in the headset the burst hung a few centimetres from the eyes and was seen
-                // double at every shot: "toujours par 2 au même endroit, on louche"). Flagged (bit 27) when textured,
-                // translucent, in the main view, entirely nearer than half a metre in the headset AND than a quarter of the
-                // scene's depth (rain around the camera, 2 m away, stays in 3D): PushNearEffects()
-                // moves each burst along its camera rays onto what it covers. The depth probes and the aim skip them.
-                // (29/09 midday) The former "effects" rule (bit 27: translucent near bursts pushed onto their target) is gone:
-                // Guillaume wants ONE rule -- whatever the game glues to its camera is on the glass, on the HUD plane (below).
-                // Universal rule (29/09, same as the System 22's PrepareFrame): a FLAT polygon facing the camera and glued to it
-                // (< 40 cm in the headset, or 10x nearer than the scene), in the main view, neither a full-frame veil nor a band
-                // (flagged above) is screen content -- a HUD drawn in 3D: bit 28, moved onto the HUD plane (PushNearEffects).
-                // ONE rule, both boards (29/09 midday, Guillaume: "tous les éléments 2D à 100 %, au même plan, rien un par un"):
-                // in the picture, and entirely nearer than 15 cm (the sparks at 9.5 cm, flat or not) or flat (< 5 %) nearer
-                // than 40 cm / 10x nearer than the scene and at most half the picture. ANY opacity (Time Crisis II's screen
-                // impacts are translucent; the rain goes to the glass too).
-                if (m_nearFxOn && vc >= 3 && (q.rgb & 0x6000000u) == 0u && q.center_x == mainCx && q.center_y == mainCy && m_a2wScale > 1e-6f) {
-                    float z0 = 1e9f, z1 = -1e9f, sx0 = 1e9f, sx1 = -1e9f, sy0 = 1e9f, sy1 = -1e9f; bool inFront = true;
-                    for (std::uint32_t v = 0; v < vc; v++) {
-                        const tcvr_m2_raw_vertex& rv = frame.raw_vertices[p.first_vertex + v];
-                        if (rv.z <= 1e-3f) { inFront = false; break; }
-                        z0 = std::min(z0, rv.z); z1 = std::max(z1, rv.z);
-                        const float sx = rv.x / rv.z, sy = rv.y / rv.z;
-                        sx0 = std::min(sx0, sx); sx1 = std::max(sx1, sx); sy0 = std::min(sy0, sy); sy1 = std::max(sy1, sy);
-                    }
-                    // at most half the picture: a HUD element is small; a wall the camera presses against is not (House of
-                    // the Dead's attract once gave 86 such polygons in a frame without this)
-                    const bool small = sx1 - sx0 <= 248.0f && sy1 - sy0 <= 192.0f;
-                    // in the game's picture (29/09: flat pieces of floor just under the camera, outside it, passed the test --
-                    // in the headset they are seen too, moved they would come off the floor). sx, sy are relative to the view's centre.
-                    const float hw = 0.5f * float(p.clip_r - p.clip_l + 1), hh = 0.5f * float(p.clip_b - p.clip_t + 1);
-                    const bool inPic = sx1 >= -hw && sx0 <= hw && sy1 >= -hh && sy0 <= hh;
-                    const bool flat = z1 - z0 <= 0.05f * z0;
-                    const bool glued = flat && small && (z0 * m_a2wScale < 0.40f || (m_sceneDepth > 0.0f && z0 < 0.1f * m_sceneDepth));
-                    // TEXTURED: what a game puts on its glass (icons, text, impacts, logos) is textured; a flat-shaded mesh part
-                    // brushing the camera is a body (House of the Dead: 394 untextured polygons of a character, 29/09)
-                    if (inFront && inPic && glued && q.textured != 0u) q.rgb |= 0x10000000u;
+                // THE GLASS, decided per OBJECT (pre-pass above): a polygon of a glued object goes onto the HUD plane (bit 28,
+                // PushNearEffects), a full-frame veil or a band keeps its own path (bits 25/26).
+                if (m_nearFxOn && vc >= 3 && (q.rgb & 0x6000000u) == 0u) {
+                    const auto go = m_glassObj.find(GlassKey(p, 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu)));
+                    if (go != m_glassObj.end() && go->second.ok && go->second.inPic) q.rgb |= 0x10000000u;
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
                     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
@@ -796,6 +820,15 @@ public:
                 const auto now = std::chrono::steady_clock::now();
                 if (m_a2wScale > 1e-6f && now - m_nearLogAt > std::chrono::seconds(1)) {
                     m_nearLogAt = now;
+                    if (!m_censusGlass.empty()) {   // objects nearer than 40 cm this second: glass or not, and why
+                        std::string c;
+                        for (const auto& kv : m_censusGlass)
+                            c += Fmt(" [%s %x: %u img, %u poly, tr %u, tex %u, %.1f-%.1f cm, relief %.0f-%.0f %%]", (kv.first >> 32) ? "VITRE" : "monde",
+                                     std::uint32_t(kv.first), kv.second.frames, kv.second.polys, kv.second.tr, kv.second.tex, kv.second.zmin, kv.second.zmax,
+                                     100.0f * kv.second.reliefMin, 100.0f * kv.second.reliefMax);
+                        Log::Write(Log::Level::Info, Fmt("TCVR_GLASSCENSUS%s", c.c_str()));
+                        m_censusGlass.clear();
+                    }
                     // TCVR_CLASS: what the second drew OUTSIDE the plain 3D -- flat secondary views, screen veils or bands,
                     // effects pushed off the camera (frames of the second that had any, most in one frame, where)
                     if (m_cls.secFrames || m_cls.ovFrames || m_cls.fxFrames) {
@@ -2353,6 +2386,19 @@ public:
     std::vector<FxBox> m_fxPrims, m_fxGroups, m_fxPrevGroups;
     bool m_nearFxOn = false;
     uint32_t m_screenMovedM2 = 0;   // flat camera-glued polygons moved onto the HUD plane this frame
+    // The glass, per object (29/09): the board's model instance -- polygon data address, copy, view; a direct-data polygon
+    // (address 0xffffffff) is its own object.
+    struct GlassObj { float zmin = 1e9f, zmax = 0.0f; std::uint32_t polys = 0, translucent = 0, textured = 0, addr = 0; bool ok = true, inPic = false; };
+    std::unordered_map<std::uint64_t, GlassObj> m_glassObj;
+    static std::uint64_t GlassKey(const tcvr_m2_prim& p, std::uint32_t captureIndex) {
+        if (p.motion_addr == 0xffffffffu) return 0x8000000000000000ull | captureIndex;
+        std::uint32_t h = 2166136261u;
+        for (std::uint32_t w : {p.window, std::uint32_t(p.center_x), std::uint32_t(p.center_y), std::uint32_t(p.clip_l), std::uint32_t(p.clip_t),
+                                std::uint32_t(p.clip_r), std::uint32_t(p.clip_b)}) { h ^= w; h *= 16777619u; }
+        return ((std::uint64_t(p.motion_addr) << 32 | p.motion_serial) ^ (std::uint64_t(h) * 0x9E3779B97F4A7C15ull)) & 0x7fffffffffffffffull;
+    }
+    struct CensusObj { std::uint32_t frames = 0, polys = 0, tr = 0, tex = 0; float zmin = 1e9f, zmax = 0.0f, reliefMin = 99.0f, reliefMax = 0.0f; };
+    std::map<std::uint64_t, CensusObj> m_censusGlass;   // TCVR_GLASSCENSUS: objects nearer than 40 cm this second, (glass, address)
     float m_scrBox[4] = {0, 0, 0, 0}, m_scrZ[2] = {0, 0};   // ... their board box and depth range (m), for TCVR_NEAR
     uint32_t m_scrTex = 0, m_scrTrans = 0, m_scrCb = 0;
     // Near comfort on the CPU, the vertex stage's nearComfort (m2_vert.glsl): a distance in metres -> where it is drawn; a point

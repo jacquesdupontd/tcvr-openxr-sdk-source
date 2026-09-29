@@ -340,6 +340,12 @@ public:
     float m_hudDepthM = 0.0f;                      // the HUD plane's distance (metres), from the last frame
     std::vector<tcvr_scene_vertex> m_moveVerts;
     bool m_emitOnHud = false;   // emit(): this polygon was moved onto the HUD plane (prim row 42)
+    std::map<std::string, int> m_census;   // TCVR_GLASSCENSUS: objects nearer than 40 cm this second, by kind and decision
+    // The glass, per object (29/09): tcvr_scene_prim.object, one model instance or one immediate polygon of the board
+    struct GlassObjS { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmin = 1e9f, zmax = 0.0f; uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false; };
+    uint32_t m_bandsKept = 0;   // strip-shaped polygons kept this second: part of a bigger object
+    std::unordered_map<uint64_t, GlassObjS> m_glassObj;
+    std::vector<uint8_t> m_primBand;   // this frame's letterbox strips (isBand), decided once
     std::string m_fireTagS22{"0"};   // TCVR_S22FIRE: injected shot followed
     bool m_diagAimSet = false; float m_diagAim[2] = {0.5f, 0.5f};
     // A REAL shot of the player (29/09): the same 15 frames of TCVR_S22FIRE around his own aim -- what he sees, logged while
@@ -352,8 +358,14 @@ public:
     uint32_t BandsDropped() const { return m_bandsDropped; }
     void SetHudDepthM(float m) { m_hudDepthM = m; }
     std::string TakeMoveDiag() {   // the second's totals: effects moved (sum), screen polygons and bands (most in a frame)
-        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u", m_fxSec, m_screenSecMax, m_bandsSecMax);
-        m_fxSec = m_screenSecMax = m_bandsSecMax = 0;
+        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u", m_fxSec, m_screenSecMax,
+                            m_bandsSecMax, m_bandsKept);
+        m_fxSec = m_screenSecMax = m_bandsSecMax = 0; m_bandsKept = 0;
+        if (!m_census.empty()) {
+            r += " | TCVR_GLASSCENSUS";
+            for (const auto& kv : m_census) r += Fmt(" [%s: %d]", kv.first.c_str(), kv.second);
+            m_census.clear();
+        }
         return r;
     }
     std::string BandDiag() const {
@@ -599,7 +611,18 @@ public:
                               p.texture_enabled, p.pens_offset);
                     ++n2;
                 }
-                Log::Write(Log::Level::Info, Fmt("TCVR_S22FIRE f%d 3D<1m:%s | 2D autour de la visee %.0f,%.0f:%s", 15 - m_fireNearFrames, line.c_str(), apx, apy, l2.c_str()));
+                int white = 0, tot = 0;
+                if (f.text && f.pri && f.pens)
+                    for (int y = 0; y < f.height; y += 8)
+                        for (int x = 0; x < f.width; x += 8, ++tot) {
+                            if ((f.pri[size_t(y) * f.pri_stride + size_t(x)] & 4) == 0) continue;
+                            const uint16_t tv = f.text[size_t(y) * f.text_stride + size_t(x)];
+                            const uint32_t c = tv < f.pen_count ? f.pens[tv] : 0u;
+                            if (((c >> 16) & 255u) > 200u && ((c >> 8) & 255u) > 200u && (c & 255u) > 200u) ++white;
+                        }
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22FIRE f%d flash? texte blanc %d/%d fade %u/%u (%.0f,%.0f,%.0f) | 3D<1m:%s | 2D autour de la visee %.0f,%.0f:%s",
+                    15 - m_fireNearFrames, white, tot, f.mix_fade_enabled, f.mix_fade_factor, f.mix_fade_r, f.mix_fade_g, f.mix_fade_b,
+                    line.c_str(), apx, apy, l2.c_str()));
             }
         }
         if (arcadexr::config::GetInt("s22.polyDiag", 0) != 0 && tBuild - m_polyDiagAt > std::chrono::seconds(1)) {
@@ -793,16 +816,8 @@ public:
             return (fullW && y1 - y0 <= 0.35f * bh && (y0 <= 0.05f * bh || y1 >= 0.95f * bh)) ||
                    (fullH && x1 - x0 <= 0.35f * bw && (x0 <= 0.05f * bw || x1 >= 0.95f * bw));
         };
-        // UNIVERSAL placement of what the game glues to its camera (29/09, Guillaume: "un outil universel, automatique, qui
-        // s'adapte à tous les jeux"; Time Crisis II draws its ammo as flat 3D quads 25 cm from the eyes -- they swam out of
-        // their 2D container when the head moved -- and its screen impacts 5 cm away). Geometry alone decides, no game list:
-        //  - FLAT facing the camera and glued to it (< 40 cm, or 10x nearer than the scene): screen content. A strip along
-        //    an edge = letterbox, dropped (isBand); anything else goes ON THE HUD PLANE at the same pixels, perceived at
-        //    the HUD's distance (NearInv undoes the near comfort), next to its 2D container.
-        //  - not flat, at most half the picture, wholly nearer than 20 cm, in it: an effect (shot impact, a hit on the screen:
-        //    Time Crisis II's are 128-192 px at 5-7 cm; a real surface that near covers more): along its rays onto what
-        //    it covers (depth map around its centre, what is nearer than 20 cm ignored).
-        //  - everything else: real 3D (with the near comfort).
+        // What the game glues to its camera goes on the glass, decided per OBJECT (below, "THE GLASS"); letterbox strips of
+        // any depth are dropped (isBand); everything else is the world, with the near comfort.
         m_bandsDropped = 0; m_bandNear = 0; m_bandSceneZ = sceneZ; m_screenMoved = 0; m_fxMoved = 0;   // this frame
         // What the glass covers (32 x 24 cells of the board): visible non-black text, 2D polygons and sprites, and (in the loop)
         // the glued polygons -- the HUD plane goes just in front of the WORLD under them (HudNearUnits), not of whatever is
@@ -848,42 +863,75 @@ public:
             while (m_letterTop < f.height / 3 && bandRow(m_letterTop)) ++m_letterTop;
             while (m_letterBottom > f.height * 2 / 3 && bandRow(m_letterBottom - 1)) --m_letterBottom;
         }
+        // THE GLASS, per OBJECT (29/09 afternoon, Guillaume: "tout ce qui est en 2D sur le même pane, toute la 3D ne bouge
+        // pas"). Part of a game's 2D is drawn as 3D polygons glued to its camera: Time Crisis II's HUD (quads at 25 cm) and
+        // screen impacts (5 cm), House of the Dead's shot sparks (Model 2, ten models at 8-20 cm). Decided polygon by polygon
+        // (flat or not, textured or not, "10x nearer than the scene"), a burst was split -- part on the glass, part before
+        // the eyes -- and flat pieces of the intro's far ship went to the glass and left holes. Now the board says which
+        // OBJECT each polygon comes from (tcvr_scene_prim.object: one model instance, or one immediate polygon), and an
+        // object goes on the glass WHOLE when every vertex of it is nearer than 40 cm in the headset, it shows in the picture,
+        // and it is a sheet (flat) or an effect (all translucent). Nothing else moves, ever. Bands (letterbox strips) are dropped.
         const float a2w = m_bandA2w;
+        const bool glassOn = m_dropBands && a2w > 0.0f && m_hudDepthM > 0.0f;
+        m_primBand.assign(f.prim_count, 0);
+        m_glassObj.clear();
+        for (uint32_t p = 0; p < f.prim_count; ++p) {
+            const tcvr_scene_prim& pr = f.prims[p];
+            if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
+            const tcvr_scene_vertex* v = f.vertices + pr.first_vertex;
+            const bool band = isBand(pr, v);
+            m_primBand[p] = band ? 1 : 0;
+            if (pr.kind != 0 || pr.direct) continue;
+            GlassObjS& o = m_glassObj[pr.object ? uint64_t(pr.object) : ((1ull << 32) | p)];
+            o.polys++; o.tr += (pr.alpha_enabled && pr.alpha > 0) ? 1u : 0u; o.tex += pr.texture_enabled ? 1u : 0u; o.imm += pr.immediate ? 1u : 0u;
+            o.bands += band ? 1u : 0u;
+            if (pr.vertex_count > 8) { o.ok = false; continue; }
+            for (uint32_t i = 0; i < pr.vertex_count; ++i) {
+                if (!(v[i].z > 0.0f)) { o.ok = false; break; }
+                const float sx = float(pr.cx) + v[i].x / v[i].z, sy = float(pr.cy) - v[i].y / v[i].z;
+                o.x0 = std::min(o.x0, sx); o.x1 = std::max(o.x1, sx); o.y0 = std::min(o.y0, sy); o.y1 = std::max(o.y1, sy);
+                o.zmin = std::min(o.zmin, v[i].z); o.zmax = std::max(o.zmax, v[i].z);
+            }
+        }
+        for (auto& kv : m_glassObj) {
+            GlassObjS& o = kv.second;
+            // wholly nearer than 40 cm, in the picture, and a SHEET (flat: depth within 5 % of its distance -- the HUD) or an
+            // EFFECT (every polygon translucent -- the screen impacts). A volume the camera is close to (a face in a close-up of
+            // the intro, opaque) is neither. Same rule as the Model 2's (vulkan_m2_renderer.h, "THE GLASS").
+            const float relief = o.zmin > 0.0f ? (o.zmax - o.zmin) / o.zmin : 99.0f;
+            const bool sheet = relief <= 0.05f, effect = o.tr == o.polys;
+            o.glass = o.ok && (sheet || effect) && o.zmax * a2w < 0.40f && o.x1 >= 0.0f && o.y1 >= 0.0f && o.x0 <= bw && o.y0 <= bh;
+            if (o.zmin * a2w < 0.40f && m_census.size() < 48)   // TCVR_GLASSCENSUS: every object nearer than 40 cm, glass or not
+                m_census[Fmt("%s %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %%", o.glass ? "VITRE" : "monde", o.polys, o.imm, o.tr, o.tex,
+                             std::floor(o.zmin * a2w * 20.0f) * 5.0f, std::ceil(o.zmax * a2w * 20.0f) * 5.0f, std::round(relief * 20.0f) * 5.0f)]++;
+        }
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
             if (pr.vertex_count < 3 || pr.first_vertex + pr.vertex_count > f.vertex_count) continue;
             const tcvr_scene_vertex* v = f.vertices + pr.first_vertex;
             const bool half = m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0;
-            if (isBand(pr, v)) { ++m_bandsDropped; continue; }
+            // a letterbox strip is dropped only when its whole object is strips (the game's own bars); a strip-shaped piece
+            // of a real model (a hull panel facing the camera along the edge) is the model's, it stays (same rule as the glass)
+            if (m_primBand[p]) {
+                const auto go = m_glassObj.find(pr.object ? uint64_t(pr.object) : ((1ull << 32) | p));
+                if (go == m_glassObj.end() || go->second.bands == go->second.polys) { ++m_bandsDropped; continue; }
+                ++m_bandsKept;
+            }
             float k = 1.0f; bool onHud = false;
-            if (m_dropBands && a2w > 0.0f && pr.kind == 0 && !pr.direct && pr.vertex_count <= 8) {
-                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
-                for (uint32_t i = 0; i < pr.vertex_count; ++i) {
-                    const float zz = std::max(v[i].z, 1e-6f);
-                    const float sx = float(pr.cx) + v[i].x / zz, sy = float(pr.cy) - v[i].y / zz;
-                    x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
-                    z0 = std::min(z0, v[i].z); z1 = std::max(z1, v[i].z);
-                }
-                const bool inPicture = x1 >= 0.0f && y1 >= 0.0f && x0 <= bw && y0 <= bh;
-                if (z0 > 0.0f && inPicture && m_hudDepthM > 0.0f) {
-                    // ONE rule (29/09 midday, Guillaume: "scanner TOUS les éléments 2D à 100 %, tous au même plan, rien un par
-                    // un"). Glued to the camera = on the glass: entirely nearer than 15 cm (nothing of the world is that near --
-                    // the screen impacts at 5 cm, flat or not), or flat (< 5 % of depth) nearer than 40 cm or 10x nearer than
-                    // the scene and at most half the picture (the HUD at 25 cm; a wall the camera presses on is bigger). ANY
-                    // opacity (the impacts are translucent). All of it on the HUD plane, at the HUD's true distance, out of
-                    // the near comfort (head parallax, see s22_scene_vert).
-                    const bool flat = z1 - z0 <= 0.05f * z0;
-                    const bool smallP = x1 - x0 <= 0.5f * bw && y1 - y0 <= 0.5f * bh;
-                    // textured, like everything a game puts on its glass (a flat-shaded mesh part brushing the camera is a body)
-                    // (no "anything nearer than 15 cm" clause: it took the faces and hands of the intro's close-ups, 351 polygons
-                    // a second, which then went behind their own bodies -- "il manque plein de petits polygones", 29/09)
-                    const bool glued = pr.texture_enabled != 0 && flat && smallP && (z0 * a2w < 0.40f || (sceneZ > 0.0f && z0 < 0.1f * sceneZ));
-                    if (glued) {
-                        k = (m_hudDepthM / a2w) / (0.5f * (z0 + z1)); ++m_screenMoved; onHud = true;
-                        const int cx0 = std::max(0, int(x0 / bw * 32.0f)), cx1 = std::min(31, int(x1 / bw * 32.0f));
-                        const int cy0 = std::max(0, int(y0 / bh * 24.0f)), cy1 = std::min(23, int(y1 / bh * 24.0f));
-                        for (int cy = cy0; cy <= cy1; ++cy) for (int cx = cx0; cx <= cx1; ++cx) m_hudCover[size_t(cy) * 32 + size_t(cx)] = 1;
+            if (glassOn && pr.kind == 0 && !pr.direct && pr.vertex_count <= 8) {
+                const auto go = m_glassObj.find(pr.object ? uint64_t(pr.object) : ((1ull << 32) | p));
+                if (go != m_glassObj.end() && go->second.glass) {
+                    // on the HUD plane at the same pixels, at the HUD's true distance, out of the near comfort (s22_scene_vert)
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                    for (uint32_t i = 0; i < pr.vertex_count; ++i) {
+                        const float sx = float(pr.cx) + v[i].x / v[i].z, sy = float(pr.cy) - v[i].y / v[i].z;
+                        x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+                        z0 = std::min(z0, v[i].z); z1 = std::max(z1, v[i].z);
                     }
+                    k = (m_hudDepthM / a2w) / (0.5f * (z0 + z1)); ++m_screenMoved; onHud = true;
+                    const int cx0 = std::max(0, int(x0 / bw * 32.0f)), cx1 = std::min(31, int(x1 / bw * 32.0f));
+                    const int cy0 = std::max(0, int(y0 / bh * 24.0f)), cy1 = std::min(23, int(y1 / bh * 24.0f));
+                    for (int cy = cy0; cy <= cy1; ++cy) for (int cx = cx0; cx <= cx1; ++cx) m_hudCover[size_t(cy) * 32 + size_t(cx)] = 1;
                 }
             }
             if (k != 1.0f) {
