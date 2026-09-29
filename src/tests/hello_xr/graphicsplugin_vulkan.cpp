@@ -2101,7 +2101,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             s_s22Self = this;
         }
         const std::string game = arcadexr::profiles::CurrentGame();
-        if (game != m_s22Game) { m_s22.ResetAssets(); m_s22Game = game; }
+        // a new game: its textures reload, and the previous game's last frame is forgotten (never drawn with the new tables)
+        if (game != m_s22Game) { m_s22.ResetAssets(); m_s22Game = game; m_s22Frame = nullptr; }
         // Bench: s22.freeze=1 keeps redrawing the same scene (valid until the next acquire).
         if (!m_s22Frame || arcadexr::config::GetInt("s22.freeze", 0) == 0) {
             const tcvr_scene_frame* f = s22::AcquireScene();
