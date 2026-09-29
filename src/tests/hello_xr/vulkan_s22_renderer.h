@@ -1470,7 +1470,16 @@ public:
     // the depth map. False when it leaves the screen or meets nothing.
     // Near comfort for the aim: metres per unit (0 = off), nearest perceived distance, start (metres).
     void SetAimNear(float a2w, float nearMin, float nearStart) { m_aimNear[0] = a2w; m_aimNear[1] = nearMin; m_aimNear[2] = nearStart; }
+    // What stops the gun (29/09 evening, Guillaume: "c'est comme s'il tirait sur une vitre à 20 cm de lui, ça vise pas bien
+    // derrière"). The gun is held ~35 cm below the eyes, the game's camera: behind cover, its ray meets the crate the player
+    // sees OVER. A surface nearer than `metres` from the eyes (arm's reach) does not stop the shot when the ray goes on to
+    // something the eyes see behind it; it is the target only when nothing is found beyond it (aiming at it on purpose).
+    void SetAimIgnoreNear(float a2w, float metres) { m_aimIgnore[0] = a2w; m_aimIgnore[1] = metres; }
+    struct AimDiag { uint32_t rays = 0, nearSkipped = 0, nearFallback = 0; };
+    AimDiag TakeAimDiag() const { AimDiag d = m_aimDiag; m_aimDiag = {}; return d; }
     float m_aimNear[3] = {0.0f, 0.5f, 1.0f};
+    float m_aimIgnore[2] = {0.0f, 0.0f};   // a2w, metres: nearer surfaces do not stop the gun (SetAimIgnoreNear)
+    mutable AimDiag m_aimDiag;
     bool RayCast(const float o[3], const float d[3], int screenW, int screenH, float& sx, float& sy, float hit[3]) const {
         if (m_depthCpu.empty() || m_depthCpuW == 0 || d[2] <= 1e-6f) return false;
         const float zoom = m_lastZoom > 0.0f ? m_lastZoom : 1.0f;
@@ -1482,10 +1491,16 @@ public:
             x = screenW * 0.5f + zoom * p[0] / p[2]; y = screenH * 0.5f - zoom * p[1] / p[2];
             if (x < 0.0f || y < 0.0f || x >= screenW || y >= screenH) return -1;
             float depth = m_depthCpu[size_t(int(y * ky)) * m_depthCpuW + size_t(int(x * kx))];
+            const float rawDepth = depth;
             if (depth > 0.0f && m_aimNear[0] > 0.0f) {   // near comfort: the surface where it is PERCEIVED (f, nearStereo)
                 const float tx = (x - screenW * 0.5f) / zoom, ty = (screenH * 0.5f - y) / zoom;
                 const float dist = depth * std::sqrt(1.0f + tx * tx + ty * ty) * m_aimNear[0];
                 if (dist < m_aimNear[2] && dist > 1e-6f) { const float u = 1.0f - dist / m_aimNear[2]; depth *= (dist + m_aimNear[1] * u * u) / dist; }
+            }
+            // arm's reach (SetAimIgnoreNear): measured from the eyes on the RAW surface, before the near comfort
+            if (depth > 0.0f && m_aimIgnore[1] > 0.0f && m_aimIgnore[0] > 0.0f) {
+                const float tx = (x - screenW * 0.5f) / zoom, ty = (screenH * 0.5f - y) / zoom;
+                if (rawDepth * std::sqrt(1.0f + tx * tx + ty * ty) * m_aimIgnore[0] < m_aimIgnore[1]) return (p[2] >= depth) ? 2 : 0;
             }
             return (depth > 0.0f && p[2] >= depth) ? 1 : 0;
         };
@@ -1493,17 +1508,38 @@ public:
         if (t < 0.0f) t = 0.0f;
         float tPrev = t;
         bool entered = false;   // the ray from a hand starts BELOW the board camera's view: march until it enters
+        ++m_aimDiag.rays;
+        // the first crossing of a surface within arm's reach: the target only if nothing is found beyond it
+        bool haveNear = false; float nearS[2] = {0, 0}, nearP[3] = {0, 0, 0}, nearLo = 0.0f, nearHi = 0.0f;
+        auto nearFallback = [&]() -> bool {
+            if (!haveNear) return false;
+            float lo = nearLo, hi = nearHi, x = nearS[0], y = nearS[1], p[3] = {nearP[0], nearP[1], nearP[2]};
+            for (int k = 0; k < 14; ++k) {
+                const float mid = 0.5f * (lo + hi);
+                float mx, my, mp[3];
+                if (probe(mid, mx, my, mp) == 2) hi = mid; else lo = mid;
+            }
+            if (probe(hi, x, y, p) == 2) { sx = x; sy = y; hit[0] = p[0]; hit[1] = p[1]; hit[2] = p[2]; ++m_aimDiag.nearFallback; return true; }
+            return false;
+        };
         for (int i = 0; i < 600; ++i) {
             float x, y, p[3];
             const int st = probe(t, x, y, p);
             if (st < 0) {
-                if (entered) return false;   // left the image after being in it: a miss
-                if (p[2] > 3.0e6f) return false;
+                if (entered) return nearFallback();   // left the image after being in it: a miss (or the near surface)
+                if (p[2] > 3.0e6f) return nearFallback();
                 tPrev = t;
                 t = std::max(t * 1.02f, t + 20.0f);
                 continue;
             }
             entered = true;
+            if (st == 2) {   // behind a surface within arm's reach: remembered, not a stop
+                if (!haveNear) { haveNear = true; nearLo = tPrev; nearHi = t; nearS[0] = x; nearS[1] = y; nearP[0] = p[0]; nearP[1] = p[1]; nearP[2] = p[2]; ++m_aimDiag.nearSkipped; }
+                if (p[2] > 3.0e6f) return nearFallback();
+                tPrev = t;
+                t = std::max(t * 1.02f, t + 20.0f);
+                continue;
+            }
             if (st == 1) {
                 // March steps grow with distance (2 %): refine the crossing between the last point in front and
                 // this one, otherwise the reported pixel slides along the ray (a lateral error from a controller
@@ -1518,11 +1554,11 @@ public:
                 sx = x; sy = y; hit[0] = p[0]; hit[1] = p[1]; hit[2] = p[2];
                 return true;
             }
-            if (p[2] > 3.0e6f) return false;
+            if (p[2] > 3.0e6f) return nearFallback();
             tPrev = t;
             t = std::max(t * 1.02f, t + 20.0f);
         }
-        return false;
+        return nearFallback();
     }
 
 private:

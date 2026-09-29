@@ -1428,6 +1428,25 @@ struct OpenXrProgram : IOpenXrProgram {
         m_gunPull = fireInjected ? 1.0f : (triggerValue.isActive == XR_TRUE) ? triggerValue.currentState : 0.0f;   // the 3D gun's trigger follows
         if (triggerPressed && !m_triggerHeld && !m_calibrating && !m_blockTriggerUntilRelease && !menuOpen && !driving) {
             m_gunShotAt = std::chrono::steady_clock::now();   // slide recoil + muzzle flash of the 3D gun (28/09)
+            if (!fireInjected && m_lastAim.valid) {   // TCVR_SHOT: one line per real shot (29/09, "tire sur une vitre à 20 cm")
+                const LastAim& a = m_lastAim;
+                const auto rel = [&](const XrVector3f& P, float& lat, float& ver, float& fwd) {
+                    const XrVector3f d{P.x - a.camera.x, P.y - a.camera.y, P.z - a.camera.z};
+                    lat = d.x * a.right.x + d.y * a.right.y + d.z * a.right.z; ver = d.x * a.up.x + d.y * a.up.y + d.z * a.up.z;
+                    fwd = -(d.x * a.normal.x + d.y * a.normal.y + d.z * a.normal.z);
+                };
+                float gl, gv, gf, hl = 0, hv = 0, hf = 0; rel(a.muzzle, gl, gv, gf);
+                float fromGun = 0.0f;
+                if (a.world) {
+                    rel(a.hit, hl, hv, hf);
+                    const XrVector3f g{a.hit.x - a.muzzle.x, a.hit.y - a.muzzle.y, a.hit.z - a.muzzle.z};
+                    fromGun = std::sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+                }
+                Log::Write(Log::Level::Info, Fmt("TCVR_SHOT %s pixel %.3f,%.3f | canon par rapport a la camera du jeu : %+.2f m cote, %+.2f m haut, %+.2f m devant | "
+                                                 "touche %s a %.2f m du canon (%+.2f cote, %+.2f haut, %.2f m devant la camera)",
+                                                 a.onScreen ? "dans l'ecran" : "HORS ECRAN", a.nx, a.ny, gl, gv, gf,
+                                                 a.world ? "la scene" : "rien (plan de l'ecran)", fromGun, hl, hv, hf));
+            }
             const int ms = arcadexr::profiles::GetInt("haptics.ms", 120);
             if (ms > 0) {
                 XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
@@ -1931,6 +1950,15 @@ struct OpenXrProgram : IOpenXrProgram {
                 }
             }
             const bool onScreen = hit.intersects && hit.on_screen;
+            {
+                const float camD = arcadexr::config::GetFloat("screen.distance", 2.0f);
+                m_lastAim.valid = true; m_lastAim.world = haveAimWorld; m_lastAim.onScreen = onScreen;
+                m_lastAim.nx = hit.normalized_x; m_lastAim.ny = hit.normalized_y;
+                m_lastAim.muzzle = {muzzle.x, muzzle.y, muzzle.z}; m_lastAim.hit = aimWorld;
+                m_lastAim.camera = {screen.center.x + screen.normal.x * camD, screen.center.y + screen.normal.y * camD, screen.center.z + screen.normal.z * camD};
+                m_lastAim.normal = {screen.normal.x, screen.normal.y, screen.normal.z};
+                m_lastAim.right = {screen.right.x, screen.right.y, screen.right.z}; m_lastAim.up = {screen.up.x, screen.up.y, screen.up.z};
+            }
             arcadexr::input::SetAnalog("gun_x", onScreen ? hit.normalized_x : 0.0f);
             arcadexr::input::SetAnalog("gun_y", onScreen ? hit.normalized_y : 0.0f);
             arcadexr::input::SetDigital("gun_offscreen", !onScreen);
@@ -2290,6 +2318,9 @@ struct OpenXrProgram : IOpenXrProgram {
     XrTime m_lastTickDisplayTime{0}, m_tickAcc{0};
     XrPosef m_swDelta{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     float m_gunPull = 0.0f;                                   // 3D gun: analog trigger of the aiming hand
+    // Last aim, for the per-shot record (TCVR_SHOT, 29/09): where the gun was, what its ray met, what the game got
+    struct LastAim { bool valid = false, world = false, onScreen = false; float nx = 0, ny = 0; XrVector3f muzzle{}, hit{}, camera{}, normal{}, right{}, up{}; };
+    LastAim m_lastAim;
     std::string m_fireTag;                                    // bench: last injected shot (debug.tcvr.fire)
     int m_fireFrames = 0, m_fireAim = 0;                      // bench: frames left with the trigger held / the aim forced
     std::chrono::steady_clock::time_point m_gunShotAt{};      // 3D gun: last shot (slide recoil, muzzle flash)

@@ -2232,7 +2232,16 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const float nearStartM = std::max(2.0f * nearMinM, arcadexr::config::GetFloat("m2.nearStart", 1.0f));
         const auto nearF = [&](float dm) { if (!nearOn || dm >= nearStartM || dm <= 1e-6f) return dm; const float u = 1.0f - dm / nearStartM; return dm + nearMinM * u * u; };
         float hudD = distance;
-        if (arcadexr::profiles::GetInt("immersive.hudIso", 1) != 0) {
+        // ONE FIXED PLANE (29/09 evening, Guillaume: "les plans bougent de profondeur très souvent ... je t'ai dit de laisser
+        // fixe les trucs"): the whole 2D -- text layer, HUD sprites, what goes on the glass, the cinema frame -- at one
+        // constant distance, whatever passes under it. The plane that followed the nearest thing (fast in, slow out) and the
+        // cinema frame's 2 m, re-decided at every image, made it jump between ~0.6 m and 2 m. Same key as the Model 2's fixed
+        // HUD (hud.distance, live debug.tcvr.hud_distance); 0 = the adaptive plane below. Default 0.65 m: where the adaptive
+        // plane settled in play (0.63 m, just in front of the cover), so nothing under the 2D is perceived nearer than it.
+        const float s22FixedHud = arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 0.65f));
+        if (s22FixedHud > 0.0f) {
+            hudD = std::max(0.3f, s22FixedHud);
+        } else if (arcadexr::profiles::GetInt("immersive.hudIso", 1) != 0) {
             if (viewIndex == 0) {
                 const float zu = m_s22.SceneDepthUnits();
                 if (zu > 0.0f) {
@@ -2276,7 +2285,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 const auto nowH = std::chrono::steady_clock::now();
                 if (nowH - s_at > std::chrono::seconds(1)) {
                     s_at = nowH;
-                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m | %s", zoomS, bw, bh, hudD, m_s22.TakeMoveDiag().c_str()));
+                    const auto ad = m_s22.TakeAimDiag();
+                    Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m%s | visee : %u rayons, %u passes au-dela d'une surface a portee de bras, %u sur elle faute d'autre chose | %s",
+                                                     zoomS, bw, bh, hudD, s22FixedHud > 0.0f ? " (fixe)" : " (adaptatif)", ad.rays, ad.nearSkipped, ad.nearFallback, m_s22.TakeMoveDiag().c_str()));
                 }
             }
             // Only with a REAL game camera: a focal length is hundreds of pixels (Time Crisis II 772.5; 28 would already be a 170
@@ -2325,6 +2336,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 st.nearCyc[0] = cycArc.x; st.nearCyc[1] = cycArc.y; st.nearCyc[2] = cycArc.z; st.nearCyc[3] = worldScale;
             }
             m_s22.SetAimNear(nearOn ? worldScale : 0.0f, nearMinM, nearStartM);
+            m_s22.SetAimIgnoreNear(worldScale, arcadexr::config::GetFloat("aim.ignoreNear", arcadexr::profiles::GetFloat("aim.ignoreNear", 1.0f)));
         }
         {
             const std::string v = arcadexr::config::GetString("immersive.void", "game");
@@ -2378,7 +2390,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                       C.z + R.z * 0.15f - U.z * 0.35f - N.z * 0.30f}}};
         for (const Origin& org : origins) {
             std::vector<float> errs;
-            int misses = 0, occluded = 0;
+            int misses = 0, occluded = 0, passed = 0;
             for (int gj = 0; gj < 9; ++gj)
                 for (int gi = 0; gi < 12; ++gi) {
                     const float sx = (gi + 0.5f) / 12.0f * W, sy = (gj + 0.5f) / 9.0f * H;
@@ -2397,12 +2409,14 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     const float hd = std::sqrt((hw.x - org.o.x) * (hw.x - org.o.x) + (hw.y - org.o.y) * (hw.y - org.o.y) + (hw.z - org.o.z) * (hw.z - org.o.z));
                     // Something nearer along this very ray: the game is RIGHT to get another pixel (not an error).
                     if (e > 1.5f && hd < 0.97f * len) { ++occluded; continue; }
+                    // beyond it: a target within arm's reach that the ray passed through on purpose (SetAimIgnoreNear)
+                    if (e > 1.5f && hd > 1.03f * len) { ++passed; continue; }
                     errs.push_back(e);
                 }
             std::sort(errs.begin(), errs.end());
             auto q = [&](float f) { return errs.empty() ? -1.0f : errs[std::min(errs.size() - 1, size_t(f * float(errs.size())))]; };
-            Log::Write(Log::Level::Info, Fmt("TCVR_AIMTEST %s: %zu points, erreur px mediane %.2f p90 %.2f max %.2f | masques par plus pres %d, rates %d",
-                                             org.name, errs.size(), q(0.5f), q(0.9f), errs.empty() ? -1.0f : errs.back(), occluded, misses));
+            Log::Write(Log::Level::Info, Fmt("TCVR_AIMTEST %s: %zu points, erreur px mediane %.2f p90 %.2f max %.2f | masques par plus pres %d, a portee de bras traverses %d, rates %d",
+                                             org.name, errs.size(), q(0.5f), q(0.9f), errs.empty() ? -1.0f : errs.back(), occluded, passed, misses));
         }
     }
     unsigned m_aimTestTick = 0;
