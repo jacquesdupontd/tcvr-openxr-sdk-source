@@ -342,7 +342,12 @@ public:
     bool m_emitOnHud = false;   // emit(): this polygon was moved onto the HUD plane (prim row 42)
     std::map<std::string, int> m_census;   // TCVR_GLASSCENSUS: objects nearer than 40 cm this second, by kind and decision
     // The glass, per object (29/09): tcvr_scene_prim.object, one model instance or one immediate polygon of the board
-    struct GlassObjS { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmin = 1e9f, zmax = 0.0f; uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false; };
+    struct GlassObjS { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmin = 1e9f, zmax = 0.0f; uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false, veil = false, drop = false; };
+    bool m_screenEffects = true;   // immersive.screenEffects: the effects glued to the camera are drawn (on the glass)
+    float m_hudScale = 1.0f;       // immersive.hudMinFov: the HUD's lateral enlargement (text layer and 3D HUD alike)
+    uint32_t m_fxDroppedSec = 0, m_veilSec = 0;
+    void SetScreenEffects(bool on) { m_screenEffects = on; }
+    void SetHudScale(float s) { m_hudScale = s > 1.0f ? s : 1.0f; }
     uint32_t m_bandsKept = 0;   // strip-shaped polygons kept this second: part of a bigger object
     std::unordered_map<uint64_t, GlassObjS> m_glassObj;
     std::vector<uint8_t> m_primBand;   // this frame's letterbox strips (isBand), decided once
@@ -364,8 +369,9 @@ public:
     uint32_t BandsDropped() const { return m_bandsDropped; }
     void SetHudDepthM(float m) { m_hudDepthM = m; }
     std::string TakeMoveDiag() {   // the second's totals: effects moved (sum), screen polygons and bands (most in a frame)
-        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u | texte recu (derniere image) : %s",
-                            m_fxSec, m_screenSecMax, m_bandsSecMax, m_bandsKept, m_textRecvDiag.c_str());
+        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u, effets masques %u, voiles %u, HUD x%.2f | texte recu (derniere image) : %s",
+                            m_fxSec, m_screenSecMax, m_bandsSecMax, m_bandsKept, m_fxDroppedSec, m_veilSec, m_hudScale, m_textRecvDiag.c_str());
+        m_fxDroppedSec = m_veilSec = 0;
         m_fxSec = m_screenSecMax = m_bandsSecMax = 0; m_bandsKept = 0;
         if (!m_census.empty()) {
             r += " | TCVR_GLASSCENSUS";
@@ -972,6 +978,12 @@ public:
             const float relief = o.zmin > 0.0f ? (o.zmax - o.zmin) / o.zmin : 99.0f;
             const bool sheet = relief <= 0.05f, effect = o.tr == o.polys;
             o.glass = o.ok && (sheet || effect) && o.zmax * a2w < 0.40f && o.x1 >= 0.0f && o.y1 >= 0.0f && o.x0 <= bw && o.y0 <= bh;
+            // a VEIL -- a flat fade over the whole frame -- is spread over the whole view: on the glass it was the frame's own
+            // square, "l'écran lui-même en carré en transparence" (29/09)
+            o.veil = o.glass && sheet && o.x0 <= 0.03f * bw && o.x1 >= 0.97f * bw && o.y0 <= 0.03f * bh && o.y1 >= 0.97f * bh;
+            // the screen EFFECTS (translucent, glued to the camera: impacts on the cabinet's glass) can be switched off
+            // (immersive.screenEffects=0, Time Crisis II by default: "on peut enlever les impacts, ils sont inutiles")
+            o.drop = o.glass && effect && !o.veil && !m_screenEffects;
             if (o.zmin * a2w < 0.40f && m_census.size() < 48)   // TCVR_GLASSCENSUS: every object nearer than 40 cm, glass or not
                 m_census[Fmt("%s %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %%", o.glass ? "VITRE" : "monde", o.polys, o.imm, o.tr, o.tex,
                              std::floor(o.zmin * a2w * 20.0f) * 5.0f, std::ceil(o.zmax * a2w * 20.0f) * 5.0f, std::round(relief * 20.0f) * 5.0f)]++;
@@ -988,9 +1000,10 @@ public:
                 if (go == m_glassObj.end() || go->second.bands == go->second.polys) { ++m_bandsDropped; continue; }
                 ++m_bandsKept;
             }
-            float k = 1.0f; bool onHud = false;
+            float k = 1.0f, kxy = 1.0f; bool onHud = false;
             if (glassOn && pr.kind == 0 && !pr.direct && pr.vertex_count <= 8) {
                 const auto go = m_glassObj.find(pr.object ? uint64_t(pr.object) : ((1ull << 32) | p));
+                if (go != m_glassObj.end() && go->second.glass && go->second.drop) { ++m_fxDroppedSec; continue; }
                 if (go != m_glassObj.end() && go->second.glass) {
                     // on the HUD plane at the same pixels, at the HUD's true distance, out of the near comfort (s22_scene_vert)
                     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
@@ -1000,6 +1013,9 @@ public:
                         z0 = std::min(z0, v[i].z); z1 = std::max(z1, v[i].z);
                     }
                     k = (m_hudDepthM / a2w) / (0.5f * (z0 + z1)); ++m_screenMoved; onHud = true;
+                    // laterally: the HUD's enlargement (SetHudScale, same factor as the text layer's plane), a veil to the whole view
+                    kxy = k * (go->second.veil ? 8.0f : m_hudScale);
+                    if (go->second.veil) ++m_veilSec;
                     const int cx0 = std::max(0, int(x0 / bw * 32.0f)), cx1 = std::min(31, int(x1 / bw * 32.0f));
                     const int cy0 = std::max(0, int(y0 / bh * 24.0f)), cy1 = std::min(23, int(y1 / bh * 24.0f));
                     for (int cy = cy0; cy <= cy1; ++cy) for (int cx = cx0; cx <= cx1; ++cx) m_hudCover[size_t(cy) * 32 + size_t(cx)] = 1;
@@ -1007,7 +1023,7 @@ public:
             }
             if (k != 1.0f) {
                 m_moveVerts.assign(v, v + pr.vertex_count);
-                for (auto& mv : m_moveVerts) { mv.x *= k; mv.y *= k; mv.z *= k; }
+                for (auto& mv : m_moveVerts) { mv.x *= kxy; mv.y *= kxy; mv.z *= k; }
                 m_emitOnHud = onHud;
                 emit(pr, m_moveVerts.data(), half);
                 m_emitOnHud = false;

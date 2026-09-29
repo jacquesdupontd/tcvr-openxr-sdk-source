@@ -2140,6 +2140,21 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         m_s22.SetDropBands(want && arcadexr::profiles::GetInt("immersive.dropBands", 1) != 0, m_s22AnchorValid ? m_s22AnchorScale : 0.0f);
         m_s22.SetHudDepthM(m_s22LastHudD);   // camera-glued screen content goes to the HUD plane (last frame's distance)
+        m_s22.SetScreenEffects(arcadexr::profiles::GetInt("immersive.screenEffects", 1) != 0);
+        {   // HUD ENLARGEMENT (29/09, Guillaume: Time Crisis II's HUD is "un petit carré au milieu de l'écran"): its camera sees
+            // 45 degrees, so the ISO HUD covers 45 degrees of the headset's view. immersive.hudMinFov=N spreads it to at least
+            // N degrees -- the text layer's plane (Hm below) and the 3D HUD moved onto the glass by the same factor, so the
+            // ammo stays in its container. 0 = the game's own field of view.
+            float s = 1.0f;
+            const float minFov = arcadexr::profiles::GetFloat("immersive.hudMinFov", 0.0f), z = m_s22.Zoom();
+            const int fw = m_s22Frame ? m_s22Frame->width : 0;
+            if (want && minFov > 1.0f && z >= 16.0f && fw > 0) {
+                const float half = std::atan(0.5f * float(fw) / z), wantHalf = 0.5f * minFov * 3.14159265f / 180.0f;
+                if (wantHalf > half && wantHalf < 1.5f) s = std::tan(wantHalf) / std::tan(half);
+            }
+            m_s22HudScale = s;
+            m_s22.SetHudScale(s);
+        }
         // the optical gun's white flash, hidden in immersive for gun games, like the Model 2's (immersive.gunFlash=1 keeps it)
         m_s22.SetHideGunFlash(want && arcadexr::profiles::GetInt("immersive.gunFlash", arcadexr::profiles::IsDriving() ? 1 : 0) == 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
@@ -2243,7 +2258,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (arcadexr::config::GetInt("s22.hudIso", 1) != 0 && zoomS >= 16.0f && bw > 0 && bh > 0 && worldScale > 1e-9f) {
                 const float zh = hudD / worldScale;
                 XrMatrix4x4f Hm{};
-                Hm.m[0] = float(bw) / zoomS * zh; Hm.m[5] = float(bh) / zoomS * zh; Hm.m[10] = 1.0f;
+                Hm.m[0] = float(bw) / zoomS * zh * m_s22HudScale; Hm.m[5] = float(bh) / zoomS * zh * m_s22HudScale; Hm.m[10] = 1.0f;
                 Hm.m[14] = zh; Hm.m[15] = 1.0f;
                 XrMatrix4x4f_Multiply(&hudToWorld, &arcadeToWorld, &Hm);
             }
@@ -2801,6 +2816,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     XrVector3f m_s22EyePosW[2]{};   // near comfort: the eyes' positions (inter-eye distance)
     float m_s22LastHudD = 0.0f;     // the HUD plane's distance (m), for camera-glued screen content
     float m_s22LastFlash = 0.0f;    // the 3D gun's muzzle flash last frame (a rising edge = the player's shot)
+    float m_s22HudScale = 1.0f;     // immersive.hudMinFov: the HUD's enlargement (PrepareSystem22 -> HUD ISO plane)
     float m_s22HudDepth = 0.0f;   // System 22/23 HUD ISO: smoothed depth (m) of the scene looked at
     float m_s22HudNear = 0.0f;    // ... and of the nearest thing in the picture (m): the HUD stays just in front of it
     struct SwDepthTarget { VkImage image = VK_NULL_HANDLE; VkExtent2D ext{0, 0}; VkFormat format = VK_FORMAT_UNDEFINED; VkImage mvImage = VK_NULL_HANDLE; };
