@@ -2140,6 +2140,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         }
         m_s22.SetDropBands(want && arcadexr::profiles::GetInt("immersive.dropBands", 1) != 0, m_s22AnchorValid ? m_s22AnchorScale : 0.0f);
         m_s22.SetHudDepthM(m_s22LastHudD);   // camera-glued screen content goes to the HUD plane (last frame's distance)
+        // the optical gun's white flash, hidden in immersive for gun games, like the Model 2's (immersive.gunFlash=1 keeps it)
+        m_s22.SetHideGunFlash(want && arcadexr::profiles::GetInt("immersive.gunFlash", arcadexr::profiles::IsDriving() ? 1 : 0) == 0);
         if (!m_s22.PrepareFrame(int(m_frameSlot), *m_s22Frame)) return;
         m_s22Prepared = true;
         if (!want) return;   // flat: drawn after the Model 2 flat block (RenderSystem22Flat)
@@ -2234,7 +2236,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     Log::Write(Log::Level::Info, Fmt("TCVR_S22HUD zoom %.1f board %dx%d hudD %.2f m | %s", zoomS, bw, bh, hudD, m_s22.TakeMoveDiag().c_str()));
                 }
             }
-            if (arcadexr::config::GetInt("s22.hudIso", 1) != 0 && zoomS > 1e-3f && bw > 0 && bh > 0 && worldScale > 1e-9f) {
+            // Only with a REAL game camera: a focal length is hundreds of pixels (Time Crisis II 772.5; 28 would already be a 170
+            // degree view); 1.0 is the default before any 3D (29/09: Time Crisis II's boot and loading screens, 2D only, were
+            // blown up ~770 times on the ISO plane -- a uniform grey view, "ni le panneau 2D de loading, ni l'intro"). Without
+            // one, the 2D is on the virtual screen's plane above, like a cabinet screen.
+            if (arcadexr::config::GetInt("s22.hudIso", 1) != 0 && zoomS >= 16.0f && bw > 0 && bh > 0 && worldScale > 1e-9f) {
                 const float zh = hudD / worldScale;
                 XrMatrix4x4f Hm{};
                 Hm.m[0] = float(bw) / zoomS * zh; Hm.m[5] = float(bh) / zoomS * zh; Hm.m[10] = 1.0f;

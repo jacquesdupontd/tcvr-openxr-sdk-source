@@ -346,6 +346,12 @@ public:
     uint32_t m_bandsKept = 0;   // strip-shaped polygons kept this second: part of a bigger object
     std::unordered_map<uint64_t, GlassObjS> m_glassObj;
     std::vector<uint8_t> m_primBand;   // this frame's letterbox strips (isBand), decided once
+    // The optical gun's white flash (System 23 global fade): hidden when sudden, for at most 3 frames (PrepareFrame)
+    bool m_hideGunFlash = false, m_hideFlash = false, m_flashJump = false, m_prevFadeLow = true;
+    uint32_t m_flashRun = 0;
+    std::string m_flashDiag;
+    std::string m_textRecvDiag; uint32_t m_textRecvN = 0;   // TCVR_S22HUD: the text layer received (boot screen check)
+    void SetHideGunFlash(bool on) { m_hideGunFlash = on; }
     std::string m_fireTagS22{"0"};   // TCVR_S22FIRE: injected shot followed
     bool m_diagAimSet = false; float m_diagAim[2] = {0.5f, 0.5f};
     // A REAL shot of the player (29/09): the same 15 frames of TCVR_S22FIRE around his own aim -- what he sees, logged while
@@ -358,8 +364,8 @@ public:
     uint32_t BandsDropped() const { return m_bandsDropped; }
     void SetHudDepthM(float m) { m_hudDepthM = m; }
     std::string TakeMoveDiag() {   // the second's totals: effects moved (sum), screen polygons and bands (most in a frame)
-        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u", m_fxSec, m_screenSecMax,
-                            m_bandsSecMax, m_bandsKept);
+        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u | texte recu (derniere image) : %s",
+                            m_fxSec, m_screenSecMax, m_bandsSecMax, m_bandsKept, m_textRecvDiag.c_str());
         m_fxSec = m_screenSecMax = m_bandsSecMax = 0; m_bandsKept = 0;
         if (!m_census.empty()) {
             r += " | TCVR_GLASSCENSUS";
@@ -566,6 +572,70 @@ public:
     // CPU port of SceneRenderer::PrepareFrame, written into this slot's buffers.
     bool PrepareFrame(int slot, const tcvr_scene_frame& f) {
         if (!m_ready || !m_assetsReady) return false;
+        // A frame that announces polygons without their lists (29/09 12:39: leaving Time Crisis II for another game, 835+
+        // polygons announced and no list -- SIGSEGV reading prims[834]) is skipped, never read.
+        if ((f.prim_count && !f.prims) || (f.vertex_count && !f.vertices)) return false;
+        if (++m_textRecvN % 30 == 0) {   // TCVR_S22HUD: what the text layer holds (29/09: Time Crisis II's boot screen not seen)
+            uint32_t tot = 0, pri4 = 0, visible = 0, anyText = 0;
+            if (f.text && f.pri && f.pens)
+                for (int y = 0; y < f.height; y += 8)
+                    for (int x = 0; x < f.width; x += 8, ++tot) {
+                        const uint16_t tv = f.text[size_t(y) * f.text_stride + size_t(x)];
+                        const uint8_t pv = f.pri[size_t(y) * f.pri_stride + size_t(x)];
+                        if (tv != 0) ++anyText;
+                        if ((pv & 4) == 0) continue;
+                        ++pri4;
+                        const uint32_t c = tv < f.pen_count ? f.pens[tv] : 0u;
+                        if (((c >> 16) & 255u) > 24u || ((c >> 8) & 255u) > 24u || (c & 255u) > 24u) ++visible;
+                    }
+            m_textRecvDiag = Fmt("%u polys, texte %s, pri&4 %u/%u, non noir visible %u, index!=0 %u, fond %06x", f.prim_count, (f.text && f.pri) ? "oui" : "ABSENT",
+                             pri4, tot, visible, anyText, f.bg_color);
+        }
+        {   // The optical gun's WHITE FLASH (29/09, Guillaume: "c'est tout l'écran qui flash comme dans tous ces jeux de
+            // lightgun"). System 23 lights the whole picture with its GLOBAL FADE (c404 screen fade, applied to every polygon:
+            // tcvr_scene_prim fade_*) for a frame or two at each shot, for the cabinet's photodiode; MAME reads the aim
+            // directly, the flash serves nothing, and in the headset it is a white wall at every shot. A SUDDEN white fade
+            // over nearly all the 3D (from a picture with no white fade) is not drawn, for at most 3 frames; a real fade to
+            // white rises gradually and is kept. Same setting as the Model 2's: immersive.gunFlash=1 brings it back.
+            uint32_t n = 0, white = 0; uint32_t maxWhite = 0;
+            for (uint32_t i = 0; i < f.prim_count; ++i) {
+                const tcvr_scene_prim& p = f.prims[i];
+                if (p.kind != 0 || p.vertex_count < 3) continue;
+                ++n;
+                if (p.fade_enabled && p.fade_r >= 192.0f && p.fade_g >= 192.0f && p.fade_b >= 192.0f) {
+                    maxWhite = std::max<uint32_t>(maxWhite, uint32_t(std::max(0, p.fadefactor)));
+                    if (p.fadefactor >= 0xC0) ++white;
+                }
+            }
+            const bool whiteNow = n > 0 && white * 10 >= n * 8;
+            if (whiteNow) { if (m_flashRun == 0) m_flashJump = m_prevFadeLow; ++m_flashRun; } else m_flashRun = 0;
+            m_hideFlash = m_hideGunFlash && whiteNow && m_flashJump && m_flashRun <= 3;
+            m_prevFadeLow = !whiteNow && maxWhite < 0x40;
+            // TCVR_S22FIRE: during the 15 frames after a shot, every channel a flash could use (measured 29/09: Time Crisis
+            // II's is the global fade, 3D 100 % white at 255 for ONE frame, on the player's real shots only -- an injected
+            // debug.tcvr.fire shot does not trigger it)
+            m_flashDiag.clear();
+            if (m_fireNearFrames > 0) {
+                uint32_t pfade = 0, pfadeWhite = 0, pensWhite = 0, textWhite = 0, textTot = 0;
+                for (uint32_t i = 0; i < f.prim_count; ++i) {
+                    const tcvr_scene_prim& p = f.prims[i];
+                    if (p.kind != 0 || p.vertex_count < 3 || !p.pfade_enabled) continue;
+                    ++pfade; if (p.poly_r >= 192.0f && p.poly_g >= 192.0f && p.poly_b >= 192.0f) ++pfadeWhite;
+                }
+                if (f.pens) for (uint32_t i = 0; i < f.pen_count; ++i) { const uint32_t c = f.pens[i]; if (((c >> 16) & 255u) > 230u && ((c >> 8) & 255u) > 230u && (c & 255u) > 230u) ++pensWhite; }
+                if (f.text && f.pens)
+                    for (int y = 0; y < f.height; y += 8)
+                        for (int x = 0; x < f.width; x += 8, ++textTot) {
+                            const uint16_t tv = f.text[size_t(y) * f.text_stride + size_t(x)];
+                            const uint32_t c = tv < f.pen_count ? f.pens[tv] : 0u;
+                            if (((c >> 16) & 255u) > 200u && ((c >> 8) & 255u) > 200u && (c & 255u) > 200u) ++textWhite;
+                        }
+                m_flashDiag = Fmt("fondu blanc 3D %u/%u (max %u)%s | pfade blanc %u/%u | palette blanche %u/%u | fond %06x | gamma 255:%u,%u,%u | texte blanc toutes prio %u/%u | spot %u/%u",
+                    white, n, maxWhite, m_hideFlash ? " CACHE" : "", pfadeWhite, pfade, pensWhite, f.pen_count, f.bg_color,
+                    f.gamma_r ? f.gamma_r[255] : 999u, f.gamma_g ? f.gamma_g[255] : 999u, f.gamma_b ? f.gamma_b[255] : 999u,
+                    textWhite, textTot, f.mix_spot_enabled, f.mix_spot_factor);
+            }
+        }
         m_slot = slot & 1;
         Slot& S = m_slots[m_slot];
         const auto tBuild = std::chrono::steady_clock::now();
@@ -620,8 +690,8 @@ public:
                             const uint32_t c = tv < f.pen_count ? f.pens[tv] : 0u;
                             if (((c >> 16) & 255u) > 200u && ((c >> 8) & 255u) > 200u && (c & 255u) > 200u) ++white;
                         }
-                Log::Write(Log::Level::Info, Fmt("TCVR_S22FIRE f%d flash? texte blanc %d/%d fade %u/%u (%.0f,%.0f,%.0f) | 3D<1m:%s | 2D autour de la visee %.0f,%.0f:%s",
-                    15 - m_fireNearFrames, white, tot, f.mix_fade_enabled, f.mix_fade_factor, f.mix_fade_r, f.mix_fade_g, f.mix_fade_b,
+                Log::Write(Log::Level::Info, Fmt("TCVR_S22FIRE f%d flash? %s | texte blanc %d/%d fade %u/%u (%.0f,%.0f,%.0f) | 3D<1m:%s | 2D autour de la visee %.0f,%.0f:%s",
+                    15 - m_fireNearFrames, m_flashDiag.c_str(), white, tot, f.mix_fade_enabled, f.mix_fade_factor, f.mix_fade_r, f.mix_fade_g, f.mix_fade_b,
                     line.c_str(), apx, apy, l2.c_str()));
             }
         }
@@ -782,7 +852,8 @@ public:
                 float(pr.pens_offset), float(pr.bn), float(pr.penmask), float(pr.penshift),
                 float(pr.texture_enabled), float(pr.shade_enabled), float(pr.prioverchar), float(pr.fog_mode),
                 float(pr.fogfactor), float(pr.cz_sdelta), float(pr.cz_bank), float(pr.alpha_pen),
-                pr.fog_r, pr.fog_g, pr.fog_b, float(pr.fade_enabled),
+                pr.fog_r, pr.fog_g, pr.fog_b,
+                float(pr.fade_enabled && !(m_hideFlash && pr.fadefactor >= 0xC0 && pr.fade_r >= 192.0f && pr.fade_g >= 192.0f && pr.fade_b >= 192.0f)),
                 pr.fade_r, pr.fade_g, pr.fade_b, float(pr.fadefactor),
                 float(pr.pfade_enabled), pr.poly_r, pr.poly_g, pr.poly_b,
                 float(pr.alpha_enabled), float(pr.alpha), float(pr.sprite_code), float(pr.flipx),
