@@ -2165,6 +2165,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_s22.SetDropBands(want && arcadexr::profiles::GetInt("immersive.dropBands", 1) != 0, m_s22AnchorValid ? m_s22AnchorScale : 0.0f);
         m_s22.SetHudDepthM(m_s22LastHudD);   // camera-glued screen content goes to the HUD plane (last frame's distance)
         m_s22.SetScreenEffects(arcadexr::profiles::GetInt("immersive.screenEffects", 1) != 0);
+        m_s22.SetCinemaFrame(arcadexr::profiles::GetInt("immersive.cinemaFrame", 1) != 0);
         {   // HUD ENLARGEMENT (29/09, Guillaume: Time Crisis II's HUD is "un petit carré au milieu de l'écran"): its camera sees
             // 45 degrees, so the ISO HUD covers 45 degrees of the headset's view. immersive.hudMinFov=N spreads it to at least
             // N degrees -- the text layer's plane (Hm below) and the 3D HUD moved onto the glass by the same factor, so the
@@ -2253,6 +2254,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 if (m_s22HudNear > 0.0f) hudD = std::min(hudD, nearF(0.9f * m_s22HudNear));
                 hudD = std::max(arcadexr::config::GetFloat("hud.nearMin", nearOn ? 0.45f : 1.2f), hudD);
             }
+            // CINEMA FRAME (29/09): while the game shows its letterbox, the subtitles sit on the frame at ONE distance --
+            // following what was under them, their plane jumped from 0.45 m to 40 m at every cut ("les textes font loucher")
+            if (m_s22.CinemaActive()) hudD = arcadexr::profiles::GetFloat("immersive.cinemaDepth", 2.0f);
         }
         if (viewIndex == 0) m_s22LastHudD = hudD;
         const float hk = hudD / distance;

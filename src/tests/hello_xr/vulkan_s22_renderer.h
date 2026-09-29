@@ -350,10 +350,16 @@ public:
     bool m_emitOnHud = false;   // emit(): this polygon was moved onto the HUD plane (prim row 42)
     std::map<std::string, int> m_census;   // TCVR_GLASSCENSUS: objects nearer than 40 cm this second, by kind and decision
     // The glass, per object (29/09): tcvr_scene_prim.object, one model instance or one immediate polygon of the board
-    struct GlassObjS { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmin = 1e9f, zmax = 0.0f; uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false, veil = false, drop = false; };
+    struct GlassObjS { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmin = 1e9f, zmax = 0.0f, ex0 = 1e9f, ex1 = -1e9f, ey0 = 1e9f, ey1 = -1e9f;
+                       uint32_t polys = 0, tr = 0, tex = 0, imm = 0, bands = 0; bool ok = true, glass = false, veil = false, drop = false; };
     bool m_screenEffects = true;   // immersive.screenEffects: the effects glued to the camera are drawn (on the glass)
     float m_hudScale = 1.0f;       // immersive.hudMinFov: the HUD's lateral enlargement (text layer and 3D HUD alike)
     uint32_t m_fxDroppedSec = 0, m_veilSec = 0;
+    bool m_cinemaFrame = true;        // immersive.cinemaFrame: letterbox bands kept as a frame on the glass
+    uint32_t m_cinemaBands = 0;       // band polygons drawn as the cinema frame this frame
+    uint32_t m_cinemaSec = 0;
+    void SetCinemaFrame(bool on) { m_cinemaFrame = on; }
+    bool CinemaActive() const { return m_cinemaBands > 0; }
     void SetScreenEffects(bool on) { m_screenEffects = on; }
     void SetHudScale(float s) { m_hudScale = s > 1.0f ? s : 1.0f; }
     uint32_t m_bandsKept = 0;   // strip-shaped polygons kept this second: part of a bigger object
@@ -377,9 +383,9 @@ public:
     uint32_t BandsDropped() const { return m_bandsDropped; }
     void SetHudDepthM(float m) { m_hudDepthM = m; }
     std::string TakeMoveDiag() {   // the second's totals: effects moved (sum), screen polygons and bands (most in a frame)
-        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u, effets masques %u, voiles %u, HUD x%.2f | texte recu (derniere image) : %s",
-                            m_fxSec, m_screenSecMax, m_bandsSecMax, m_bandsKept, m_fxDroppedSec, m_veilSec, m_hudScale, m_textRecvDiag.c_str());
-        m_fxDroppedSec = m_veilSec = 0;
+        std::string r = Fmt("second: effects->target %u, screen->HUD max %u, bands max %u, strip-shaped kept (part of a model) %u, effets masques %u, voiles %u, HUD x%.2f, cadre cinema %u | texte recu (derniere image) : %s",
+                            m_fxSec, m_screenSecMax, m_bandsSecMax, m_bandsKept, m_fxDroppedSec, m_veilSec, m_hudScale, m_cinemaSec, m_textRecvDiag.c_str());
+        m_fxDroppedSec = m_veilSec = m_cinemaSec = 0;
         m_fxSec = m_screenSecMax = m_bandsSecMax = 0; m_bandsKept = 0;
         if (!m_census.empty()) {
             r += " | TCVR_GLASSCENSUS";
@@ -904,6 +910,7 @@ public:
         // What the game glues to its camera goes on the glass, decided per OBJECT (below, "THE GLASS"); letterbox strips of
         // any depth are dropped (isBand); everything else is the world, with the near comfort.
         m_bandsDropped = 0; m_bandNear = 0; m_bandSceneZ = sceneZ; m_screenMoved = 0; m_fxMoved = 0;   // this frame
+        m_cinemaSec = std::max(m_cinemaSec, m_cinemaBands); m_cinemaBands = 0;
         // What the glass covers (32 x 24 cells of the board): visible non-black text, 2D polygons and sprites, and (in the loop)
         // the glued polygons -- the HUD plane goes just in front of the WORLD under them (HudNearUnits), not of whatever is
         // nearest anywhere (29/09: the partner at the edge, 90 cm away, pulled Time Crisis II's HUD "trop proche").
@@ -976,6 +983,10 @@ public:
                 const float sx = float(pr.cx) + v[i].x / v[i].z, sy = float(pr.cy) - v[i].y / v[i].z;
                 o.x0 = std::min(o.x0, sx); o.x1 = std::max(o.x1, sx); o.y0 = std::min(o.y0, sy); o.y1 = std::max(o.y1, sy);
                 o.zmin = std::min(o.zmin, v[i].z); o.zmax = std::max(o.zmax, v[i].z);
+                if (pr.zoom > 1e-3f) {   // eye space without the camera zoom: the object's REAL extent
+                    const float ex = v[i].x / pr.zoom, ey = v[i].y / pr.zoom;
+                    o.ex0 = std::min(o.ex0, ex); o.ex1 = std::max(o.ex1, ex); o.ey0 = std::min(o.ey0, ey); o.ey1 = std::max(o.ey1, ey);
+                }
             }
         }
         for (auto& kv : m_glassObj) {
@@ -986,12 +997,17 @@ public:
             const float relief = o.zmin > 0.0f ? (o.zmax - o.zmin) / o.zmin : 99.0f;
             const bool sheet = relief <= 0.05f, effect = o.tr == o.polys;
             const bool inPic = o.x1 >= 0.0f && o.y1 >= 0.0f && o.x0 <= bw && o.y0 <= bh, near = o.zmax * a2w < 0.40f;
+            const float realM = (o.ex1 >= o.ex0) ? std::max({o.ex1 - o.ex0, o.ey1 - o.ey0, o.zmax - o.zmin}) * a2w : 99.0f;
             // DEBRIS (29/09, Guillaume: "ce sont les cartouches qui s'éjectent, devant les yeux, et elles bougent à l'inverse
-            // de la tête"): a SMALL 3D object wholly within 40 cm -- at most a quarter of the frame each way -- is something the
-            // game throws at its screen (ejected cartridges: 10-polygon objects at 10-25 cm). Left in 3D it hung a few cm from
-            // the eyes and swung against every head move. A face or a hand in a close-up covers far more than a quarter.
-            const bool debris = o.ok && near && inPic && (o.x1 - o.x0) <= 0.25f * bw && (o.y1 - o.y0) <= 0.25f * bh;
-            o.glass = o.ok && (sheet || effect || debris) && near && inPic;
+            // de la tête"): a SMALL object -- at most 8 cm for real -- wholly within 40 cm is something the game throws at
+            // its screen (ejected cartridges: 6- to 10-polygon objects at 0-25 cm). Left in 3D it hung a few cm from the eyes
+            // and swung against every head move. Its size is measured in 3D: projected, an object 5 cm away spans thousands
+            // of pixels. A hand or a face in a close-up is 10-20 cm.
+            const bool debris = o.ok && near && realM <= 0.08f;
+            // The cabinet's frame is NOT the headset's view: effects and debris outside the frame are still in front of the
+            // eyes (7 of 19 impacts and every cartridge were "outside the picture", 29/09). Only a flat SHEET must show in
+            // the frame -- a flat piece of floor just under the camera, outside it, is the floor.
+            o.glass = o.ok && near && ((sheet && inPic) || effect || debris);
             // a VEIL -- a flat fade over the whole frame -- is spread over the whole view: on the glass it was the frame's own
             // square, "l'écran lui-même en carré en transparence" (29/09)
             o.veil = o.glass && sheet && o.x0 <= 0.03f * bw && o.x1 >= 0.97f * bw && o.y0 <= 0.03f * bh && o.y1 >= 0.97f * bh;
@@ -1000,10 +1016,10 @@ public:
             o.drop = o.glass && (effect || (debris && !sheet)) && !o.veil && !m_screenEffects;
             if (o.zmin * a2w < 0.40f && m_census.size() < 48) {   // TCVR_GLASSCENSUS: every object nearer than 40 cm, and why it is where it is
                 const char* pourquoi = o.glass ? (o.drop ? "masque" : o.veil ? "voile" : sheet ? "feuille" : effect ? "effet" : "debris")
-                                     : !o.ok ? "sommet-derriere-camera" : !inPic ? "hors-image" : !near ? "pas-entier-40cm" : "volume";
-                m_census[Fmt("%s(%s) %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %% taille %.0fx%.0f px", o.glass ? "VITRE" : "monde", pourquoi,
+                                     : !o.ok ? "sommet-derriere-camera" : !near ? "pas-entier-40cm" : (sheet && !inPic) ? "feuille-hors-image" : "volume";
+                m_census[Fmt("%s(%s) %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %% taille %.0f cm", o.glass ? "VITRE" : "monde", pourquoi,
                              o.polys, o.imm, o.tr, o.tex, std::floor(o.zmin * a2w * 20.0f) * 5.0f, std::ceil(o.zmax * a2w * 20.0f) * 5.0f,
-                             std::round(relief * 20.0f) * 5.0f, std::min(9999.0f, o.x1 - o.x0), std::min(9999.0f, o.y1 - o.y0))]++;
+                             std::round(relief * 20.0f) * 5.0f, std::min(999.0f, realM * 100.0f))]++;
             }
         }
         for (uint32_t p = 0; p < f.prim_count; ++p) {
@@ -1013,12 +1029,43 @@ public:
             const bool half = m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0;
             // a letterbox strip is dropped only when its whole object is strips (the game's own bars); a strip-shaped piece
             // of a real model (a hull panel facing the camera along the edge) is the model's, it stays (same rule as the glass)
+            float k = 1.0f, kxy = 1.0f; bool onHud = false;
             if (m_primBand[p]) {
                 const auto go = m_glassObj.find(pr.object ? uint64_t(pr.object) : ((1ull << 32) | p));
-                if (go == m_glassObj.end() || go->second.bands == go->second.polys) { ++m_bandsDropped; continue; }
+                if (go == m_glassObj.end() || go->second.bands == go->second.polys) {
+                    // THE CINEMA FRAME (29/09, Guillaume: "tente le cadre cinématique"). Dropped, the letterbox bands let
+                    // us see what the cabinet hides under them -- a part of the scene the game never finished (the boss
+                    // "qui vole", his legs and no floor) -- and the subtitles then lay over the 3D, their plane jumping
+                    // from 0.45 m to 40 m at every cut. Kept, but ON THE GLASS (the HUD's distance, not 3 cm from the
+                    // eyes) and spread over the whole view: the band keeps its inner edge, its outer edge goes to the
+                    // view's border. immersive.cinemaFrame=0 drops them as before.
+                    if (!m_cinemaFrame || !glassOn) { ++m_bandsDropped; continue; }
+                    float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                    for (uint32_t i = 0; i < pr.vertex_count; ++i) {
+                        const float zz = std::max(v[i].z, 1e-6f);
+                        const float sx = float(pr.cx) + v[i].x / zz, sy = float(pr.cy) - v[i].y / zz;
+                        bx0 = std::min(bx0, sx); bx1 = std::max(bx1, sx); by0 = std::min(by0, sy); by1 = std::max(by1, sy);
+                        z0 = std::min(z0, v[i].z); z1 = std::max(z1, v[i].z);
+                    }
+                    const bool top = by0 <= 0.05f * bh, bottom = by1 >= 0.95f * bh, left = bx0 <= 0.05f * bw, right = bx1 >= 0.95f * bw;
+                    const bool horiz = (bx1 - bx0) >= 0.9f * bw;   // a top or bottom band (else a side one)
+                    const float kk = (m_hudDepthM / a2w) / std::max(1e-6f, 0.5f * (z0 + z1));
+                    m_moveVerts.assign(v, v + pr.vertex_count);
+                    for (auto& mv : m_moveVerts) {
+                        const float sy = float(pr.cy) - mv.y / std::max(mv.z, 1e-6f), sx = float(pr.cx) + mv.x / std::max(mv.z, 1e-6f);
+                        const bool outer = horiz ? ((top && sy <= by0 + 0.5f * (by1 - by0)) || (bottom && sy >= by0 + 0.5f * (by1 - by0)))
+                                                 : ((left && sx <= bx0 + 0.5f * (bx1 - bx0)) || (right && sx >= bx0 + 0.5f * (bx1 - bx0)));
+                        const float ax = horiz ? 8.0f : (outer ? 8.0f : 1.0f), ay = horiz ? (outer ? 8.0f : 1.0f) : 8.0f;
+                        mv.x *= kk * ax; mv.y *= kk * ay; mv.z *= kk;
+                    }
+                    m_emitOnHud = true;
+                    emit(pr, m_moveVerts.data(), m_altFix && p < m_altHalfPrim.size() && m_altHalfPrim[p] != 0);
+                    m_emitOnHud = false;
+                    ++m_cinemaBands;
+                    continue;
+                }
                 ++m_bandsKept;
             }
-            float k = 1.0f, kxy = 1.0f; bool onHud = false;
             if (glassOn && pr.kind == 0 && !pr.direct && pr.vertex_count <= 8) {
                 const auto go = m_glassObj.find(pr.object ? uint64_t(pr.object) : ((1ull << 32) | p));
                 if (go != m_glassObj.end() && go->second.glass && go->second.drop) { ++m_fxDroppedSec; continue; }
