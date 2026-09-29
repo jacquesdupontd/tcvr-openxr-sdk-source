@@ -985,16 +985,26 @@ public:
             // the intro, opaque) is neither. Same rule as the Model 2's (vulkan_m2_renderer.h, "THE GLASS").
             const float relief = o.zmin > 0.0f ? (o.zmax - o.zmin) / o.zmin : 99.0f;
             const bool sheet = relief <= 0.05f, effect = o.tr == o.polys;
-            o.glass = o.ok && (sheet || effect) && o.zmax * a2w < 0.40f && o.x1 >= 0.0f && o.y1 >= 0.0f && o.x0 <= bw && o.y0 <= bh;
+            const bool inPic = o.x1 >= 0.0f && o.y1 >= 0.0f && o.x0 <= bw && o.y0 <= bh, near = o.zmax * a2w < 0.40f;
+            // DEBRIS (29/09, Guillaume: "ce sont les cartouches qui s'éjectent, devant les yeux, et elles bougent à l'inverse
+            // de la tête"): a SMALL 3D object wholly within 40 cm -- at most a quarter of the frame each way -- is something the
+            // game throws at its screen (ejected cartridges: 10-polygon objects at 10-25 cm). Left in 3D it hung a few cm from
+            // the eyes and swung against every head move. A face or a hand in a close-up covers far more than a quarter.
+            const bool debris = o.ok && near && inPic && (o.x1 - o.x0) <= 0.25f * bw && (o.y1 - o.y0) <= 0.25f * bh;
+            o.glass = o.ok && (sheet || effect || debris) && near && inPic;
             // a VEIL -- a flat fade over the whole frame -- is spread over the whole view: on the glass it was the frame's own
             // square, "l'écran lui-même en carré en transparence" (29/09)
             o.veil = o.glass && sheet && o.x0 <= 0.03f * bw && o.x1 >= 0.97f * bw && o.y0 <= 0.03f * bh && o.y1 >= 0.97f * bh;
             // the screen EFFECTS (translucent, glued to the camera: impacts on the cabinet's glass) can be switched off
             // (immersive.screenEffects=0, Time Crisis II by default: "on peut enlever les impacts, ils sont inutiles")
-            o.drop = o.glass && effect && !o.veil && !m_screenEffects;
-            if (o.zmin * a2w < 0.40f && m_census.size() < 48)   // TCVR_GLASSCENSUS: every object nearer than 40 cm, glass or not
-                m_census[Fmt("%s %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %%", o.glass ? "VITRE" : "monde", o.polys, o.imm, o.tr, o.tex,
-                             std::floor(o.zmin * a2w * 20.0f) * 5.0f, std::ceil(o.zmax * a2w * 20.0f) * 5.0f, std::round(relief * 20.0f) * 5.0f)]++;
+            o.drop = o.glass && (effect || (debris && !sheet)) && !o.veil && !m_screenEffects;
+            if (o.zmin * a2w < 0.40f && m_census.size() < 48) {   // TCVR_GLASSCENSUS: every object nearer than 40 cm, and why it is where it is
+                const char* pourquoi = o.glass ? (o.drop ? "masque" : o.veil ? "voile" : sheet ? "feuille" : effect ? "effet" : "debris")
+                                     : !o.ok ? "sommet-derriere-camera" : !inPic ? "hors-image" : !near ? "pas-entier-40cm" : "volume";
+                m_census[Fmt("%s(%s) %u poly imm %u tr %u tex %u %.0f-%.0f cm relief %.0f %% taille %.0fx%.0f px", o.glass ? "VITRE" : "monde", pourquoi,
+                             o.polys, o.imm, o.tr, o.tex, std::floor(o.zmin * a2w * 20.0f) * 5.0f, std::ceil(o.zmax * a2w * 20.0f) * 5.0f,
+                             std::round(relief * 20.0f) * 5.0f, std::min(9999.0f, o.x1 - o.x0), std::min(9999.0f, o.y1 - o.y0))]++;
+            }
         }
         for (uint32_t p = 0; p < f.prim_count; ++p) {
             const tcvr_scene_prim& pr = f.prims[p];
