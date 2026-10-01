@@ -336,18 +336,42 @@ public:
                     mainCx = keys[k].cx; mainCy = keys[k].cy;
                 }
             }
-            // A large view that holds most of the frame's polygons is the world, wherever its projection centre sits
-            // (01/10, Daytona USA: the attract race camera is centred 50 px below the screen centre, 2 px past the
-            // tolerance above -- the whole demo went to the flat secondary path, 13-28 ms of GPU at half resolution,
-            // and the scene recording mode flipped every few frames). Centring stays the rule for every other view:
-            // it is what keeps a 3D HUD element (a needle, a position digit, its own centre) flat.
+            // A large view that holds most of the frame's polygons AND reaches into the distance is the world, wherever
+            // its projection centre sits (01/10, Daytona USA: the attract race camera is centred 50 px below the screen
+            // centre, 2 px past the tolerance above -- the whole demo went to the flat secondary path, 13-28 ms of GPU at
+            // half resolution, and the scene recording mode flipped every few frames). Centring stays the rule for every
+            // other view: it keeps a 3D HUD element (a needle, a position digit, its own centre) flat, and Sega Rally's
+            // car select, four full-screen previews that differ only by their centre (15/09). The depth test is what
+            // tells a world from an object shown to the camera: the same far-geometry test as the horizon below
+            // (deepest vertex beyond 3x the median depth, and enough vertices out there) -- a car preview has none.
             // debug.tcvr.m2_mainDominant=0 restores the centred-only rule.
+            auto reachesFar = [&](const Key& key) {
+                if (!frame.raw_prim_count) return false;
+                std::vector<float> zs;
+                for (std::uint32_t i = 0; i < kn; i++) {
+                    const tcvr_m2_prim& p = kp[i];
+                    if (p.clip_l != key.l || p.clip_t != key.t || p.clip_r != key.r || p.clip_b != key.b ||
+                        p.center_x != key.cx || p.center_y != key.cy) continue;
+                    for (std::uint32_t v = 0; v < p.vertex_count; v++) {
+                        const std::uint32_t index = p.first_vertex + v;
+                        if (index < frame.raw_vertex_count && frame.raw_vertices[index].z > 0.0f) zs.push_back(frame.raw_vertices[index].z);
+                    }
+                }
+                if (zs.size() < 32) return false;
+                std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+                const float zmed = zs[zs.size() / 2], zmax = *std::max_element(zs.begin(), zs.end());
+                if (zmax <= 3.0f * zmed) return false;
+                const float farZ = 0.4f * zmax;
+                const size_t far = size_t(std::count_if(zs.begin(), zs.end(), [farZ](float z) { return z >= farZ; }));
+                return far >= ((kp[0].rgb & 0x1000000u) != 0u ? 8u : 32u);
+            };
             if (arcadexr::config::GetInt("m2.mainDominant", 1) != 0) {
                 for (unsigned k = 0; k < n; ++k) {
                     const std::int64_t area = std::int64_t(keys[k].r - keys[k].l + 1) * std::int64_t(keys[k].b - keys[k].t + 1);
                     if (area < halfScreen || keys[k].prims < 64u || std::uint64_t(keys[k].prims) * 2u < std::uint64_t(kn)) continue;
                     if (keys[k].cx == mainCx && keys[k].cy == mainCy && keys[k].l == mainL && keys[k].t == mainT &&
                         keys[k].r == mainR && keys[k].b == mainB) break;   // already the main view
+                    if (!reachesFar(keys[k])) { ++m_mainRefusedFlat; break; }   // an object shown to the camera: stays flat
                     bestArea = area; bestPrims = keys[k].prims;
                     mainL = keys[k].l; mainT = keys[k].t; mainR = keys[k].r; mainB = keys[k].b;
                     mainCx = keys[k].cx; mainCy = keys[k].cy;
@@ -357,12 +381,13 @@ public:
                     break;
                 }
             }
-            if (++m_mainPromotedTick >= 300u) {   // every ~5 s of arcade frames, only when the rule changed something
-                if (m_mainPromoted > 0)
+            if (++m_mainPromotedTick >= 300u) {   // every ~5 s of arcade frames, only when the rule looked at something
+                if (m_mainPromoted > 0 || m_mainRefusedFlat > 0)
                     Log::Write(Log::Level::Info, Fmt("TCVR_MAINVIEW %u/%u frames: an off-centre view holding most polygons made the main view "
-                                                     "(last: centre screen=%d,%d prims=%d of %d)", m_mainPromoted, m_mainPromotedTick,
-                                                     m_mainPromotedAt[0], m_mainPromotedAt[1], m_mainPromotedAt[2], m_mainPromotedAt[3]));
-                m_mainPromoted = 0; m_mainPromotedTick = 0;
+                                                     "(last: centre screen=%d,%d prims=%d of %d); %u frames left flat (no far geometry: an object, not a world)",
+                                                     m_mainPromoted, m_mainPromotedTick, m_mainPromotedAt[0], m_mainPromotedAt[1],
+                                                     m_mainPromotedAt[2], m_mainPromotedAt[3], m_mainRefusedFlat));
+                m_mainPromoted = 0; m_mainRefusedFlat = 0; m_mainPromotedTick = 0;
             }
         }
         m_haveMainView = bestArea > 0;
@@ -5373,7 +5398,7 @@ private:
     int32_t m_mainClip[4] = {-1, -1, -1, -1};
     int32_t m_mainCenter[2] = {-100000, -100000};
     bool m_haveMainView = false;
-    unsigned m_mainPromoted = 0, m_mainPromotedTick = 0; int m_mainPromotedAt[4] = {};   // TCVR_MAINVIEW
+    unsigned m_mainPromoted = 0, m_mainRefusedFlat = 0, m_mainPromotedTick = 0; int m_mainPromotedAt[4] = {};   // TCVR_MAINVIEW
     float m_horizonGeo = -1.0f;
     bool m_haveHorizon = false;
     float m_mainZMax = 0.0f;   // deepest main-view vertex (menu or scene?)
