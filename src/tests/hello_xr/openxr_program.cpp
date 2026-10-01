@@ -1501,6 +1501,28 @@ struct OpenXrProgram : IOpenXrProgram {
                 const int mt = arcadexr::config::GetInt("menu.toggle", 0);
                 if (mt != s_lastMenuToggle) { s_lastMenuToggle = mt; if (mt != 0) menu.Toggle(); }
             }
+            {   // bench (01/10): debug.tcvr.menu_cmd=<tag>:<cmd>, once per new value -- the PLAYER's menu path driven
+                // without a controller (CHANGER DE JEU stops the game and shows the selector: a path the bench switch,
+                // which starts the next game at once, never took; Guillaume's switch from Daytona crashed the headset's
+                // compositor on it). cmd: toggle | close | up | down | left | right | ok | row=<n> | game=<driver>
+                static std::string s_lastMenuCmd;
+                const std::string mc = arcadexr::config::GetString("menu.cmd", "");
+                if (!mc.empty() && mc != s_lastMenuCmd) {
+                    s_lastMenuCmd = mc;
+                    const size_t colon = mc.find(':');
+                    const std::string c = colon == std::string::npos ? mc : mc.substr(colon + 1);
+                    if (c == "toggle") menu.Toggle();
+                    else if (c == "close") menu.Close();
+                    else if (c == "up") menu.MoveRow(-1);
+                    else if (c == "down") menu.MoveRow(1);
+                    else if (c == "left") menu.CycleValue(-1);
+                    else if (c == "right") menu.CycleValue(1);
+                    else if (c == "ok") menu.Activate();
+                    else if (c.rfind("row=", 0) == 0) menu.SetRow(std::atoi(c.c_str() + 4));
+                    else if (c.rfind("game=", 0) == 0) menu.SelectGame(c.substr(5));
+                    Log::Write(Log::Level::Info, Fmt("TCVR_MENU bench command %s (menu %s)", c.c_str(), menu.IsOpen() ? "open" : "closed"));
+                } else if (mc.empty()) s_lastMenuCmd.clear();
+            }
             if (menu.IsOpen()) {
                 XrActionStateGetInfo navInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.menuNavAction, XR_NULL_PATH};
                 XrActionStateVector2f nav{XR_TYPE_ACTION_STATE_VECTOR2F};
@@ -2267,8 +2289,29 @@ struct OpenXrProgram : IOpenXrProgram {
             // vrruntimeservice: spacewarp extrapolates from the previous frame, and there was none), and the runtime
             // stayed broken until a reboot. Sega Rally never hit it: its 3D comes seconds into the session. Chained only
             // once the session is focused and 30 plain frames were submitted.
-            if (i == 0) m_swFramesFocused = (m_sessionState == XR_SESSION_STATE_FOCUSED) ? m_swFramesFocused + 1 : 0;
-            if (swThisView && m_graphicsPlugin->ViewWroteSwDepth() && m_swFramesFocused > 30) {
+            // And never on the first frames after the space-warp images stopped being written (01/10): switching from
+            // Time Crisis II (System 23: the Model 2 pass, which writes them, does not run) to Daytona chained the info
+            // on the Model 2 pass's very first write, the session long focused -- the same compositor crash (fault addr
+            // 0x40, OVR::TimeWarp), reproduced; Guillaume's switch from Daytona through the menu crashed it too (0x18).
+            // 30 consecutive frames with the images written before chaining, counted again after every interruption
+            // (a game switch, the selector, a 2D screen). TCVR_APPSW logs each start and stop.
+            // And never while the app's menu is open: CHANGER DE JEU stops the game from inside the menu, and the game
+            // stopping under an active space warp crashed the compositor 23 ms later (fault addr 0x18, reproduced with
+            // the bench's menu commands; the same address as Guillaume's crash). Switching games outside the menu, the
+            // space warp only stopped and nothing crashed. The menu is a 2D panel: nothing to extrapolate there (its
+            // motion vectors were already cut).
+            if (i == 0) {
+                m_swFramesFocused = (m_sessionState == XR_SESSION_STATE_FOCUSED) ? m_swFramesFocused + 1 : 0;
+                const bool ready = swThisView && m_graphicsPlugin->ViewWroteSwDepth() && !arcadexr::ui::Menu::Get().IsOpen();
+                if (!ready && m_swReady > 30)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_APPSW space warp off: images not written this frame (after %llu frames on)",
+                                                     (unsigned long long)(m_swReady - 30)));
+                m_swReady = ready ? m_swReady + 1 : 0;
+                if (m_swReady == 31)
+                    Log::Write(Log::Level::Info, "TCVR_APPSW space warp on: 30 consecutive frames with its images written");
+            }
+            if (swThisView && m_graphicsPlugin->ViewWroteSwDepth() && m_swFramesFocused > 30 && m_swReady > 30 &&
+                !arcadexr::ui::Menu::Get().IsOpen()) {
                 const Swapchain mvSwapchain = m_motionVectorSwapchains[i];
 
                 XrCompositionLayerSpaceWarpInfoFB& sw = m_spaceWarpInfos[i];
@@ -2407,6 +2450,7 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_appswActive{false};
     std::vector<XrCompositionLayerSpaceWarpInfoFB> m_spaceWarpInfos;
     uint64_t m_swFramesFocused = 0;   // frames submitted since the session became focused (space warp waits for 30)
+    uint64_t m_swReady = 0;           // consecutive frames with the space-warp images written (space warp waits for 30)
     std::vector<XrView> m_views;
     int64_t m_colorSwapchainFormat{-1};
     int64_t m_depthSwapchainFormat{-1};
