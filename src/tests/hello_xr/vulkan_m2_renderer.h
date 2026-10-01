@@ -274,7 +274,21 @@ public:
         if (!m_initialized || frame.geometry_unchanged != 0u) return;
         const bool haveClipped = frame.prim_count != 0 && frame.vertex_count != 0;
         const bool haveRaw = frame.raw_prim_count != 0 && frame.raw_vertex_count != 0;
-        if (!haveClipped && !haveRaw) return;
+        if (!haveClipped && !haveRaw) {
+            // An EXPLICITLY empty scene: new geometry (geometry_unchanged is 0) and none of it -- the board drew no 3D
+            // this frame (MAME's render_polygons, poly_list_index 0, which publishes it on purpose). Returning without
+            // building kept the LAST scene on screen (01/10, Daytona USA's title: MAME published empty=60 for fifteen
+            // seconds while the app went on drawing the race it had before, frozen, 1440 polygons -- the title's white
+            // page seen behind a stopped race read as a white sky with a black wedge). No 3D now: built, and empty, so
+            // the immersive pass declines (m_opaqueIndexCount 0) and the 2D screen is shown as the board shows it.
+            m_rawPrims.clear(); m_rawVerts.clear(); m_rawPrimOfVertex.clear(); m_rawIdx.clear();
+            m_leanIndexCount = m_fastIndexCount = m_secIndexStart = m_opaqueIndexCount = m_glassIndexCount = 0;
+            m_haveMainView = false; m_mainLike.clear();
+            m_built = true;
+            if (++m_emptyScenes == 1 || (m_emptyScenes % 600u) == 0u)
+                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK empty scene published by the board: no 3D drawn (%u so far)", m_emptyScenes));
+            return;
+        }
         m_built = true;
         m_overlayOn = arcadexr::profiles::GetInt("immersive.screenOverlay", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
         m_nearFxOn = !m_flatMode && arcadexr::profiles::GetInt("immersive.nearEffects", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
@@ -336,15 +350,16 @@ public:
                     mainCx = keys[k].cx; mainCy = keys[k].cy;
                 }
             }
-            // A large view that holds most of the frame's polygons AND reaches into the distance is the world, wherever
-            // its projection centre sits (01/10, Daytona USA: the attract race camera is centred 50 px below the screen
-            // centre, 2 px past the tolerance above -- the whole demo went to the flat secondary path, 13-28 ms of GPU at
-            // half resolution, and the scene recording mode flipped every few frames). Centring stays the rule for every
+            // A large view that holds most of the frame's polygons AND spans depth is the world, wherever its projection
+            // centre sits (01/10, Daytona USA: the attract race camera is centred 50 px below the screen centre, 2 px
+            // past the tolerance above -- the whole demo went to the flat secondary path, 13-28 ms of GPU at half
+            // resolution, and the scene recording mode flipped every few frames). Centring stays the rule for every
             // other view: it keeps a 3D HUD element (a needle, a position digit, its own centre) flat, and Sega Rally's
-            // car select, four full-screen previews that differ only by their centre (15/09). The depth test is what
-            // tells a world from an object shown to the camera: the same far-geometry test as the horizon below
-            // (deepest vertex beyond 3x the median depth, and enough vertices out there) -- a car preview has none.
-            // debug.tcvr.m2_mainDominant=0 restores the centred-only rule.
+            // car select, four full-screen previews that differ only by their centre (15/09). What tells a world from
+            // an object shown to the camera is its depth SPAN: a road runs from under the camera to the horizon (95th
+            // percentile of the depths >= 8x the 5th), a car seen whole stays within ~2x. (The horizon's far-geometry
+            // test was tried first: it left up to 259 of 300 Daytona race frames flat, measured, and the picture flipped
+            // between immersive and flat.) debug.tcvr.m2_mainDominant=0 restores the centred-only rule.
             auto reachesFar = [&](const Key& key) {
                 if (!frame.raw_prim_count) return false;
                 std::vector<float> zs;
@@ -358,12 +373,12 @@ public:
                     }
                 }
                 if (zs.size() < 32) return false;
-                std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
-                const float zmed = zs[zs.size() / 2], zmax = *std::max_element(zs.begin(), zs.end());
-                if (zmax <= 3.0f * zmed) return false;
-                const float farZ = 0.4f * zmax;
-                const size_t far = size_t(std::count_if(zs.begin(), zs.end(), [farZ](float z) { return z >= farZ; }));
-                return far >= ((kp[0].rgb & 0x1000000u) != 0u ? 8u : 32u);
+                const size_t i05 = zs.size() / 20, i95 = (zs.size() * 19) / 20;
+                std::nth_element(zs.begin(), zs.begin() + i05, zs.end());
+                const float z05 = zs[i05];
+                std::nth_element(zs.begin(), zs.begin() + i95, zs.end());
+                const float z95 = zs[i95];
+                return z95 >= 8.0f * std::max(z05, 1e-3f);
             };
             if (arcadexr::config::GetInt("m2.mainDominant", 1) != 0) {
                 for (unsigned k = 0; k < n; ++k) {
@@ -4572,6 +4587,7 @@ private:
     uint8_t* m_lutMapped = nullptr;
     uint32_t m_lastEyePixels = 0;
     bool m_built = false;
+    unsigned m_emptyScenes = 0;   // explicitly empty scenes published by the board (TCVR_M2VK empty scene)
     int m_lastRegionsReset = 0;
     int m_lastRb = 0, m_rbWaitFrames = 0;
     bool m_rbPending = false, m_rbPendingNext = false;
