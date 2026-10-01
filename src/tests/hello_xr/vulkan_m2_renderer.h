@@ -423,6 +423,7 @@ public:
             }
         }
         m_haveMainView = bestArea > 0;
+        m_mainFlat = false;   // a page, measured below on the main view's depths (Model 2)
         if (!m_haveMainView) { mainL = mainT = mainR = mainB = -1; mainCx = mainCy = -100000; }
 
         m_horizonGeo = -1.0f;
@@ -466,6 +467,11 @@ public:
                     std::nth_element(zs.begin(), zs.begin() + i95, zs.end());
                     m_mainDepthP[1] = zs[i95];
                     m_mainSpansDepth = m_mainDepthP[1] >= 3.0f * std::max(m_mainDepthP[0], 1e-3f) || m_mainDepthP[1] >= 100.0f;
+                    // A PAGE (01/10 evening): the opposite, a main view whose 3D sits at ONE depth. Virtua Cop's STAGE SELECT is
+                    // one full-screen view, 1509 polygons -- its blue page, its three framed previews -- all at 50 units (17.84 m);
+                    // its 2D text on the 2 m HUD plane floated 16 m in front of its own frames ("effet parallax"). A world, a car
+                    // seen close, a room all span far more than 25 % (Daytona's attract: a road from under the camera to 400 units).
+                    m_mainFlat = m_mainDepthP[1] <= 1.25f * std::max(m_mainDepthP[0], 1e-3f);
                 }
             }
             if (m_directColour && frame.raw_prim_count) {
@@ -609,10 +615,10 @@ public:
                     const std::uint32_t vc = std::min<std::uint32_t>(p.vertex_count, frame.raw_vertex_count - std::min(p.first_vertex, frame.raw_vertex_count));
                     GlassObj& o = m_glassObj[GlassKey(p, i)];
                     if (vc < 3) continue;
-                    o.addr = p.motion_addr; o.polys++;
+                    o.addr = p.motion_addr; o.polys++; o.window = p.window;
                     if (p.translucent) o.translucent++;
                     if (p.textured) o.textured++;
-                    if (p.center_x != mainCx || p.center_y != mainCy) o.ok = false;
+                    if (p.center_x != mainCx || p.center_y != mainCy) { o.ok = false; o.mainView = false; }
                     const float hw = 0.5f * float(p.clip_r - p.clip_l + 1), hh = 0.5f * float(p.clip_b - p.clip_t + 1);
                     float sx0 = 1e9f, sx1 = -1e9f, sy0 = 1e9f, sy1 = -1e9f; bool front = true;
                     for (std::uint32_t v = 0; v < vc; v++) {
@@ -635,6 +641,48 @@ public:
                     GlassObj& o = kv.second;
                     const bool sheet = o.zmax - o.zmin <= 0.05f * o.zmin, effect = o.translucent == o.polys;
                     if (!sheet && !effect) o.ok = false;
+                }
+                {   // THE GAME'S OWN HUD LAYER (01/10 evening, Virtua Cop's revolver cylinder: "le barillet du flingue en 3D bouge
+                    // avec le casque alors que le reste des HUD ne bouge pas et ça fait loucher"). The board layers a 3D HUD object
+                    // over its scene with a WINDOW of its own, drawn over the world's: the cylinder's polygons came first in the
+                    // board's order (rank 0) at a depth of 1169 units -- ~800 m, far behind everything it covers. Rule: in the
+                    // main view, an object of a window the board draws OVER the world's (a higher window number: the board
+                    // draws its windows from the last to the first, the first written on a pixel stays) and BEYOND the world
+                    // (nearest vertex past 2x the world's 95th-percentile depth) is the game's HUD: onto the HUD plane, same
+                    // pixels. The world's window holds most of the main view's polygons. "Over" matters: The House of the
+                    // Dead's attract has 19 far polygons in a window drawn UNDER the world's (a backdrop), which the HUD plane
+                    // would have painted over the scene. Top Skater's skater, in a window of its own to be drawn over the
+                    // ramp, stands inside the world's depth and stays 3D.
+                    std::unordered_map<std::uint32_t, std::uint32_t> perWin;
+                    for (std::uint32_t i = 0; i < n; i++) {
+                        const tcvr_m2_prim& p = frame.raw_prims[i];
+                        if (p.center_x == mainCx && p.center_y == mainCy) ++perWin[p.window];
+                    }
+                    std::uint32_t mainWin = 0, best = 0;
+                    for (const auto& kv : perWin) if (kv.second > best) { best = kv.second; mainWin = kv.first; }
+                    std::vector<float> zw;
+                    for (std::uint32_t i = 0; i < n; i++) {
+                        const tcvr_m2_prim& p = frame.raw_prims[i];
+                        if (p.window != mainWin || p.center_x != mainCx || p.center_y != mainCy || p.vertex_count == 0 ||
+                            frame.raw_vertex_count == 0) continue;
+                        const std::uint32_t fv = std::min(p.first_vertex, frame.raw_vertex_count - 1);
+                        if (frame.raw_vertices[fv].z > 0.0f) zw.push_back(frame.raw_vertices[fv].z);
+                    }
+                    m_overlayPolys = 0;
+                    if (perWin.size() > 1 && zw.size() >= 32) {
+                        std::nth_element(zw.begin(), zw.begin() + (zw.size() * 95) / 100, zw.end());
+                        const float far95 = zw[(zw.size() * 95) / 100];
+                        for (auto& kv : m_glassObj) {
+                            GlassObj& o = kv.second;
+                            if (o.polys == 0 || !o.mainView || o.window <= mainWin || o.zmin <= 0.0f) continue;
+                            if (o.zmin > 2.0f * far95) { o.overlay = true; m_overlayPolys += o.polys; }
+                        }
+                    }
+                    if (m_overlayPolys != m_overlayLogged && (++m_overlayTick % 60u) == 0u) {
+                        m_overlayLogged = m_overlayPolys;
+                        Log::Write(Log::Level::Info, Fmt("TCVR_OVERLAYWIN %u polygone(s) d'une fenetre de HUD du jeu -> plan du HUD (fenetre du monde %u, %u fenetres)",
+                                                         m_overlayPolys, mainWin, unsigned(perWin.size())));
+                    }
                 }
                 // TCVR_GLASSCENSUS: every object that comes nearer than 40 cm, glass or not, summed over the second
                 for (const auto& kv : m_glassObj) {
@@ -708,7 +756,7 @@ public:
                 // PushNearEffects), a full-frame veil or a band keeps its own path (bits 25/26).
                 if (m_nearFxOn && vc >= 3 && (q.rgb & 0x6000000u) == 0u) {
                     const auto go = m_glassObj.find(GlassKey(p, 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu)));
-                    if (go != m_glassObj.end() && go->second.ok && go->second.inPic) q.rgb |= 0x10000000u;
+                    if (go != m_glassObj.end() && go->second.inPic && (go->second.ok || go->second.overlay)) q.rgb |= 0x10000000u;
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
                     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
@@ -1248,7 +1296,9 @@ public:
         pitchTarget += arcadexr::config::GetFloat("m2.immersivePitchOffset", 0.0f);
         if (viewIndex == 0) m_m2Pitch += (pitchTarget - m_m2Pitch) * 0.1f;
         if (viewIndex == 0 && !m_flatMode && (++m_pitchLogTick % 30u) == 0u)
-            Log::Write(Log::Level::Info, Fmt("TCVR_PITCH hz=%d horizon=%.1f target=%.4f applied=%.4f menu=%d zmax=%.0f prims=%zu", m_haveHorizon ? 1 : 0, m_horizonGeo, pitchTarget, m_m2Pitch, m_backNoTile ? 1 : 0, m_mainZMax, m_rawPrims.size()));
+            Log::Write(Log::Level::Info, Fmt("TCVR_PITCH hz=%d horizon=%.1f target=%.4f applied=%.4f menu=%d zmax=%.0f prims=%zu | depth p5 %.1f p95 %.1f page=%d",
+                m_haveHorizon ? 1 : 0, m_horizonGeo, pitchTarget, m_m2Pitch, m_backNoTile ? 1 : 0, m_mainZMax, m_rawPrims.size(),
+                m_mainDepthP[0], m_mainDepthP[1], m_menuPage ? 1 : 0));
 
         const float cp = ::cosf(m_m2Pitch), sp = ::sinf(m_m2Pitch);
         const arcadexr::gun::Vec3 upP{cp * screen.up.x - sp * screen.normal.x, cp * screen.up.y - sp * screen.normal.y, cp * screen.up.z - sp * screen.normal.z};
@@ -1311,7 +1361,27 @@ public:
         // keeps its page on its boxes at the depth of its 3D -- at 2 m it sat "right in front of the eyes" (26/09), the
         // cars far behind it. The games that flip between menu and scene (House of the Dead) keep the 2 m plane throughout.
         const bool hudNearRule = arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
-        const bool menuKeepsIso = m_isMenuM1 && MenuIso() && !hudNearRule;
+        // (corrected the same evening, Guillaume: Daytona's "insert coin" "avance et recule selon la scène" -- its attract shots
+        // without horizon were "menus", its recipe has hudNear=0, so its HUD went to the menu depth and back. And Virtua Cop's
+        // STAGE SELECT: its text at 2 m, its three 3D frames at 18 m, "effet parallax".) The page sits on its 3D only on a
+        // MENU PAGE -- "menu" state and a FLAT main view (its 3D at one depth, m_mainFlat) that HOLDS STILL, within 3 % of its
+        // depth for a second -- or where the profile keeps its validated ISO menus (immersive.menuIsoHud: Sega Rally's car
+        // select). A first try measured how much of the screen the 3D covered: Virtua Cop's page is 3D to its blue
+        // background, it covered it all. Without "still", Super GT's intro (a flat plate rushing at the camera, 9.5 to 0.6
+        // units in 2 s) pulled the HUD along from 1.56 to 1.23 m: the very "avance et recule".
+        if (viewIndex == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (m_isMenuM1 && m_mainFlat) {
+                const float d = m_mainDepthP[0];
+                if (m_pageDepth <= 0.0f || std::fabs(d - m_pageDepth) > 0.03f * m_pageDepth) { m_pageDepth = d; m_pageSince = now; }
+            } else {
+                m_pageDepth = 0.0f;
+            }
+            m_menuPage = m_pageDepth > 0.0f && now - m_pageSince >= std::chrono::seconds(1);
+        }
+        const bool menuPage = m_menuPage;
+        const bool menuKeepsIso = m_isMenuM1 && MenuIso() &&
+                                  (menuPage || arcadexr::profiles::GetInt("immersive.menuIsoHud", 0) != 0);
         const float hudFixedM = menuKeepsIso ? 0.0f
                               : arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 2.0f));
         const bool hudFixed = hudFixedM > 0.0f && !m_flatMode;
@@ -2532,7 +2602,9 @@ public:
     uint32_t m_screenMovedM2 = 0;   // flat camera-glued polygons moved onto the HUD plane this frame
     // The glass, per object (29/09): the board's model instance -- polygon data address, copy, view; a direct-data polygon
     // (address 0xffffffff) is its own object.
-    struct GlassObj { float zmin = 1e9f, zmax = 0.0f; std::uint32_t polys = 0, translucent = 0, textured = 0, addr = 0; bool ok = true, inPic = false; };
+    struct GlassObj { float zmin = 1e9f, zmax = 0.0f; std::uint32_t polys = 0, translucent = 0, textured = 0, addr = 0; bool ok = true, inPic = false;
+                      std::uint32_t window = 0; bool mainView = true, overlay = false; };
+    std::uint32_t m_overlayPolys = 0, m_overlayLogged = 0xffffffffu, m_overlayTick = 0;   // TCVR_OVERLAYWIN
     std::unordered_map<std::uint64_t, GlassObj> m_glassObj;
     static std::uint64_t GlassKey(const tcvr_m2_prim& p, std::uint32_t captureIndex) {
         if (p.motion_addr == 0xffffffffu) return 0x8000000000000000ull | captureIndex;
@@ -5488,6 +5560,10 @@ private:
     float m_horizonGeo = -1.0f;
     bool m_haveHorizon = false;
     float m_mainZMax = 0.0f;   // deepest main-view vertex (menu or scene?)
+    bool m_mainFlat = false;             // the main view's 3D at one depth (p95 <= 1.25 p5): a page (Model 2)
+    float m_pageDepth = 0.0f;            // a flat "menu" view's depth (p5) when it last settled, 0 = none
+    std::chrono::steady_clock::time_point m_pageSince{};   // ... since when it has held that depth
+    bool m_menuPage = false;             // held a second: a menu page, its text on its plane
     float m_crtc[2] = {0.0f, 0.0f};
     struct AimTransform { bool valid; arcadexr::gun::Vec3 cam, R, U, N; float s, nearM; };
     AimTransform m_aimXf{false, {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1.0f, 0.25f};
