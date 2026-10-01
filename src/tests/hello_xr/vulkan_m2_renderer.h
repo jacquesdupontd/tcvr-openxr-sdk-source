@@ -301,7 +301,11 @@ public:
         m_emptyRun = 0;
         m_built = true;
         m_overlayOn = arcadexr::profiles::GetInt("immersive.screenOverlay", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
-        m_nearFxOn = !m_flatMode && arcadexr::profiles::GetInt("immersive.nearEffects", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
+        // The glass (objects glued to the camera nearer than 40 cm) and the game's HUD windows, for EVERY game since 01/10 night
+        // (it was off for the racing games, out of caution for Sega Rally). Measured with it forced on, in attract and in a
+        // race, cameras cycled: Sega Rally, Daytona, Virtua Racing, Top Skater -- nothing moves; Super GT -- one HUD element,
+        // 12 translucent polygons drawn 21 cm before the eyes, goes to the HUD plane (like Daytona's rev needle, see hudView).
+        m_nearFxOn = !m_flatMode && arcadexr::profiles::GetInt("immersive.nearEffects", 1) != 0;
         {   // Bench (28/09): after an injected shot (debug.tcvr.fire), each of the next 24 frames logs its nearest polygons
             // and its front layer (TCVR_FIREDIAG) -- what the game draws for a shot, and where. Logged one frame late.
             if (!m_fireNear.empty()) {
@@ -329,7 +333,7 @@ public:
         std::int64_t bestArea = -1; std::uint32_t bestPrims = 0;
         std::int32_t mainL = 0, mainT = 0, mainR = 0, mainB = 0, mainCx = 0, mainCy = 0;
         {
-            struct Key { std::int32_t l, t, r, b, cx, cy; std::uint32_t prims; };
+            struct Key { std::int32_t l, t, r, b, cx, cy; std::uint32_t prims; float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; };
             Key keys[8]; unsigned n = 0;
             for (std::uint32_t i = 0; i < kn; i++) {
                 const tcvr_m2_prim& p = kp[i];
@@ -339,12 +343,26 @@ public:
                         keys[k].b == p.clip_b && keys[k].cx == p.center_x && keys[k].cy == p.center_y)
                         break;
                 if (k == n && n < 8) keys[n++] = {p.clip_l, p.clip_t, p.clip_r, p.clip_b, p.center_x, p.center_y, 0};
-                if (k < n) keys[k].prims++;
+                if (k < n) {
+                    keys[k].prims++;
+                    if (frame.raw_prim_count) {   // where the view draws on the board (its own centre), for the HUD view rule below
+                        for (std::uint32_t v = 0; v < p.vertex_count; v++) {
+                            const std::uint32_t index = p.first_vertex + v;
+                            if (index >= frame.raw_vertex_count) break;
+                            const tcvr_m2_raw_vertex& rv = frame.raw_vertices[index];
+                            if (rv.z <= 1e-3f) continue;
+                            const float sx = float(p.center_x) + rv.x / rv.z, sy = float(384 - p.center_y) - rv.y / rv.z;
+                            keys[k].x0 = std::min(keys[k].x0, sx); keys[k].x1 = std::max(keys[k].x1, sx);
+                            keys[k].y0 = std::min(keys[k].y0, sy); keys[k].y1 = std::max(keys[k].y1, sy);
+                        }
+                    }
+                }
             }
             if (arcadexr::config::GetInt("m2.viewDiag", 0) != 0 && (++m_viewDiagTick % 120u) == 0u)
                 for (unsigned k = 0; k < n; ++k)
-                    Log::Write(Log::Level::Info, Fmt("TCVR_VIEWS %u/%u clip=%d,%d..%d,%d centre screen=%d,%d prims=%u", k, n,
-                        keys[k].l, keys[k].t, keys[k].r, keys[k].b, frame.crtc_xoffset + keys[k].cx, (384 - keys[k].cy) + frame.crtc_yoffset, keys[k].prims));
+                    Log::Write(Log::Level::Info, Fmt("TCVR_VIEWS %u/%u clip=%d,%d..%d,%d centre screen=%d,%d prims=%u box %.0f,%.0f..%.0f,%.0f", k, n,
+                        keys[k].l, keys[k].t, keys[k].r, keys[k].b, frame.crtc_xoffset + keys[k].cx, (384 - keys[k].cy) + frame.crtc_yoffset, keys[k].prims,
+                        keys[k].x0, keys[k].y0, keys[k].x1, keys[k].y1));
             m_mainLike.clear();
             const std::int64_t halfScreen = std::int64_t(496) * std::int64_t(384) / 2;
             for (unsigned k = 0; k < n; ++k) {
@@ -353,7 +371,25 @@ public:
                 const int sy = (384 - keys[k].cy) + frame.crtc_yoffset;
                 const bool centred = std::abs(sx - 496 / 2) <= 496 / 8 && std::abs(sy - 384 / 2) <= 384 / 8;
                 if (area < halfScreen || !centred) continue;
-                if (m_mainLike.size() < 8) m_mainLike.push_back({keys[k].l, keys[k].t, keys[k].r, keys[k].b, keys[k].cx, keys[k].cy});
+                // THE GAME'S 3D HUD IN A VIEW OF ITS OWN (01/10 night, Daytona's rev counter: "l'aiguille ... en jaune qui est en 3D
+                // devant nous c'est un tout petit losange alors que le reste du HUD se trouve plus profondément sur un pane").
+                // The board draws it as a full-screen view centred near the screen centre (248,196; the race camera is at
+                // 248,242), 40 polygons: the needle at 0.30 m, the dotted arc at 3-9 m. Merged into the world below like Top
+                // Skater's backdrop, it floated at those depths, 46 px off its place. A backdrop covers the screen; this one
+                // covers a strip of it. In a scene (not a menu, not a page), a centred view whose drawing covers under a
+                // quarter of the board stays a secondary view: flat on the HUD plane, at its own pixels.
+                const float cw = std::max(0.0f, std::min(keys[k].x1, float(keys[k].r + 1)) - std::max(keys[k].x0, float(keys[k].l)));
+                const float ch = std::max(0.0f, std::min(keys[k].y1, float(keys[k].b + 1)) - std::max(keys[k].y0, float(keys[k].t)));
+                const float cover = (keys[k].x1 > keys[k].x0 && keys[k].y1 > keys[k].y0) ? cw * ch / (496.0f * 384.0f) : 0.0f;
+                // Model 2 only for now: Virtua Racing (Model 1) shows a 4-polygon centred view on 14 % of the board for a few
+                // frames, not looked at yet. And a HUD is a few polygons: Top Skater's attract shows its scene from afar,
+                // 1167 polygons on 19 % of the board, in such a view for a few frames -- flattened, it lost its 3D.
+                const bool model1 = kn > 0 && (kp[0].rgb & 0x1000000u) != 0u;
+                const bool hudView = !model1 && !m_isMenuM1 && !m_menuPage && cover < 0.25f && keys[k].prims <= 100u &&
+                                     arcadexr::config::GetInt("m2.hudViewFlat", 1) != 0;
+                if (hudView) { m_hudViewLast[0] = frame.crtc_xoffset + keys[k].cx; m_hudViewLast[1] = (384 - keys[k].cy) + frame.crtc_yoffset;
+                               m_hudViewLast[2] = int(keys[k].prims); m_hudViewCover = cover; }
+                if (m_mainLike.size() < 8) m_mainLike.push_back({keys[k].l, keys[k].t, keys[k].r, keys[k].b, keys[k].cx, keys[k].cy, hudView});
                 if (area > bestArea || (area == bestArea && keys[k].prims > bestPrims)) {
                     bestArea = area; bestPrims = keys[k].prims;
                     mainL = keys[k].l; mainT = keys[k].t; mainR = keys[k].r; mainB = keys[k].b;
@@ -411,6 +447,13 @@ public:
                     break;
                 }
             }
+            if (++m_hudViewTick >= 300u) {   // TCVR_HUDVIEW: frames where a centred view was kept flat as the game's 3D HUD
+                if (m_hudViewFrames > 0)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_HUDVIEW %u/%u frames: a centred full-screen view drawing on %.0f %% of the board kept flat on the HUD plane "
+                                                     "(centre screen=%d,%d, %d polygons)", m_hudViewFrames, m_hudViewTick, 100.0f * m_hudViewCover,
+                                                     m_hudViewLast[0], m_hudViewLast[1], m_hudViewLast[2]));
+                m_hudViewFrames = 0; m_hudViewTick = 0;
+            }
             if (++m_mainPromotedTick >= 300u) {   // every ~5 s of arcade frames, only when the rule looked at something
                 if (m_mainPromoted > 0 || m_mainRefusedFlat > 0)
                     Log::Write(Log::Level::Info, Fmt("TCVR_MAINVIEW %u/%u frames: an off-centre view holding most polygons made the main view "
@@ -424,6 +467,11 @@ public:
         }
         m_haveMainView = bestArea > 0;
         m_mainFlat = false;   // a page, measured below on the main view's depths (Model 2)
+        for (const auto& ml : m_mainLike)   // TCVR_HUDVIEW counts the frames where a HUD view really stayed out of the world
+            if (ml.hud && m_haveMainView && !(ml.cx == mainCx && ml.cy == mainCy && ml.l == mainL && ml.t == mainT && ml.r == mainR && ml.b == mainB)) {
+                ++m_hudViewFrames;
+                break;
+            }
         if (!m_haveMainView) { mainL = mainT = mainR = mainB = -1; mainCx = mainCy = -100000; }
 
         m_horizonGeo = -1.0f;
@@ -472,6 +520,14 @@ public:
                     // its 2D text on the 2 m HUD plane floated 16 m in front of its own frames ("effet parallax"). A world, a car
                     // seen close, a room all span far more than 25 % (Daytona's attract: a road from under the camera to 400 units).
                     m_mainFlat = m_mainDepthP[1] <= 1.25f * std::max(m_mainDepthP[0], 1e-3f);
+                    m_mainFlatZ = m_mainDepthP[0];
+                } else if (zs.size() >= 3) {
+                    // A page with only a few 3D bits (01/10 night): Daytona's MISSION SELECT draws 5 polygons (20 vertices), its
+                    // CIRCUIT SELECT 12 -- below 32 vertices the page was never measured, so one menu sat on its page at 9 m
+                    // and the next one at 2 m ("les menus sont un coup en 3D un coup en 2D plus loin"). Its extremes.
+                    const auto mm = std::minmax_element(zs.begin(), zs.end());
+                    m_mainFlat = *mm.second <= 1.25f * std::max(*mm.first, 1e-3f);
+                    m_mainFlatZ = *mm.first;
                 }
             }
             if (m_directColour && frame.raw_prim_count) {
@@ -803,7 +859,7 @@ public:
                 // them in 3D, so they take the main view's centre and window.
                 if (!m_flatMode && m_haveMainView && !(q.center_x == mainCx && q.center_y == mainCy))
                     for (const auto& ml : m_mainLike)
-                        if (q.center_x == ml.cx && q.center_y == ml.cy && q.clip_l == ml.l && q.clip_t == ml.t &&
+                        if (!ml.hud && q.center_x == ml.cx && q.center_y == ml.cy && q.clip_l == ml.l && q.clip_t == ml.t &&
                             q.clip_r == ml.r && q.clip_b == ml.b) {
                             q.center_x = mainCx; q.center_y = mainCy;
                             q.clip_l = mainL; q.clip_t = mainT; q.clip_r = mainR; q.clip_b = mainB;
@@ -1369,19 +1425,24 @@ public:
         // select). A first try measured how much of the screen the 3D covered: Virtua Cop's page is 3D to its blue
         // background, it covered it all. Without "still", Super GT's intro (a flat plate rushing at the camera, 9.5 to 0.6
         // units in 2 s) pulled the HUD along from 1.56 to 1.23 m: the very "avance et recule".
+        // (01/10 night, Guillaume: "pendant le select je vois d'abord le parallax sur les tiles et puis ça devient tout au même
+        // plan") The page took 1.5 s to be recognised: half a second to enter the "menu" state, then a second of stillness.
+        // Now no menu state is needed -- a flat main view with no horizon is the page's own evidence -- and 0.3 s of
+        // stillness. On every attract of the tour (Daytona, House of the Dead, Virtua Cop, Top Skater, Super GT) that rule
+        // finds one page only: Super GT's title plate, flat and still half a second at 1.56 m, nearer than the 2 m HUD.
         if (viewIndex == 0) {
             const auto now = std::chrono::steady_clock::now();
-            if (m_isMenuM1 && m_mainFlat) {
-                const float d = m_mainDepthP[0];
+            if (m_mainFlat && !m_haveHorizon) {
+                const float d = m_mainFlatZ;
                 if (m_pageDepth <= 0.0f || std::fabs(d - m_pageDepth) > 0.03f * m_pageDepth) { m_pageDepth = d; m_pageSince = now; }
             } else {
                 m_pageDepth = 0.0f;
             }
-            m_menuPage = m_pageDepth > 0.0f && now - m_pageSince >= std::chrono::seconds(1);
+            m_menuPage = m_pageDepth > 0.0f && now - m_pageSince >= std::chrono::milliseconds(300);
         }
         const bool menuPage = m_menuPage;
-        const bool menuKeepsIso = m_isMenuM1 && MenuIso() &&
-                                  (menuPage || arcadexr::profiles::GetInt("immersive.menuIsoHud", 0) != 0);
+        const bool menuKeepsIso = (menuPage && HudIsoProfile()) ||
+                                  (m_isMenuM1 && MenuIso() && arcadexr::profiles::GetInt("immersive.menuIsoHud", 0) != 0);
         const float hudFixedM = menuKeepsIso ? 0.0f
                               : arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 2.0f));
         const bool hudFixed = hudFixedM > 0.0f && !m_flatMode;
@@ -1406,10 +1467,10 @@ public:
         // the rays at the depth the game draws its 3D (deepest main-view vertex: 28 units in Sega Rally's menus, i.e.
         // far and large as on 25/09). Brought to the 2 m HUD plane it sat "right in front of the eyes"; boxes at the
         // game depth with the page left at 2 m, it was a parallax.
-        const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f) && HudIsoProfile();
+        const bool hudIso = !m_flatMode && m_haveMainView && (menuPage || (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f)) && HudIsoProfile();
         // Before any "near" rule. Every game but Sega Rally: the scene's depth in "menu" state too -- House of the Dead
         // flips menu/scene all the time and the jump to the farthest vertex made everything on this plane jump (28/09).
-        const float hudSceneZ = std::max(1.0f, (m_isMenuM1 && !hudNearRule) ? m_mainZMax
+        const float hudSceneZ = std::max(1.0f, ((m_isMenuM1 || menuPage) && !hudNearRule) ? m_mainZMax
                                                    : (m_sceneDepth > 0.0f ? m_sceneDepth : m_mainZMax));
         auto hudMvpAt = [&](float zh, XrMatrix4x4f& out) {
             const float fcx = float(m_crtc[0]) + float(m_mainCenter[0]), fcy = float(384 - m_mainCenter[1]) + float(m_crtc[1]);
@@ -1460,7 +1521,7 @@ public:
         // A menu of the game (no main 3D view): its 2D back layer is part of the screen, not a sky -- same plane as the
         // HUD, level, not repeated (the course select showed ten copies of a course, and the selection frame of the
         // front layer did not sit on the course of the back one).
-        const bool menuScreen = !m_flatMode && (!m_haveMainView || m_isMenuM1);
+        const bool menuScreen = !m_flatMode && (!m_haveMainView || m_isMenuM1 || menuPage);
         m_backNoTile = menuScreen;
         const bool skyAnchor = !menuScreen && !m_flatMode && m_horizonGeo >= 0.0f &&
             arcadexr::profiles::GetInt("immersive.skyAnchor", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;   // GOLD (Sega Rally) unchanged by default
@@ -4678,7 +4739,8 @@ private:
     uint32_t m_fastIndexCount = 0;
     uint32_t m_leanIndexCount = 0;
     uint32_t m_viewDiagTick = 0;
-    struct MainLike { std::int32_t l, t, r, b, cx, cy; };
+    struct MainLike { std::int32_t l, t, r, b, cx, cy; bool hud = false; };   // hud: the game's 3D HUD view, kept flat
+    std::uint32_t m_hudViewFrames = 0, m_hudViewTick = 0; int m_hudViewLast[3] = {0, 0, 0}; float m_hudViewCover = 0.0f;   // TCVR_HUDVIEW
     std::vector<MainLike> m_mainLike;   // full-screen, centred views of this frame (main camera candidates)   // [0, lean) lean shader; [lean, fast) full shader (no region image nor layer)
 
     VkPipeline m_voidPipeline = VK_NULL_HANDLE;
@@ -5561,6 +5623,7 @@ private:
     bool m_haveHorizon = false;
     float m_mainZMax = 0.0f;   // deepest main-view vertex (menu or scene?)
     bool m_mainFlat = false;             // the main view's 3D at one depth (p95 <= 1.25 p5): a page (Model 2)
+    float m_mainFlatZ = 0.0f;            // ... its near depth (p5, or the nearest vertex under 32 vertices)
     float m_pageDepth = 0.0f;            // a flat "menu" view's depth (p5) when it last settled, 0 = none
     std::chrono::steady_clock::time_point m_pageSince{};   // ... since when it has held that depth
     bool m_menuPage = false;             // held a second: a menu page, its text on its plane
