@@ -441,6 +441,33 @@ public:
             // Model 1 scene "far" is relative to the view's depth, and a view without depth (a menu with 3D icons)
             // has no horizon at all. Model 2 keeps its validated threshold.
             float farZ = 1000.0f;
+            // The main view's depth SPAN (01/10, Daytona USA): Model 2's horizon test looks for vertices beyond 1000 units,
+            // a value set on Sega Rally's scale; Daytona's world ends at 140-400 units, so its whole race had no horizon
+            // and was taken for a MENU (TCVR_PITCH menu=1 for minutes): the HUD went to the farthest vertex, 140-400 m
+            // away, jumping with it, painted over cars 5 m away. A menu has neither a horizon nor depth; a road running
+            // from under the camera to the distance is a scene: the 95th percentile of the depths >= 3x the 5th, or >= 100
+            // units -- the rule of the off-centre main view. Model 2 only (Model 1 keeps its validated rules).
+            m_mainSpansDepth = false;
+            if (!m_directColour && frame.raw_prim_count) {
+                std::vector<float> zs;
+                for (std::uint32_t i = 0; i < kn; i++) {
+                    const tcvr_m2_prim& p = kp[i];
+                    if (p.clip_l != mainL || p.clip_t != mainT || p.clip_r != mainR || p.clip_b != mainB ||
+                        p.center_x != mainCx || p.center_y != mainCy) continue;
+                    for (std::uint32_t v = 0; v < p.vertex_count; v++) {
+                        const std::uint32_t index = p.first_vertex + v;
+                        if (index < frame.raw_vertex_count && frame.raw_vertices[index].z > 0.0f) zs.push_back(frame.raw_vertices[index].z);
+                    }
+                }
+                if (zs.size() >= 32) {
+                    const size_t i05 = zs.size() / 20, i95 = (zs.size() * 19) / 20;
+                    std::nth_element(zs.begin(), zs.begin() + i05, zs.end());
+                    m_mainDepthP[0] = zs[i05];
+                    std::nth_element(zs.begin(), zs.begin() + i95, zs.end());
+                    m_mainDepthP[1] = zs[i95];
+                    m_mainSpansDepth = m_mainDepthP[1] >= 3.0f * std::max(m_mainDepthP[0], 1e-3f) || m_mainDepthP[1] >= 100.0f;
+                }
+            }
             if (m_directColour && frame.raw_prim_count) {
                 std::vector<float> zs;
                 for (std::uint32_t i = 0; i < kn; i++) {
@@ -494,14 +521,27 @@ public:
             // Model 2 too (26/09, Sega Rally's car select: a full-screen centred view made it a "scene": its 2D page
             // tiled to infinity as a sky and the boxes floated in front). A horizon row can be negative in a race
             // (-23.7 measured): "no horizon" is the flag, never the sign.
-            const bool looksMenu = !m_haveHorizon && (m_directColour ? kn < 400u : true);
+            // On by default for a game with no tuning history; for a validated game it changed frames of The House of the
+            // Dead and Top Skater (their scenes without a horizon were menus), so it waits for Guillaume's judgement there:
+            // debug.tcvr.m2_sceneBySpan=1/0 forces it, live (A/B on a frozen frame).
+            const bool spanRuleOn = arcadexr::config::GetInt("m2.sceneBySpan",
+                arcadexr::profiles::IsTuned(arcadexr::profiles::CurrentGame()) ? 0 : 1) != 0;
+            const bool spanScene = spanRuleOn && !m_directColour && m_haveMainView && m_mainSpansDepth && !m_haveHorizon;
+            const bool looksMenu = !m_haveHorizon && !spanScene && (m_directColour ? kn < 400u : true);
+            if (spanScene) ++m_spanSceneFrames;
+            if (++m_spanSceneTick >= 300u) {   // TCVR_SCENE: when the span decided "a scene" where the horizon said "a menu"
+                if (m_spanSceneFrames > 0)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_SCENE %u/%u frames: no horizon but the main view spans depth (p5 %.1f p95 %.1f): a scene, not a menu",
+                                                     m_spanSceneFrames, m_spanSceneTick, m_mainDepthP[0], m_mainDepthP[1]));
+                m_spanSceneFrames = 0; m_spanSceneTick = 0;
+            }
             m_menuFrames = looksMenu ? std::min(m_menuFrames + 1, 1000) : std::max(m_menuFrames - 1, -1000);
             if (m_menuFrames >= 30) m_isMenuM1 = true;
             if (m_menuFrames <= -30) m_isMenuM1 = false;
             // Model 2: a horizon is proof of a scene (every menu measured has none: depth 28 against 200000 in a race),
             // so leave at once -- held 30 arcade frames, the start of a race stayed flat for 2 s while the course
             // loaded (few frames published, 26/09).
-            if (!m_directColour && m_haveHorizon) { m_isMenuM1 = false; m_menuFrames = 0; }
+            if (!m_directColour && (m_haveHorizon || spanScene)) { m_isMenuM1 = false; m_menuFrames = 0; }
             if (!looksMenu && m_menuFrames > 0) m_menuFrames = 0;
             if (looksMenu && m_menuFrames < 0) m_menuFrames = 0;
             // Decided ONCE per frame (read per polygon by the routing, and by the shader's uMenuFlat).
@@ -5432,6 +5472,8 @@ private:
     int32_t m_mainClip[4] = {-1, -1, -1, -1};
     int32_t m_mainCenter[2] = {-100000, -100000};
     bool m_haveMainView = false;
+    bool m_mainSpansDepth = false; float m_mainDepthP[2] = {};   // the main view's depth p5/p95 (Model 2 scene vs menu)
+    unsigned m_spanSceneFrames = 0, m_spanSceneTick = 0;            // TCVR_SCENE
     unsigned m_mainPromoted = 0, m_mainRefusedFlat = 0, m_mainPromotedTick = 0; int m_mainPromotedAt[4] = {};   // TCVR_MAINVIEW
     float m_mainDepthPromoted[2] = {}, m_mainDepthRefused[2] = {};   // depth p5/p95 of the last promoted / refused view
     float m_horizonGeo = -1.0f;
