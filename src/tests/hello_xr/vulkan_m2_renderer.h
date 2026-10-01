@@ -306,6 +306,7 @@ public:
         // race, cameras cycled: Sega Rally, Daytona, Virtua Racing, Top Skater -- nothing moves; Super GT -- one HUD element,
         // 12 translucent polygons drawn 21 cm before the eyes, goes to the HUD plane (like Daytona's rev needle, see hudView).
         m_nearFxOn = !m_flatMode && arcadexr::profiles::GetInt("immersive.nearEffects", 1) != 0;
+        m_screenFxOn = arcadexr::profiles::GetInt("immersive.screenEffects", 1) != 0;
         {   // Bench (28/09): after an injected shot (debug.tcvr.fire), each of the next 24 frames logs its nearest polygons
             // and its front layer (TCVR_FIREDIAG) -- what the game draws for a shot, and where. Logged one frame late.
             if (!m_fireNear.empty()) {
@@ -333,7 +334,8 @@ public:
         std::int64_t bestArea = -1; std::uint32_t bestPrims = 0;
         std::int32_t mainL = 0, mainT = 0, mainR = 0, mainB = 0, mainCx = 0, mainCy = 0;
         {
-            struct Key { std::int32_t l, t, r, b, cx, cy; std::uint32_t prims; float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; };
+            struct Key { std::int32_t l, t, r, b, cx, cy; std::uint32_t prims; float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                         float zmax = 0.0f, zsum = 0.0f; std::uint32_t zn = 0; };
             Key keys[8]; unsigned n = 0;
             for (std::uint32_t i = 0; i < kn; i++) {
                 const tcvr_m2_prim& p = kp[i];
@@ -351,6 +353,7 @@ public:
                             if (index >= frame.raw_vertex_count) break;
                             const tcvr_m2_raw_vertex& rv = frame.raw_vertices[index];
                             if (rv.z <= 1e-3f) continue;
+                            keys[k].zmax = std::max(keys[k].zmax, rv.z); keys[k].zsum += rv.z; ++keys[k].zn;
                             const float sx = float(p.center_x) + rv.x / rv.z, sy = float(384 - p.center_y) - rv.y / rv.z;
                             keys[k].x0 = std::min(keys[k].x0, sx); keys[k].x1 = std::max(keys[k].x1, sx);
                             keys[k].y0 = std::min(keys[k].y0, sy); keys[k].y1 = std::max(keys[k].y1, sy);
@@ -389,7 +392,7 @@ public:
                                      arcadexr::config::GetInt("m2.hudViewFlat", 1) != 0;
                 if (hudView) { m_hudViewLast[0] = frame.crtc_xoffset + keys[k].cx; m_hudViewLast[1] = (384 - keys[k].cy) + frame.crtc_yoffset;
                                m_hudViewLast[2] = int(keys[k].prims); m_hudViewCover = cover; }
-                if (m_mainLike.size() < 8) m_mainLike.push_back({keys[k].l, keys[k].t, keys[k].r, keys[k].b, keys[k].cx, keys[k].cy, hudView});
+                if (m_mainLike.size() < 8) m_mainLike.push_back({keys[k].l, keys[k].t, keys[k].r, keys[k].b, keys[k].cx, keys[k].cy, hudView, keys[k].zmax});
                 if (area > bestArea || (area == bestArea && keys[k].prims > bestPrims)) {
                     bestArea = area; bestPrims = keys[k].prims;
                     mainL = keys[k].l; mainT = keys[k].t; mainR = keys[k].r; mainB = keys[k].b;
@@ -464,6 +467,16 @@ public:
                                                      m_mainRefusedFlat, m_mainDepthRefused[0], m_mainDepthRefused[1]));
                 m_mainPromoted = 0; m_mainRefusedFlat = 0; m_mainPromotedTick = 0;
             }
+            // A HUD view is NEAR the camera (Daytona's rev counter: 0.3-9 units, its race 2-400): a centred view reaching
+            // past half the world's mean depth is a backdrop (a sky, far scenery) and stays in the world as before.
+            for (unsigned k = 0; k < n; ++k)
+                if (keys[k].cx == mainCx && keys[k].cy == mainCy && keys[k].l == mainL && keys[k].t == mainT &&
+                    keys[k].r == mainR && keys[k].b == mainB && keys[k].zn > 0) {
+                    const float worldMean = keys[k].zsum / float(keys[k].zn);
+                    for (auto& ml : m_mainLike)
+                        if (ml.hud && ml.zmax >= 0.5f * worldMean) ml.hud = false;
+                    break;
+                }
         }
         m_haveMainView = bestArea > 0;
         m_mainFlat = false;   // a page, measured below on the main view's depths (Model 2)
@@ -683,6 +696,8 @@ public:
                         o.zmin = std::min(o.zmin, rv.z); o.zmax = std::max(o.zmax, rv.z);
                         const float sx = rv.x / rv.z, sy = rv.y / rv.z;
                         sx0 = std::min(sx0, sx); sx1 = std::max(sx1, sx); sy0 = std::min(sy0, sy); sy1 = std::max(sy1, sy);
+                        const float bx = float(frame.crtc_xoffset + p.center_x) + sx, by = float((384 - p.center_y) + frame.crtc_yoffset) - sy;
+                        o.bx0 = std::min(o.bx0, bx); o.bx1 = std::max(o.bx1, bx); o.by0 = std::min(o.by0, by); o.by1 = std::max(o.by1, by);
                     }
                     if (!front || o.zmax >= zLim) o.ok = false;
                     if (front && sx1 >= -hw && sx0 <= hw && sy1 >= -hh && sy0 <= hh) o.inPic = true;
@@ -739,6 +754,36 @@ public:
                         Log::Write(Log::Level::Info, Fmt("TCVR_OVERLAYWIN %u polygone(s) d'une fenetre de HUD du jeu -> plan du HUD (fenetre du monde %u, %u fenetres)",
                                                          m_overlayPolys, mainWin, unsigned(perWin.size())));
                     }
+                }
+                if (!m_screenFxOn) {   // THE IMPACTS ON THE SCREEN'S GLASS (01/10 night, Guillaume: "comme pour Time Crisis 2, il y a 2
+                    // impacts, ceux sur les ennemis, qu'on laisse évidemment, et ceux qui sont sur la vitre de l'écran ... je te demande de
+                    // faire pareil"). Time Crisis II's rule (vulkan_s22_renderer.h, immersive.screenEffects=0), the same here: an object
+                    // on the glass (glued to the camera, nearer than 40 cm) that is an EFFECT (all translucent) or an IMPACT (over a
+                    // shot of the last second, 8 % of the board around it) is not drawn. The impacts ON the enemies are in the world
+                    // and stay; the game's HUD windows (Virtua Cop's cylinder) stay.
+                    // An impact APPEARS with the shot: an object already on the glass before it (Virtua Cop's lock-on sight
+                    // around the enemy the player aims at, one quad 36-40 cm away, every frame) is not one -- Time Crisis II's
+                    // rule alone would have wiped the sight at each shot on its enemy. Each glass object's first frame is kept.
+                    arcadexr::gun::RecentShot shots[16];
+                    const int ns = arcadexr::gun::RecentShots(shots, 16, 1.0f);
+                    const auto now = std::chrono::steady_clock::now();
+                    for (auto& kv : m_glassObj) {
+                        GlassObj& o = kv.second;
+                        if (!o.ok || o.overlay || o.polys == 0) continue;
+                        auto fs = m_glassFirstSeen.find(kv.first);
+                        if (fs == m_glassFirstSeen.end()) fs = m_glassFirstSeen.emplace(kv.first, std::make_pair(now, now)).first;
+                        fs->second.second = now;   // last seen
+                        const float objAge = std::chrono::duration<float>(now - fs->second.first).count();
+                        bool impact = false;
+                        for (int i = 0; i < ns && !impact; ++i) {
+                            const float px = shots[i].nx * 496.0f, py = shots[i].ny * 384.0f, mg = 0.08f * 496.0f;
+                            impact = objAge <= shots[i].age + 0.05f &&
+                                     px >= o.bx0 - mg && px <= o.bx1 + mg && py >= o.by0 - mg && py <= o.by1 + mg;
+                        }
+                        o.drop = o.translucent == o.polys || impact;
+                    }
+                    for (auto it = m_glassFirstSeen.begin(); it != m_glassFirstSeen.end();)   // forget what left the glass
+                        it = (now - it->second.second > std::chrono::milliseconds(250)) ? m_glassFirstSeen.erase(it) : std::next(it);
                 }
                 // TCVR_GLASSCENSUS: every object that comes nearer than 40 cm, glass or not, summed over the second
                 for (const auto& kv : m_glassObj) {
@@ -810,9 +855,11 @@ public:
                 }
                 // THE GLASS, decided per OBJECT (pre-pass above): a polygon of a glued object goes onto the HUD plane (bit 28,
                 // PushNearEffects), a full-frame veil or a band keeps its own path (bits 25/26).
+                bool glassDrop = false;
                 if (m_nearFxOn && vc >= 3 && (q.rgb & 0x6000000u) == 0u) {
                     const auto go = m_glassObj.find(GlassKey(p, 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu)));
                     if (go != m_glassObj.end() && go->second.inPic && (go->second.ok || go->second.overlay)) q.rgb |= 0x10000000u;
+                    if (go != m_glassObj.end() && go->second.drop) { glassDrop = true; ++m_glassDropped; }
                 }
                 if (m_fireDiag > 0 && vc >= 3) {
                     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, zmin = 1e9f;
@@ -875,7 +922,7 @@ public:
                                     std::abs(q.clip_l - mainL) <= 2 && std::abs(q.clip_t - mainT) <= 2 &&
                                     std::abs(q.clip_r - mainR) <= 2 && std::abs(q.clip_b - mainB) <= 2;
                 // Untextured + translucent draws NOTHING on the board (draw_scanline_solid returns).
-                const bool invisible = q.textured == 0u && q.translucent != 0u;
+                const bool invisible = (q.textured == 0u && q.translucent != 0u) || glassDrop;
                 // Discard-free: opaque, no stipple, main camera (secondary views need the clip test).
                 const bool fast = !isGlass && isMain && (q.translucent == 0u || !RegionHasHoles(q));
                 if (m_primDiagOn && vc >= 3 && arcadexr::config::GetInt("m2.primDiag", 0) == 2) {
@@ -1049,6 +1096,10 @@ public:
                 const auto now = std::chrono::steady_clock::now();
                 if (m_a2wScale > 1e-6f && now - m_nearLogAt > std::chrono::seconds(1)) {
                     m_nearLogAt = now;
+                    if (m_glassDropped > 0) {   // TCVR_SCREENFX: the screen's impacts and effects not drawn this second (screenEffects=0)
+                        Log::Write(Log::Level::Info, Fmt("TCVR_SCREENFX %u polygone(s) d'impacts ou d'effets sur la vitre non dessines cette seconde", m_glassDropped));
+                        m_glassDropped = 0;
+                    }
                     if (!m_censusGlass.empty()) {   // objects nearer than 40 cm this second: glass or not, and why
                         std::string c;
                         for (const auto& kv : m_censusGlass)
@@ -1425,20 +1476,20 @@ public:
         // select). A first try measured how much of the screen the 3D covered: Virtua Cop's page is 3D to its blue
         // background, it covered it all. Without "still", Super GT's intro (a flat plate rushing at the camera, 9.5 to 0.6
         // units in 2 s) pulled the HUD along from 1.56 to 1.23 m: the very "avance et recule".
-        // (01/10 night, Guillaume: "pendant le select je vois d'abord le parallax sur les tiles et puis ça devient tout au même
-        // plan") The page took 1.5 s to be recognised: half a second to enter the "menu" state, then a second of stillness.
-        // Now no menu state is needed -- a flat main view with no horizon is the page's own evidence -- and 0.3 s of
-        // stillness. On every attract of the tour (Daytona, House of the Dead, Virtua Cop, Top Skater, Super GT) that rule
-        // finds one page only: Super GT's title plate, flat and still half a second at 1.56 m, nearer than the 2 m HUD.
+        // (01/10 night) A page recognised in 0.3 s without the "menu" state took Super GT's title plate -- shot with a long
+        // lens -- for a page: its HUD went onto the game camera's narrow frustum, "push select ou insert coin dans un tout
+        // petit pane carré ultra loin" (Guillaume, 02/10). Back to the "menu" state and a second of stillness; the residual
+        // parallax of Virtua Cop's STAGE SELECT ("la carte en dessous avec marqué le nom des modes bouge avec le casque") was
+        // the HUD put 10 % in front of the page (15.4 m on frames at 17.9 m): on a page it now lies ON the page (below).
         if (viewIndex == 0) {
             const auto now = std::chrono::steady_clock::now();
-            if (m_mainFlat && !m_haveHorizon) {
+            if (m_isMenuM1 && m_mainFlat && !m_haveHorizon) {
                 const float d = m_mainFlatZ;
                 if (m_pageDepth <= 0.0f || std::fabs(d - m_pageDepth) > 0.03f * m_pageDepth) { m_pageDepth = d; m_pageSince = now; }
             } else {
                 m_pageDepth = 0.0f;
             }
-            m_menuPage = m_pageDepth > 0.0f && now - m_pageSince >= std::chrono::milliseconds(300);
+            m_menuPage = m_pageDepth > 0.0f && now - m_pageSince >= std::chrono::seconds(1);
         }
         const bool menuPage = m_menuPage;
         const bool menuKeepsIso = (menuPage && HudIsoProfile()) ||
@@ -1486,6 +1537,8 @@ public:
             // Sega Rally keeps its validated placement (immersive.hudNear=0).
             if (hudFixed && m_a2wScale > 1e-6f) {
                 zh = hudFixedM / m_a2wScale;
+            } else if (hudNearRule && menuPage && m_pageDepth > 0.0f) {
+                zh = m_pageDepth;   // ON the page: its text and its 3D at one depth (no "subtitle" gap in front of it)
             } else if (hudNearRule) {
                 if (m_hudNear > 0.0f) {   // just in front of where that nearest thing is DRAWN (near comfort moves it off the eyes)
                     float nz = 0.9f * m_hudNear;
@@ -2664,7 +2717,13 @@ public:
     // The glass, per object (29/09): the board's model instance -- polygon data address, copy, view; a direct-data polygon
     // (address 0xffffffff) is its own object.
     struct GlassObj { float zmin = 1e9f, zmax = 0.0f; std::uint32_t polys = 0, translucent = 0, textured = 0, addr = 0; bool ok = true, inPic = false;
-                      std::uint32_t window = 0; bool mainView = true, overlay = false; };
+                      std::uint32_t window = 0; bool mainView = true, overlay = false;
+                      float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;   // its box on the board (pixels), for the shots
+                      bool drop = false; };                                     // a screen impact or effect, not drawn (screenEffects=0)
+    bool m_screenFxOn = true;          // immersive.screenEffects
+    // glass object -> (first frame seen, last frame seen): an impact appears with its shot (screenEffects=0)
+    std::unordered_map<std::uint64_t, std::pair<std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point>> m_glassFirstSeen;
+    std::uint32_t m_glassDropped = 0;  // polygons of screen impacts/effects not drawn this second (TCVR_SCREENFX)
     std::uint32_t m_overlayPolys = 0, m_overlayLogged = 0xffffffffu, m_overlayTick = 0;   // TCVR_OVERLAYWIN
     std::unordered_map<std::uint64_t, GlassObj> m_glassObj;
     static std::uint64_t GlassKey(const tcvr_m2_prim& p, std::uint32_t captureIndex) {
@@ -4739,7 +4798,7 @@ private:
     uint32_t m_fastIndexCount = 0;
     uint32_t m_leanIndexCount = 0;
     uint32_t m_viewDiagTick = 0;
-    struct MainLike { std::int32_t l, t, r, b, cx, cy; bool hud = false; };   // hud: the game's 3D HUD view, kept flat
+    struct MainLike { std::int32_t l, t, r, b, cx, cy; bool hud = false; float zmax = 0.0f; };   // hud: the game's 3D HUD view, kept flat
     std::uint32_t m_hudViewFrames = 0, m_hudViewTick = 0; int m_hudViewLast[3] = {0, 0, 0}; float m_hudViewCover = 0.0f;   // TCVR_HUDVIEW
     std::vector<MainLike> m_mainLike;   // full-screen, centred views of this frame (main camera candidates)   // [0, lean) lean shader; [lean, fast) full shader (no region image nor layer)
 
