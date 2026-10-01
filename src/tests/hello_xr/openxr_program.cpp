@@ -2261,7 +2261,14 @@ struct OpenXrProgram : IOpenXrProgram {
                 CHECK_XRCMD(xrReleaseSwapchainImage(mvSwapchain.handle, &mvRelease));
                 m_swapchainImages[mvSwapchain.handle]->ReleaseDepthSwapchainImage();
             }
-            if (swThisView && m_graphicsPlugin->ViewWroteSwDepth()) {
+            // Never on a session's first frames (01/10): Daytona USA, launched straight into its game, had 3D -- and so the
+            // space-warp info -- on the session's FIRST frame, submitted before the session was even FOCUSED. The headset's
+            // compositor crashed in that very millisecond (SIGSEGV, fault addr 0x40, thread OVR::TimeWarp of
+            // vrruntimeservice: spacewarp extrapolates from the previous frame, and there was none), and the runtime
+            // stayed broken until a reboot. Sega Rally never hit it: its 3D comes seconds into the session. Chained only
+            // once the session is focused and 30 plain frames were submitted.
+            if (i == 0) m_swFramesFocused = (m_sessionState == XR_SESSION_STATE_FOCUSED) ? m_swFramesFocused + 1 : 0;
+            if (swThisView && m_graphicsPlugin->ViewWroteSwDepth() && m_swFramesFocused > 30) {
                 const Swapchain mvSwapchain = m_motionVectorSwapchains[i];
 
                 XrCompositionLayerSpaceWarpInfoFB& sw = m_spaceWarpInfos[i];
@@ -2399,6 +2406,7 @@ struct OpenXrProgram : IOpenXrProgram {
     int64_t m_motionVectorSwapchainFormat{0};
     bool m_appswActive{false};
     std::vector<XrCompositionLayerSpaceWarpInfoFB> m_spaceWarpInfos;
+    uint64_t m_swFramesFocused = 0;   // frames submitted since the session became focused (space warp waits for 30)
     std::vector<XrView> m_views;
     int64_t m_colorSwapchainFormat{-1};
     int64_t m_depthSwapchainFormat{-1};
