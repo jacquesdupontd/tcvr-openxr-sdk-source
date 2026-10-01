@@ -336,6 +336,34 @@ public:
                     mainCx = keys[k].cx; mainCy = keys[k].cy;
                 }
             }
+            // A large view that holds most of the frame's polygons is the world, wherever its projection centre sits
+            // (01/10, Daytona USA: the attract race camera is centred 50 px below the screen centre, 2 px past the
+            // tolerance above -- the whole demo went to the flat secondary path, 13-28 ms of GPU at half resolution,
+            // and the scene recording mode flipped every few frames). Centring stays the rule for every other view:
+            // it is what keeps a 3D HUD element (a needle, a position digit, its own centre) flat.
+            // debug.tcvr.m2_mainDominant=0 restores the centred-only rule.
+            if (arcadexr::config::GetInt("m2.mainDominant", 1) != 0) {
+                for (unsigned k = 0; k < n; ++k) {
+                    const std::int64_t area = std::int64_t(keys[k].r - keys[k].l + 1) * std::int64_t(keys[k].b - keys[k].t + 1);
+                    if (area < halfScreen || keys[k].prims < 64u || std::uint64_t(keys[k].prims) * 2u < std::uint64_t(kn)) continue;
+                    if (keys[k].cx == mainCx && keys[k].cy == mainCy && keys[k].l == mainL && keys[k].t == mainT &&
+                        keys[k].r == mainR && keys[k].b == mainB) break;   // already the main view
+                    bestArea = area; bestPrims = keys[k].prims;
+                    mainL = keys[k].l; mainT = keys[k].t; mainR = keys[k].r; mainB = keys[k].b;
+                    mainCx = keys[k].cx; mainCy = keys[k].cy;
+                    ++m_mainPromoted;
+                    m_mainPromotedAt[0] = frame.crtc_xoffset + keys[k].cx; m_mainPromotedAt[1] = (384 - keys[k].cy) + frame.crtc_yoffset;
+                    m_mainPromotedAt[2] = int(keys[k].prims); m_mainPromotedAt[3] = int(kn);
+                    break;
+                }
+            }
+            if (++m_mainPromotedTick >= 300u) {   // every ~5 s of arcade frames, only when the rule changed something
+                if (m_mainPromoted > 0)
+                    Log::Write(Log::Level::Info, Fmt("TCVR_MAINVIEW %u/%u frames: an off-centre view holding most polygons made the main view "
+                                                     "(last: centre screen=%d,%d prims=%d of %d)", m_mainPromoted, m_mainPromotedTick,
+                                                     m_mainPromotedAt[0], m_mainPromotedAt[1], m_mainPromotedAt[2], m_mainPromotedAt[3]));
+                m_mainPromoted = 0; m_mainPromotedTick = 0;
+            }
         }
         m_haveMainView = bestArea > 0;
         if (!m_haveMainView) { mainL = mainT = mainR = mainB = -1; mainCx = mainCy = -100000; }
@@ -5345,6 +5373,7 @@ private:
     int32_t m_mainClip[4] = {-1, -1, -1, -1};
     int32_t m_mainCenter[2] = {-100000, -100000};
     bool m_haveMainView = false;
+    unsigned m_mainPromoted = 0, m_mainPromotedTick = 0; int m_mainPromotedAt[4] = {};   // TCVR_MAINVIEW
     float m_horizonGeo = -1.0f;
     bool m_haveHorizon = false;
     float m_mainZMax = 0.0f;   // deepest main-view vertex (menu or scene?)
