@@ -1578,9 +1578,26 @@ struct OpenXrProgram : IOpenXrProgram {
             std::snprintf(t, sizeof t, "%s_%02d", m_bugBurstTag.c_str(), 16 - m_bugBurst);
             arcadexr::config::Set("dump", t);   // taken by the renderer whenever its dump buffer is free
             if (--m_bugBurst == 0) {
-                m_bugPaused = true;
-                arcadexr::input::SetDigital("bug_pause", true);
-                Log::Write(Log::Level::Info, Fmt("TCVR_BUG burst %s done: emulation paused", m_bugBurstTag.c_str()));
+                if (m_benchBurstNoPause) {
+                    m_benchBurstNoPause = false;
+                    arcadexr::config::Set("dump", "0");
+                    Log::Write(Log::Level::Info, Fmt("TCVR_BUG bench burst %s done", m_bugBurstTag.c_str()));
+                } else {
+                    m_bugPaused = true;
+                    arcadexr::input::SetDigital("bug_pause", true);
+                    Log::Write(Log::Level::Info, Fmt("TCVR_BUG burst %s done: emulation paused", m_bugBurstTag.c_str()));
+                }
+            }
+        }
+        {   // Bench (01/10): debug.tcvr.bug_burst=<new tag> takes the same live burst of 16 frames AS DISPLAYED, without the
+            // pause at the end -- a defect seen in motion (Virtua Racing in a race) needs consecutive frames, in motion.
+            const std::string want = arcadexr::config::GetString("bug_burst", "");
+            if (!want.empty() && want != "\"\"" && want != m_benchBurstTag && m_bugBurst == 0) {
+                m_benchBurstTag = want;
+                m_bugBurstTag = want;
+                m_bugBurst = 16;
+                m_benchBurstNoPause = true;
+                Log::Write(Log::Level::Info, Fmt("TCVR_BUG bench burst %s: dump-%s_NN-vkL.ppm, no pause", want.c_str(), want.c_str()));
             }
         }
         if (bugCombo && !m_bugComboHeld && m_bugBurst == 0) {
@@ -2383,6 +2400,8 @@ struct OpenXrProgram : IOpenXrProgram {
     bool m_swDeltaOk{false};
     int m_bugBurst{0};
     std::string m_bugBurstTag;
+    std::string m_benchBurstTag;       // debug.tcvr.bug_burst: the last bench burst taken (a new value takes another)
+    bool m_benchBurstNoPause{false};
     unsigned m_bugCount{0};
     bool m_supportsDisplayRefreshRate{false};
     bool m_supportsFoveation{false};

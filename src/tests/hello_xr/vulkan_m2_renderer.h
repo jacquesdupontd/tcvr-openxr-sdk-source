@@ -1507,7 +1507,8 @@ public:
             ubo.uBright = m_flatMode ? 0.0f : arcadexr::config::GetFloat("bright", 0.0f);
             ubo.uLift = LiftExponent();
             ubo.uNearA2w = (m_nearOn && !m_flatMode) ? worldScale : 0.0f;
-            ubo.uNearMin = m_nearMinM; ubo.uNearStart = m_nearStartM; ubo.padNear = 0.0f;
+            ubo.uNearMin = m_nearMinM; ubo.uNearStart = m_nearStartM;
+            ubo.uClipNearW = m_flatMode ? 0.0f : m_depthNear;   // the projection's near, metres (see m2_vert.glsl)
             memcpy(ubo.uMvpCyc, nearCycMvp.m, sizeof(nearCycMvp.m));
             ubo.uCycArc[0] = nearCycArc.x; ubo.uCycArc[1] = nearCycArc.y; ubo.uCycArc[2] = nearCycArc.z; ubo.uCycArc[3] = 0.0f;
             ubo.uTestStage = arcadexr::config::GetInt("m2.stage", 0);

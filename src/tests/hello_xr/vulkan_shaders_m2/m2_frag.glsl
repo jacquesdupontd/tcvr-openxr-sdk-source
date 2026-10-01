@@ -59,7 +59,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uNearA2w;     // (vertex stage) near comfort
     float uNearMin;
     float uNearStart;
-    float padNear;
+    float uClipNearW;       // (vertex stage) immersive near clip plane
     mat4 uMvpCyc;
     vec4 uCycArc;
 };

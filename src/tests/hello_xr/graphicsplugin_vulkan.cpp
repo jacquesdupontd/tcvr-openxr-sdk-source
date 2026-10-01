@@ -1283,8 +1283,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             {
                 // Smooth motion (Model 1): draw every display refresh at 90 Hz, interpolated between arcade frames,
                 // instead of the 120 Hz cadence that shows each arcade frame twice.
+                // OFF by default since 01/10 evening (Guillaume in Virtua Racing: "ça clignotait dans tous les sens ... le sol
+                // tombait sous moi"): bursts of consecutive frames in a real race (scripts/banc/rafale_course.py) showed the
+                // camera jumping from frame to frame -- the car near, gone, far, a view from above -- with the blend on, and
+                // every frame coherent with it off, at the same place of the same race. Built on 24/09 for a 90 Hz display
+                // without space warp and a 5x5 draw grid; with 60 IMAGES, LISSAGE CASQUE and 49 cells it blends unrelated
+                // positions. Virtua Racing then shows its 3D at 30 frames a second, as the cabinet does; the headset smooths
+                // the head's motion. Profile immersive.smoothMotion=1 brings it back.
                 m_smoothOn = m_lastM2Drawn && m_m2Renderer.HasMotionIds() &&
-                             arcadexr::profiles::GetInt("immersive.smoothMotion", 1) != 0;
+                             arcadexr::profiles::GetInt("immersive.smoothMotion", 0) != 0;
                 // AppSW (26/09): 120 Hz, the app drawing at 60 and the headset synthesising the other refresh.
                 const bool appswGame = m_lastM2Drawn && m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 &&
                                        arcadexr::profiles::GetInt("appsw", 0) != 0;

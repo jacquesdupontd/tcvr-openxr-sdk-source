@@ -1,7 +1,7 @@
 #version 450
 // The cut-out colour pass tests depth EQUAL against its own pre-pass: positions must be bit-identical.
 invariant gl_Position;
-out float gl_ClipDistance[4];
+out float gl_ClipDistance[5];
 // APPSW_DEPTH (26/09): the same placement for everything (HUD and overlays on their plane, scenery at its distance),
 // but the REAL depth: the headset's reprojection needs distances, not the painter rank of the colour pass.
 // APPSW_MV keeps the colour pass's visibility (painter rank as depth): the vector of a pixel is the one of the polygon
@@ -58,7 +58,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uNearA2w;     // near comfort: metres per arcade unit, 0 = off (28/09)
     float uNearMin;     // near comfort: the nearest a point is drawn, metres
     float uNearStart;   // near comfort: distances below this are compressed, metres
-    float padNear;
+    float uClipNearW;       // immersive: a near clip plane at this distance (metres), 0 = none -- see main()
     mat4 uMvpCyc;       // near comfort: this eye's projection seen from the CYCLOPEAN eye (between the two)
     vec4 uCycArc;       // near comfort: the cyclopean eye in the board camera's space
 };
@@ -126,7 +126,7 @@ void main() {
 #ifdef APPSW_MV
     vMv = vec3(0.0);
 #endif
-    gl_ClipDistance[0] = 1.0; gl_ClipDistance[1] = 1.0; gl_ClipDistance[2] = 1.0; gl_ClipDistance[3] = 1.0;
+    gl_ClipDistance[0] = 1.0; gl_ClipDistance[1] = 1.0; gl_ClipDistance[2] = 1.0; gl_ClipDistance[3] = 1.0; gl_ClipDistance[4] = 1.0;
     vPrim = aPrim;
     {
         Prim q = prims[aPrim];
@@ -211,6 +211,12 @@ void main() {
 #endif
         gl_Position.z += uDepthBias * float(p.zsort) * gl_Position.w;
         if (DEPTH_ORDER_ON) gl_Position.z = ((float(aPrim) + 0.5) / max(uPrimCount, 1.0)) * gl_Position.w;
+        // A REAL near plane (01/10 evening, Virtua Racing: "le sol tombait sous moi"). With the painter's rank as depth,
+        // z = rank * w puts BOTH depth planes of the clipper on w = 0, the eye plane itself: a polygon passing behind the
+        // eye (the big road slab under the car) was cut AT the eye, where x/w is infinite -- the GPU dropped it in some
+        // frames and not others (bursts in a race: the road and the green median there and gone, the river under the
+        // bridge every other frame; with the real depth, stable). This plane cuts first, at the projection's near.
+        if (uClipNearW > 0.0) gl_ClipDistance[4] = gl_Position.w - uClipNearW;
         vParam = (uRaw != 0) ? vec3(aParamI.y / 8.0, aParamI.z / 8.0, z)
                              : vec3(aParamI.y * z, aParamI.z * z, z);
         return;
