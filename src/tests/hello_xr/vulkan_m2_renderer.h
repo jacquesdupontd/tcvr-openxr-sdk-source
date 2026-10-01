@@ -356,10 +356,12 @@ public:
             // resolution, and the scene recording mode flipped every few frames). Centring stays the rule for every
             // other view: it keeps a 3D HUD element (a needle, a position digit, its own centre) flat, and Sega Rally's
             // car select, four full-screen previews that differ only by their centre (15/09). What tells a world from
-            // an object shown to the camera is its depth SPAN: a road runs from under the camera to the horizon (95th
-            // percentile of the depths >= 8x the 5th), a car seen whole stays within ~2x. (The horizon's far-geometry
-            // test was tried first: it left up to 259 of 300 Daytona race frames flat, measured, and the picture flipped
-            // between immersive and flat.) debug.tcvr.m2_mainDominant=0 restores the centred-only rule.
+            // an object shown to the camera is its depth: a road runs from under the camera to the horizon, a car seen
+            // whole stays within ~2x of its own distance and near. A world here: the 95th percentile of the depths >= 3x
+            // the 5th, OR >= 100 units (Model 2 units are about metres: Sega Rally 1 unit = 1 m). Measured on the way:
+            // the horizon's far-geometry test left up to 259 of 300 Daytona race frames flat, a span of 8x still 24 of
+            // 300 -- the picture flipped between immersive and flat. TCVR_MAINVIEW logs the depths of the last promoted
+            // and the last refused view. debug.tcvr.m2_mainDominant=0 restores the centred-only rule.
             auto reachesFar = [&](const Key& key) {
                 if (!frame.raw_prim_count) return false;
                 std::vector<float> zs;
@@ -378,7 +380,10 @@ public:
                 const float z05 = zs[i05];
                 std::nth_element(zs.begin(), zs.begin() + i95, zs.end());
                 const float z95 = zs[i95];
-                return z95 >= 8.0f * std::max(z05, 1e-3f);
+                const bool world = z95 >= 3.0f * std::max(z05, 1e-3f) || z95 >= 100.0f;
+                float* at = world ? m_mainDepthPromoted : m_mainDepthRefused;
+                at[0] = z05; at[1] = z95;
+                return world;
             };
             if (arcadexr::config::GetInt("m2.mainDominant", 1) != 0) {
                 for (unsigned k = 0; k < n; ++k) {
@@ -399,9 +404,11 @@ public:
             if (++m_mainPromotedTick >= 300u) {   // every ~5 s of arcade frames, only when the rule looked at something
                 if (m_mainPromoted > 0 || m_mainRefusedFlat > 0)
                     Log::Write(Log::Level::Info, Fmt("TCVR_MAINVIEW %u/%u frames: an off-centre view holding most polygons made the main view "
-                                                     "(last: centre screen=%d,%d prims=%d of %d); %u frames left flat (no far geometry: an object, not a world)",
+                                                     "(last: centre screen=%d,%d prims=%d of %d, depth p5 %.1f p95 %.1f); %u frames left flat as an object "
+                                                     "(last refused: depth p5 %.1f p95 %.1f)",
                                                      m_mainPromoted, m_mainPromotedTick, m_mainPromotedAt[0], m_mainPromotedAt[1],
-                                                     m_mainPromotedAt[2], m_mainPromotedAt[3], m_mainRefusedFlat));
+                                                     m_mainPromotedAt[2], m_mainPromotedAt[3], m_mainDepthPromoted[0], m_mainDepthPromoted[1],
+                                                     m_mainRefusedFlat, m_mainDepthRefused[0], m_mainDepthRefused[1]));
                 m_mainPromoted = 0; m_mainRefusedFlat = 0; m_mainPromotedTick = 0;
             }
         }
@@ -5415,6 +5422,7 @@ private:
     int32_t m_mainCenter[2] = {-100000, -100000};
     bool m_haveMainView = false;
     unsigned m_mainPromoted = 0, m_mainRefusedFlat = 0, m_mainPromotedTick = 0; int m_mainPromotedAt[4] = {};   // TCVR_MAINVIEW
+    float m_mainDepthPromoted[2] = {}, m_mainDepthRefused[2] = {};   // depth p5/p95 of the last promoted / refused view
     float m_horizonGeo = -1.0f;
     bool m_haveHorizon = false;
     float m_mainZMax = 0.0f;   // deepest main-view vertex (menu or scene?)
