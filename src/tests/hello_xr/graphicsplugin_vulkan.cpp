@@ -1285,11 +1285,19 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 // instead of the 120 Hz cadence that shows each arcade frame twice.
                 m_smoothOn = m_lastM2Drawn && m_m2Renderer.HasMotionIds() &&
                              arcadexr::profiles::GetInt("immersive.smoothMotion", 1) != 0;
-                const bool m2Cadence = m_lastM2Drawn && !m_smoothOn && arcadexr::profiles::GetInt("immersive.cadence", 0) != 0;
-                // 120 Hz for the cadence, 90 Hz for smooth motion (drawn every refresh), 90 when leaving either.
                 // AppSW (26/09): 120 Hz, the app drawing at 60 and the headset synthesising the other refresh.
                 const bool appswGame = m_lastM2Drawn && m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 &&
                                        arcadexr::profiles::GetInt("appsw", 0) != 0;
+                // NO CADENCE UNDER AppSW (01/10): the cadence re-submits the last layer when the game has no new frame, and
+                // that layer carries no space-warp images. Mixed into the stream, those plain frames threw the compositor out
+                // of half-rate mode for good (Virtua Cop, measured live on one attract run: 61 app frames a second, 210 early,
+                // 31 stale per 20 s while it held; 73-76, 2900-3200 early, 400-560 stale, 17 % of the arcade frames never
+                // shown once it had left -- Guillaume's "lag à fond"; after: 61, 14-33, 0-1, even after switching settings).
+                // Sega Rally, validated, has no cadence: it held. The System 22 cadence (Time Crisis II, no space warp of
+                // its own) is untouched: drawing every call there took it to 70-80 app frames and 39-57 stale a second.
+                const bool m2Cadence = m_lastM2Drawn && !m_smoothOn && !appswGame &&
+                                       arcadexr::profiles::GetInt("immersive.cadence", 0) != 0;
+                // 120 Hz for the cadence, 90 Hz for smooth motion (drawn every refresh), 90 when leaving either.
                 // The AppSW-only CPU work (camera delta, motion vectors) only for a game that uses AppSW now (26/09: it
                 // ran in every game once the extension was on -- House of the Dead's frame preparation paid for it).
                 m_m2Renderer.SetCameraDeltaWanted(appswGame);
@@ -1944,15 +1952,6 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // (no 2-1-2-1 judder on 90 Hz, and an alternating 30 Hz effect stays regular) and each drawn frame has
     // two refreshes of GPU time.
     bool RenderThisFrame() override {
-        // LISSAGE CASQUE (AppSW): a frame for EVERY call. The runtime runs the app at half the refresh rate only while the
-        // frames it gets carry their space-warp images; the cadence's re-submitted last layer carries none. Mixed into the
-        // stream, those plain frames threw the compositor out of half-rate mode for good (Virtua Cop, 01/10, measured live
-        // on one attract run: 61 app frames a second, 210 early, 31 stale per 20 s while it held; 73-76, 2900-3200 early,
-        // 400-560 stale, 17 % of the arcade frames never shown once it had left -- Guillaume's "lag à fond"). Sega Rally,
-        // validated, never re-submitted (cadence 0): it held. Under AppSW a frame without new arcade image is drawn again.
-        if (m_appswWanted && arcadexr::config::GetInt("appsw_on", 1) != 0 && arcadexr::profiles::GetInt("appsw", 1) != 0 &&
-            arcadexr::config::GetInt("appsw_cadenceResubmit", 0) == 0)
-            return true;
         if (m_m2CadenceActive && !m_cadenceActive) {
             if (arcadexr::config::GetInt("m2.freeze", 0) != 0) return true;
             const tcvr_m2_frame* f = arcadexr::hardware::sega_model2::AcquireScene();
