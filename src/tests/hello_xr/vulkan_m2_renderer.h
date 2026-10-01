@@ -1077,6 +1077,16 @@ public:
         if (metresPerUnit > 0.0f) baseScale = metresPerUnit;
         if (autoScale && m_camHeightUnits > 1e-3f) baseScale = std::max(0.005f, std::min(5.0f, eyeHeight / m_camHeightUnits));
         const float worldScale = baseScale * std::max(0.1f, std::min(10.0f, arcadexr::profiles::GetFloat("immersive.worldScaleMul", 1.0f)));
+        {   // TCVR_M2SCALE (01/10, the one-pass port): is the world the right size? The game camera's height above its floor,
+            // in its units and in metres at this scale -- a chase camera 1.5-4 m, a bumper or cockpit one ~1 m.
+            static std::chrono::steady_clock::time_point s_scaleLog{};
+            const auto nowS = std::chrono::steady_clock::now();
+            if (m_camHeightUnits > 1e-3f && nowS - s_scaleLog > std::chrono::seconds(5)) {
+                s_scaleLog = nowS;
+                Log::Write(Log::Level::Info, Fmt("TCVR_M2SCALE camera %.2f units above its floor = %.2f m (metresPerUnit %.2f, autoScale %d, scale %.5f m/unit)",
+                                                 m_camHeightUnits, m_camHeightUnits * worldScale, metresPerUnit, int(autoScale), worldScale));
+            }
+        }
         const arcadexr::gun::Vec3 camera{screen.center.x + screen.normal.x * distance,
                                          screen.center.y + screen.normal.y * distance,
                                          screen.center.z + screen.normal.z * distance};
