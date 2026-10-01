@@ -281,14 +281,23 @@ public:
             // seconds while the app went on drawing the race it had before, frozen, 1440 polygons -- the title's white
             // page seen behind a stopped race read as a white sky with a black wedge). No 3D now: built, and empty, so
             // the immersive pass declines (m_opaqueIndexCount 0) and the 2D screen is shown as the board shows it.
+            // Only once the board has stayed empty for 6 frames (0.1 s): The House of the Dead and Top Skater publish a
+            // LONE empty frame every few seconds (measured in their attract, 01/10), and the whole world vanishing for
+            // one frame is a flash in a headset. A real 2D screen lasts seconds (Sega Rally 4 s, Daytona's title 15).
+            if (++m_emptyRun < 6) {
+                ++m_emptyLoneKept;
+                return;   // m_built false: the last scene stays, as before
+            }
             m_rawPrims.clear(); m_rawVerts.clear(); m_rawPrimOfVertex.clear(); m_rawIdx.clear();
             m_leanIndexCount = m_fastIndexCount = m_secIndexStart = m_opaqueIndexCount = m_glassIndexCount = 0;
             m_haveMainView = false; m_mainLike.clear();
             m_built = true;
             if (++m_emptyScenes == 1 || (m_emptyScenes % 600u) == 0u)
-                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK empty scene published by the board: no 3D drawn (%u so far)", m_emptyScenes));
+                Log::Write(Log::Level::Info, Fmt("TCVR_M2VK empty scene published by the board: no 3D drawn (%u so far; %u empty frames shorter "
+                                                 "than 6 kept the last scene)", m_emptyScenes, m_emptyLoneKept));
             return;
         }
+        m_emptyRun = 0;
         m_built = true;
         m_overlayOn = arcadexr::profiles::GetInt("immersive.screenOverlay", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
         m_nearFxOn = !m_flatMode && arcadexr::profiles::GetInt("immersive.nearEffects", arcadexr::profiles::IsDriving() ? 0 : 1) != 0;
@@ -4595,6 +4604,7 @@ private:
     uint32_t m_lastEyePixels = 0;
     bool m_built = false;
     unsigned m_emptyScenes = 0;   // explicitly empty scenes published by the board (TCVR_M2VK empty scene)
+    unsigned m_emptyRun = 0, m_emptyLoneKept = 0;   // consecutive empty frames; empty frames in runs shorter than 6
     int m_lastRegionsReset = 0;
     int m_lastRb = 0, m_rbWaitFrames = 0;
     bool m_rbPending = false, m_rbPendingNext = false;
