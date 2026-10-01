@@ -1301,10 +1301,19 @@ public:
         // distance ou de panneau"; UEVR's "UI distance", 3D Vision's constant HUD depth): hud.distance > 0 (metres) puts the
         // whole front 2D layer -- a menu's page with it, the screen overlays and secondary views, the panel -- at that one
         // constant distance: no depth following the scene, no nearest rule, no per-element depth. Live
-        // (debug.tcvr.hud_distance). 0 = adaptive (default). Tested at 50 m on 28/09: squint at once, "il n'a rien de 50 m"
-        // -- measured at 50 m (same left/right shift as the far trees), but painted OVER nearer 3D the brain cannot place it.
-        // A 2D layer must never be behind what it covers: the nearest rule below stays the method.
-        const float hudFixedM = arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 0.0f));
+        // (debug.tcvr.hud_distance). Tested at 50 m on 28/09: squint at once, "il n'a rien de 50 m" -- measured at 50 m
+        // (same left/right shift as the far trees), but painted OVER nearer 3D the brain cannot place it.
+        // EVERY GAME AT 2 M (01/10, Guillaume: "les jeux n'ont pas les mêmes profondeurs de HUD, je pensais que t'avais fait
+        // ISO de Time Crisis II lorsqu'on s'est dit que c'était bon"): the System 22's fixed plane, validated on Time Crisis
+        // II on 29/09 ("je t'ai dit de laisser fixe les trucs"), is now every game's default -- the adaptive planes (scene
+        // depth, nearest rule) made each game's HUD sit at its own depth, and move. 0 = the adaptive rules below.
+        // Exception: a MENU screen of a game whose menus were validated in ISO (immersive.hudNear=0: Sega Rally's car select)
+        // keeps its page on its boxes at the depth of its 3D -- at 2 m it sat "right in front of the eyes" (26/09), the
+        // cars far behind it. The games that flip between menu and scene (House of the Dead) keep the 2 m plane throughout.
+        const bool hudNearRule = arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
+        const bool menuKeepsIso = m_isMenuM1 && MenuIso() && !hudNearRule;
+        const float hudFixedM = menuKeepsIso ? 0.0f
+                              : arcadexr::config::GetFloat("hud.distance", arcadexr::profiles::GetFloat("hud.distance", 2.0f));
         const bool hudFixed = hudFixedM > 0.0f && !m_flatMode;
         const float hudDistance = hudFixed ? std::max(0.5f, hudFixedM) : std::max(0.5f, arcadexr::config::GetFloat("m2.hudDistance", 2.0f));
         const float hudK = hudDistance / distance;
@@ -1328,7 +1337,6 @@ public:
         // far and large as on 25/09). Brought to the 2 m HUD plane it sat "right in front of the eyes"; boxes at the
         // game depth with the page left at 2 m, it was a parallax.
         const bool hudIso = !m_flatMode && m_haveMainView && (m_isMenuM1 ? MenuIso() : m_sceneDepth > 0.0f) && HudIsoProfile();
-        const bool hudNearRule = arcadexr::profiles::GetInt("immersive.hudNear", arcadexr::profiles::CurrentGame() == "srallyc" ? 0 : 1) != 0;
         // Before any "near" rule. Every game but Sega Rally: the scene's depth in "menu" state too -- House of the Dead
         // flips menu/scene all the time and the jump to the farthest vertex made everything on this plane jump (28/09).
         const float hudSceneZ = std::max(1.0f, (m_isMenuM1 && !hudNearRule) ? m_mainZMax
