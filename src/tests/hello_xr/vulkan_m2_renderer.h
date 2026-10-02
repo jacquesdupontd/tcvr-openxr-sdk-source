@@ -278,6 +278,14 @@ public:
     // for ElSemi's Model 2 Emulator: a texture is replaced only when its ID1 (header) AND its ID2 (crc32 of its content in
     // the raw texture RAM, as the emulator computes it) are in the pack -- never by place alone (the HD try of 19/09
     // plastered wrong textures when a course loaded its textures elsewhere). Off unless immersive.texPack (menu TEXTURES).
+    // The projection's near plane in the headset, metres (immersive.near per game, game_profile.cpp; m2.immersiveNear where no
+    // profile says anything). 02/10: at 0.25 m Daytona's low attract cameras, a few centimetres above the banked road, had
+    // the whole bottom of the picture nearer than the plane: the road cut by a straight line and the 2D back layer seen
+    // under it ("on voit encore ce fond devant la route"). 0.10 m already fills it; 0.05 m on Model 1/2, Sega Rally 0.25.
+    float ImmersiveNearM() const {
+        return arcadexr::profiles::GetFloat("immersive.near", arcadexr::config::GetFloat("m2.immersiveNear", 0.25f));
+    }
+
     void UpdateTexPack() {
         const std::string game = arcadexr::profiles::CurrentGame();
         if (game != m_packGame) {
@@ -1522,7 +1530,7 @@ public:
         if (!m_flatMode && viewIndex == 0) {
             // Lightgun (Aim): the arcade-to-world transform of the image the player sees.
             m_aimXf = {true, camera, screen.right, upP, normalP, worldScale,
-                       std::max(0.002f, std::min(1.0f, arcadexr::config::GetFloat("m2.immersiveNear", 0.25f)))};
+                       std::max(0.002f, std::min(1.0f, ImmersiveNearM()))};
         }
         XrMatrix4x4f arcadeToWorld{};
         arcadeToWorld.m[0] = screen.right.x * worldScale;  arcadeToWorld.m[1] = screen.right.y * worldScale;  arcadeToWorld.m[2] = screen.right.z * worldScale;
@@ -1531,7 +1539,7 @@ public:
         arcadeToWorld.m[12] = camera.x; arcadeToWorld.m[13] = camera.y; arcadeToWorld.m[14] = camera.z; arcadeToWorld.m[15] = 1.0f;
 
         const float farMetres = std::max(200.0f, arcadexr::config::GetFloat("immersive.far", 20000.0f));
-        const float nearMetres = std::max(0.002f, std::min(1.0f, arcadexr::config::GetFloat("m2.immersiveNear", 0.25f)));
+        const float nearMetres = std::max(0.002f, std::min(1.0f, ImmersiveNearM()));
         if (viewIndex == 0 && !m_flatMode) {
             m_a2wRight = screen.right; m_a2wUp = upP; m_a2wNormal = normalP; m_a2wCam = camera; m_a2wScale = worldScale;
             m_a2wValid = true; m_depthNear = nearMetres; m_depthFar = farMetres;
