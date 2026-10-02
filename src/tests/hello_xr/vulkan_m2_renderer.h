@@ -352,8 +352,13 @@ public:
                 m_packLoader.Request(key, e->path, cd == 0);
                 m_packState[key] = 1;
             } else if (state == 2) {   // decoded (kept in memory: the regions are cleared at every course load)
+                // At most half the frame's staging for HD images: the board's own regions of this frame come first.
                 const auto im = m_packImages.find(key);
-                if (im != m_packImages.end()) slot = m_regions.SlotPixels(key, im->second.w, im->second.h, im->second.px.data());
+                const size_t bytes = (im != m_packImages.end()) ? im->second.px.size() : 0;
+                if (bytes != 0 && m_packFrameBytes + bytes <= M2RegionTextures::kHalfBytes / 2) {
+                    slot = m_regions.SlotPixels(key, im->second.w, im->second.h, im->second.px.data());
+                    if (slot != M2RegionTextures::kNone) m_packFrameBytes += bytes;
+                }
             }
         }
         if (slot != M2RegionTextures::kNone) { code = uint32_t(cd); ++m_packStat.drawn; }
@@ -365,6 +370,7 @@ public:
         if (!m_initialized || frame.geometry_unchanged != 0u) return;
         UpdateTexPack();
         m_packStat = {};
+        m_packFrameBytes = 0;
         const bool haveClipped = frame.prim_count != 0 && frame.vertex_count != 0;
         const bool haveRaw = frame.raw_prim_count != 0 && frame.raw_vertex_count != 0;
         if (!haveClipped && !haveRaw) {
@@ -5724,6 +5730,7 @@ private:
     std::unordered_map<uint64_t, uint8_t> m_packState;              // 1 decoding, 2 decoded, 4 unreadable
     std::unordered_map<uint64_t, arcadexr::texpack::Image> m_packImages;   // decoded, kept for the next course load
     size_t m_packDecodedBytes = 0;
+    size_t m_packFrameBytes = 0;   // HD image bytes sent this frame (capped, see TexPackSlot)
     uint32_t m_packFailed = 0;
     struct PackStat { uint32_t textured = 0, id1 = 0, matched = 0, drawn = 0, kept = 0; } m_packStat;   // this frame
     arcadexr::texpack::Loader m_packLoader;   // last: its thread stops before the maps it fills go away
