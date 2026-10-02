@@ -1609,7 +1609,10 @@ public:
         const float hudK = hudDistance / distance;
         const float hudLiftAt10 = arcadexr::config::GetFloat("m2.hudLift", 1.8f);
         const float hudLift = hudLiftAt10 * hudDistance / 10.0f;
-        const float backDistance = std::max(0.5f, arcadexr::config::GetFloat("m2.backDistance", 10.0f));
+        // The game's 2D back layer: per game (immersive.backDistance, game_profile.cpp: 300 m on Model 1/2, Sega Rally 10 m),
+        // m2.backDistance only where no profile says anything.
+        const float backDistance = std::max(0.5f, arcadexr::profiles::GetFloat("immersive.backDistance",
+                                                                               arcadexr::config::GetFloat("m2.backDistance", 10.0f)));
         const arcadexr::gun::Vec3 hudCenter{camera.x - screen.normal.x * hudDistance + screen.up.x * hudLift,
                                             camera.y - screen.normal.y * hudDistance + screen.up.y * hudLift,
                                             camera.z - screen.normal.z * hudDistance + screen.up.z * hudLift};
