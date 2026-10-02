@@ -1388,6 +1388,15 @@ public:
                                              st, (unsigned long long)m_regions.StaleTotal(), m_regions.m_lastStale[0], m_regions.m_lastStale[1],
                                              m_regions.m_lastStale[2], m_regions.m_lastStale[3], m_regions.m_lastStale[4], m_partialTexLog));
         m_regions.ProcessRefills(m_sheetCpu);   // regions whose texels a partial update rewrote
+        // The pool full last frame (TakeFull): rebuild, as for a course load -- at most every 2 s, so a scene that
+        // alone needs more than the pool does not rebuild every frame.
+        ++m_poolFrames;
+        m_regions.SetLimit(uint32_t(arcadexr::config::GetInt("m2.poolLimit", int(M2RegionTextures::kMaxSlots))));
+        if (m_regions.TakeFull() && m_poolFrames - m_lastFullRebuild > 120u) {
+            m_lastFullRebuild = m_poolFrames;
+            m_regionsStale = true;
+            Log::Write(Log::Level::Info, Fmt("TCVR_M2VK region pool full (%u HD images): rebuilt", m_regions.HdCount()));
+        }
         const bool texChanged = m_regionsStale;
         if (texChanged && !reuse) {
             m_regionsStale = false;
@@ -5747,6 +5756,7 @@ private:
     struct PackStat { uint32_t textured = 0, id1 = 0, matched = 0, drawn = 0, kept = 0; } m_packStat;   // this frame
     arcadexr::texpack::Loader m_packLoader;   // last: its thread stops before the maps it fills go away
     bool m_regionsStale = false;
+    uint32_t m_poolFrames = 0, m_lastFullRebuild = 0;   // region pool full -> rebuild, at most every 120 frames
     int m_lastTexReupload = 0;            // a full upload happened: regions to rebuild on the next built frame
     uint32_t m_partialTexLog = 0;
     bool m_texturesUploaded = false;

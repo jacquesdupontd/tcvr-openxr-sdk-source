@@ -123,6 +123,7 @@ public:
         m_resetDescriptors = true;
         m_stagingUsed = 0;
         m_lutPending = false;
+        m_full = false;
     }
 
     // Slot of a region, creating it (this frame, within the staging budget) if new.
@@ -132,7 +133,7 @@ public:
         const uint64_t key = (uint64_t(sheet & 1) << 60) | (uint64_t(ox) << 44) | (uint64_t(oy) << 28) | (uint64_t(w) << 14) | uint64_t(h);
         auto it = m_map.find(key);
         if (it != m_map.end()) return it->second;
-        if (m_slots.size() >= kMaxSlots) return kNone;
+        if (m_slots.size() >= m_limit) { m_full = true; return kNone; }
         const size_t bytes = size_t(w) * h * 4;
         if (m_stagingUsed + bytes > kHalfBytes) return kNone;  // next frame
         // Texels of the region, through the board's fold (x >= 1024 -> other half).
@@ -176,7 +177,8 @@ public:
     uint32_t SlotPixels(uint64_t key, uint32_t w, uint32_t h, const uint8_t* rgba) {
         const auto it = m_hdMap.find(key);
         if (it != m_hdMap.end()) return it->second;
-        if (w < 1 || h < 1 || w > 4096 || h > 4096 || m_slots.size() >= kMaxSlots) return kNone;
+        if (w < 1 || h < 1 || w > 4096 || h > 4096) return kNone;
+        if (m_slots.size() >= m_limit) { m_full = true; return kNone; }
         const size_t bytes = size_t(w) * h * 4;
         if (bytes > kHalfBytes || m_stagingUsed + bytes > kHalfBytes) return kNone;
         std::memcpy(m_stagingPtr + Base() + m_stagingUsed, rgba, bytes);
@@ -192,6 +194,11 @@ public:
         m_stagingUsed += (bytes + 255) & ~size_t(255);
         return slot;
     }
+    // A slot or a layer refused because the pool was full (02/10, Daytona's circuit select: 229 HD images kept from the
+    // attract and the race filled the 512 slots, the three course maps got none and showed as flat colours, at random
+    // -- it depended on what had been shown before). The renderer rebuilds everything on the next frame.
+    void SetLimit(uint32_t n) { m_limit = std::min<uint32_t>(std::max<uint32_t>(n, 16u), kMaxSlots); }   // test: debug.tcvr.m2_poolLimit
+    bool TakeFull() { const bool f = m_full; m_full = false; return f; }
     uint32_t HdCount() const { return uint32_t(m_hdMap.size()); }
     size_t HdBytes() const { return m_hdBytes; }
 
@@ -210,7 +217,8 @@ public:
         const uint64_t key = (uint64_t(sheet & 1) << 60) | (uint64_t(ox) << 44) | (uint64_t(oy) << 28) | (uint64_t(w) << 14) | uint64_t(h);
         auto it = m_layerMap.find(key);
         if (it != m_layerMap.end()) return it->second;
-        if (m_layerCount >= kMaxLayers || m_array.image == VK_NULL_HANDLE) return kNone;
+        if (m_array.image == VK_NULL_HANDLE) return kNone;
+        if (m_layerCount >= kMaxLayers) { m_full = true; return kNone; }
         const size_t bytes = size_t(kLayerSize) * kLayerSize * 4;
         if (m_stagingUsed + bytes > kHalfBytes) return kNone;
         uint8_t* dst = m_stagingPtr + Base() + m_stagingUsed;
@@ -689,6 +697,8 @@ private:
     std::vector<Entry> m_slots;
     std::unordered_map<uint64_t, uint32_t> m_map;
     std::unordered_map<uint64_t, uint32_t> m_hdMap;   // HD pack images: key -> slot (outside m_map, see SlotPixels)
+    bool m_full = false;                             // see TakeFull
+    uint32_t m_limit = kMaxSlots;
     size_t m_hdBytes = 0;                             // their GPU size, mips included
     std::vector<Pending> m_pending;
     std::vector<uint32_t> m_dirtySlots;
