@@ -1910,7 +1910,8 @@ public:
                 backPc.uKeyZero = 0;
                 backPc.uUvScaleX = m_layerUvScaleX[1];
                 backPc.uClipRow = clipRow;
-                backPc.uNoTile = m_backNoTile ? 1.0f : 0.0f;
+                backPc.uNoTile = m_backNoTile ? 1.0f
+                               : (arcadexr::profiles::GetInt("immersive.backRowsOnly", 0) != 0 ? 2.0f : 0.0f);   // plane_frag.glsl
     
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (bgFar ? m_planePipelineFar : m_planePipeline));
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_planePipelineLayout, 0, 1, &m_layerDescSet[1], 0, nullptr);

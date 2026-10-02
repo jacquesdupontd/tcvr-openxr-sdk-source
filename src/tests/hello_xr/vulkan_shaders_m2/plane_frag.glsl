@@ -14,7 +14,7 @@ layout(push_constant) uniform PlanePushConstants {
     int uKeyZero;
     float uUvScaleX;   // 496/512: only the arcade's columns (the texture's last 16 are empty; they drew black bands, 23/09)
     float uClipRow;    // > 0: back layer cut below this board row, the ground colour shows there (gun games)
-    float uNoTile;     // 1: a menu page: inside the arcade frame only
+    float uNoTile;     // 1: a menu page: inside the arcade frame only; 2: the board's rows only (above/below: the void's sky/ground)
     float uLift;       // brightness curve exponent (menu LUMINOSITE)
     float uZNear;      // nearest depth marched (arcade units)
     vec4 uEyeArc;      // eye in the board camera's space; w = depth of uHudMvp's plane (0 = off)
@@ -82,7 +82,11 @@ void main_body() {
         if (ux < uProj.x || vy < uProj.y || ux > uProj.z || vy > uProj.w) discard;
     }
     bool inside = abs(u) <= 0.5 && abs(v) <= 0.5;
-    if ((uKeyZero != 0 || uNoTile > 0.5) && !inside) discard;
+    if ((uKeyZero != 0 || (uNoTile > 0.5 && uNoTile < 1.5)) && !inside) discard;
+    // 02/10 (Daytona, "un gros bug de textures dans le ciel"): the headset sees above and below the board's picture; clamped,
+    // its top / bottom row was smeared there in vertical stripes (mountains, clouds). Not drawn: the void pass shows the sky
+    // colour above the horizon and the ground below, as an empty board row would.
+    if (uNoTile > 1.5 && abs(v) > 0.5) discard;
     // Back layer beyond the arcade frame: repeated MIRRORED (identity inside the frame), so the edges meet
     // without a seam; a plain repeat put the image's left edge against its right one (a hard line in the sky).
     float t = u + 0.5, m = fract(t * 0.5) * 2.0;
