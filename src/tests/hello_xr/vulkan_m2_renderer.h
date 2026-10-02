@@ -17,6 +17,11 @@
 #include "virtual_screen.h"
 #include "m2_pipeline_types.h"
 #include "vulkan_m2_regions.h"
+#include "m2_texpack_loader.h"   // HD texture packs (02/10/2026)
+
+// The Prim struct of m2_vert.glsl / m2_frag.glsl reads tcvr_m2_prim straight from the storage buffer (std430, 37
+// 32-bit fields): a field added on one side only shifts every polygon after the first.
+static_assert(sizeof(tcvr_m2_prim) == 37 * 4, "tcvr_m2_prim must match struct Prim in vulkan_shaders_m2/m2_*.glsl");
 #include "aim_state.h"
 
 #include "m2_vert_spv.h"
@@ -269,9 +274,97 @@ public:
     // may still be reading, so the plugin runs it BEFORE waiting for the previous frame's fence:
     // it overlaps the GPU instead of leaving it idle (measured 22/09: wait 9 ms + prepare 3.7 ms
     // back to back -> a 14 ms period, 71 fps, with the GPU only 73% busy).
+    // ---- HD texture packs (02/10/2026, m2_texpack.h / m2_texpack_loader.h). files/texpacks/<game>/<game>.pat, written
+    // for ElSemi's Model 2 Emulator: a texture is replaced only when its ID1 (header) AND its ID2 (crc32 of its content in
+    // the raw texture RAM, as the emulator computes it) are in the pack -- never by place alone (the HD try of 19/09
+    // plastered wrong textures when a course loaded its textures elsewhere). Off unless immersive.texPack (menu TEXTURES).
+    void UpdateTexPack() {
+        const std::string game = arcadexr::profiles::CurrentGame();
+        if (game != m_packGame) {
+            m_packGame = game;
+            m_packLoader.Stop();
+            m_packState.clear(); m_packImages.clear(); m_id2Cache.clear();
+            m_packDecodedBytes = 0; m_packFailed = 0; m_packOutOfRange = -1;
+            const std::string dir = arcadexr::config::ExternalDirectory() + "/texpacks/" + game;
+            m_packLoaded = m_pack.Load(dir, game);
+            if (m_packLoaded) m_packModes.Load(dir);
+            if (m_packLoaded)
+                Log::Write(Log::Level::Info, Fmt("TCVR_TEXPACK %s: %s | colour formats:%s", game.c_str(), m_pack.Report().c_str(),
+                                                 m_packModes.Report().c_str()));
+            else
+                Log::Write(Log::Level::Info, Fmt("TCVR_TEXPACK %s: no pack (%s/%s.pat)", game.c_str(), dir.c_str(), game.c_str()));
+        }
+        m_packOn = m_packLoaded && arcadexr::profiles::GetInt("immersive.texPack", 0) != 0;
+        if (!m_packLoaded) return;
+        const int oor = arcadexr::profiles::GetInt("immersive.texPackOutOfRange", 0);   // the pack's "14": see m2_texpack_loader.h
+        if (oor != m_packOutOfRange) { m_packOutOfRange = oor; m_packModes.SetOutOfRange(oor); }
+        m_packLoader.Collect([this](uint64_t key, arcadexr::texpack::Image&& im) {
+            if (!im.error.empty() || im.px.empty()) {
+                m_packState[key] = 4; ++m_packFailed;
+                Log::Write(Log::Level::Warning, Fmt("TCVR_TEXPACK cannot read %s: %s", im.path.c_str(), im.error.c_str()));
+                return;
+            }
+            m_packDecodedBytes += im.px.size();
+            m_packImages[key] = std::move(im);
+            m_packState[key] = 2;
+        });
+        static unsigned s_packLog = 0;
+        if ((s_packLog++ % 300u) == 0u)
+            Log::Write(Log::Level::Info, Fmt("TCVR_TEXPACK on=%d textured=%u id1InPack=%u id1+id2=%u drawnHD=%u shaderUnread=%u | "
+                                             "decoding=%zu decoded=%zu (%.0f MB CPU) failed=%u | GPU images=%u (%.0f MB)",
+                                             int(m_packOn), m_packStat.textured, m_packStat.id1, m_packStat.matched, m_packStat.drawn,
+                                             m_packStat.kept, m_packLoader.Pending(), m_packImages.size(),
+                                             double(m_packDecodedBytes) / 1048576.0, m_packFailed, m_regions.HdCount(),
+                                             double(m_regions.HdBytes()) / 1048576.0));
+    }
+
+    // The replacement image's slot for this polygon, or kNone (then the board's own texture, unchanged). code = the
+    // shader's colour code (0 = grey through the board's colour chain, see uTexPack).
+    uint32_t TexPackSlot(const tcvr_m2_prim& q, uint32_t& code) {
+        code = 0;
+        ++m_packStat.textured;
+        const uint32_t id1 = arcadexr::texpack::Id1(q.texheader0, q.texheader2);
+        if (!m_pack.HasId1(id1)) return M2RegionTextures::kNone;
+        ++m_packStat.id1;
+        // ID2 depends only on the size code, the place and the sheet of the header (and the texture RAM)
+        const uint32_t ck = ((q.texheader0 & 0x3fu) << 16) | (q.texheader2 & 0x17ffu);
+        uint32_t id2 = 0;
+        const auto c = m_id2Cache.find(ck);
+        if (c != m_id2Cache.end()) {
+            id2 = c->second;
+        } else {
+            const std::vector<uint32_t>& sh = m_texShadow[(q.texheader2 & 0x1000u) ? 1 : 0];
+            if (sh.empty()) return M2RegionTextures::kNone;   // nothing uploaded yet: decide on the next frame
+            id2 = arcadexr::texpack::Id2(q.texheader0, q.texheader2, reinterpret_cast<const uint8_t*>(sh.data()), sh.size() * 4u);
+            m_id2Cache.emplace(ck, id2);
+        }
+        const arcadexr::texpack::Entry* e = m_pack.Find(id1, id2);
+        if (!e) return M2RegionTextures::kNone;
+        ++m_packStat.matched;
+        const int cd = m_packModes.Code(e->format);
+        if (cd < 0 || e->path.empty()) { ++m_packStat.kept; return M2RegionTextures::kNone; }
+        const uint64_t key = (1ull << 63) | (uint64_t(id1) << 32) | uint64_t(id2);
+        uint32_t slot = m_regions.HdSlot(key);
+        if (slot == M2RegionTextures::kNone) {
+            const auto st = m_packState.find(key);
+            const uint8_t state = (st == m_packState.end()) ? 0 : st->second;
+            if (state == 0) {
+                m_packLoader.Request(key, e->path, cd == 0);
+                m_packState[key] = 1;
+            } else if (state == 2) {   // decoded (kept in memory: the regions are cleared at every course load)
+                const auto im = m_packImages.find(key);
+                if (im != m_packImages.end()) slot = m_regions.SlotPixels(key, im->second.w, im->second.h, im->second.px.data());
+            }
+        }
+        if (slot != M2RegionTextures::kNone) { code = uint32_t(cd); ++m_packStat.drawn; }
+        return slot;
+    }
+
     void BuildFrame(const tcvr_m2_frame& frame) {
         m_built = false;
         if (!m_initialized || frame.geometry_unchanged != 0u) return;
+        UpdateTexPack();
+        m_packStat = {};
         const bool haveClipped = frame.prim_count != 0 && frame.vertex_count != 0;
         const bool haveRaw = frame.raw_prim_count != 0 && frame.raw_vertex_count != 0;
         if (!haveClipped && !haveRaw) {
@@ -878,19 +971,28 @@ public:
                 m_rawPrimSrc[k] = 0xffffu - uint32_t(m_rawKeys[k] & 0xffffu);   // capture index: its motion matrix
                 {
                     uint32_t slot = M2RegionTextures::kNone, micro = M2RegionTextures::kNone;
-                    if (m_useRegions && q.textured != 0u) {
-                        slot = m_regions.Slot(m_sheetCpu, q.texsheet & 1u, (q.texx - 2048u) & 2047u, (q.texy - 1024u) & 1023u,
-                                              q.texwidth, q.texheight);
-                        if (q.utex != 0u) micro = m_regions.Slot(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
+                    uint32_t layer = M2RegionTextures::kNone, mlayer = M2RegionTextures::kNone;
+                    // HD texture pack (02/10): its own image through the region path of the shaders (no tiled layer,
+                    // no microtexture: the drawn image has the detail). Without one, exactly the board's texture as before.
+                    uint32_t hdCode = 0;
+                    const uint32_t hd = (m_packOn && m_useRegions && q.textured != 0u) ? TexPackSlot(q, hdCode) : M2RegionTextures::kNone;
+                    if (hd != M2RegionTextures::kNone) {
+                        slot = hd;
+                    } else {
+                        if (m_useRegions && q.textured != 0u) {
+                            slot = m_regions.Slot(m_sheetCpu, q.texsheet & 1u, (q.texx - 2048u) & 2047u, (q.texy - 1024u) & 1023u,
+                                                  q.texwidth, q.texheight);
+                            if (q.utex != 0u) micro = m_regions.Slot(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
+                        }
+                        if (q.textured != 0u) {
+                            layer = m_regions.Layer(m_sheetCpu, q.texsheet & 1u, (q.texx - 2048u) & 2047u, (q.texy - 1024u) & 1023u,
+                                                    q.texwidth, q.texheight);
+                            if (q.utex != 0u) mlayer = m_regions.Layer(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
+                        }
                     }
                     m_primSlot[k] = slot | (micro << 16);
-                    uint32_t layer = M2RegionTextures::kNone, mlayer = M2RegionTextures::kNone;
-                    if (q.textured != 0u) {
-                        layer = m_regions.Layer(m_sheetCpu, q.texsheet & 1u, (q.texx - 2048u) & 2047u, (q.texy - 1024u) & 1023u,
-                                                q.texwidth, q.texheight);
-                        if (q.utex != 0u) mlayer = m_regions.Layer(m_sheetCpu, (1u - q.texsheet) & 1u, q.utexx, q.utexy, 128, 128);
-                    }
                     m_primLayer[k] = layer | (mlayer << 16);
+                    m_rawPrims[k].texpack_format = hdCode;
                 }
 
                 for (std::uint32_t v = 0; v < vc; v++) {
@@ -1703,6 +1805,10 @@ public:
             ubo.uBoardLod = (arcadexr::config::GetInt("m2.boardLod", 1) != 0 &&
                              arcadexr::profiles::GetInt("immersive.boardLod", 0) != 0) ? 1 : 0;
             ubo.uCountOverdraw = (m_useRegions && arcadexr::config::GetInt("m2.regions", 1) != 0) ? 1 : 0;  // = uUseRegions
+            for (uint32_t c = 0; c < 20u; ++c) {   // HD texture packs: each colour format's formula (m2_texpack_loader.h)
+                const arcadexr::texpack::Mode& md = m_packModes[c < 18u ? c : 0u];
+                ubo.uTexPack[c][0] = md.rgb; ubo.uTexPack[c][1] = md.light; ubo.uTexPack[c][2] = md.alpha; ubo.uTexPack[c][3] = 0.0f;
+            }
         }
 
         m_lastEyePixels = renderAreaExtent.width * renderAreaExtent.height;
@@ -4587,6 +4693,7 @@ private:
                     m_regions.InvalidateRows(uint32_t(sheet), rowDirty);
                 }
                 m_regionHasHoles.clear();
+                m_id2Cache.clear();   // HD packs: an ID2 hashes texture RAM
                 if ((++m_partialTexLog % 120u) == 0u)
                     Log::Write(Log::Level::Info, Fmt("TCVR_M2VK partial texture update: %zu of %zu blocks", nDirty, nBlocks));
                 return 2;
@@ -4656,6 +4763,7 @@ private:
         m_texturesUploaded = true;
         m_sheetGeneration = frame.dirty_generation;
         m_regionHasHoles.clear();
+        m_id2Cache.clear();   // HD packs: an ID2 hashes texture RAM
         return 1;
     }
 
@@ -5606,6 +5714,19 @@ private:
     uint64_t m_sheetGeneration = 0;
     uint64_t m_texHash = 0;
     std::vector<uint32_t> m_texShadow[2];   // texture RAM as last uploaded (partial updates)
+    // HD texture packs (02/10/2026): see UpdateTexPack / TexPackSlot.
+    arcadexr::texpack::Pack m_pack;
+    arcadexr::texpack::Modes m_packModes;
+    std::string m_packGame = std::string(1, '\x01');   // the game the pack was looked up for (impossible name: not yet)
+    bool m_packLoaded = false, m_packOn = false;
+    int m_packOutOfRange = -1;
+    std::unordered_map<uint32_t, uint32_t> m_id2Cache;              // (size code, place, sheet) -> ID2 on the current texture RAM
+    std::unordered_map<uint64_t, uint8_t> m_packState;              // 1 decoding, 2 decoded, 4 unreadable
+    std::unordered_map<uint64_t, arcadexr::texpack::Image> m_packImages;   // decoded, kept for the next course load
+    size_t m_packDecodedBytes = 0;
+    uint32_t m_packFailed = 0;
+    struct PackStat { uint32_t textured = 0, id1 = 0, matched = 0, drawn = 0, kept = 0; } m_packStat;   // this frame
+    arcadexr::texpack::Loader m_packLoader;   // last: its thread stops before the maps it fills go away
     bool m_regionsStale = false;
     int m_lastTexReupload = 0;            // a full upload happened: regions to rebuild on the next built frame
     uint32_t m_partialTexLog = 0;

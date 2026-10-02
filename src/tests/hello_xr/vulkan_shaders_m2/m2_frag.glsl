@@ -62,6 +62,8 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uClipNearW;       // (vertex stage) immersive near clip plane
     mat4 uMvpCyc;
     vec4 uCycArc;
+    vec4 uTexPack[20];  // HD texture packs (02/10): per colour format of the pack, x = rgb factor,
+                        // y = light (0 = the polygon's, 1 = the game's luma table at that light, 2 = none), z = alpha factor
 };
 
 struct Prim {
@@ -80,6 +82,8 @@ struct Prim {
     uint rgb;                 // tcvr_m2_prim::rgb: bit 24 = direct colour 0xRRGGBB (Model 1)
     uint window;              // tcvr_m2_prim::window: the board draws the last window first (25/09)
     uint motion_addr, motion_poly, motion_serial;   // tcvr_m2_prim: smooth motion identity (CPU only, keeps the layout)
+    uint texheader0, texheader2;   // tcvr_m2_prim: raw texture header words, HD packs (CPU only, keeps the layout)
+    uint texpack_format;           // tcvr_m2_prim: written by the renderer, 0 = no coloured HD image (see uTexPack)
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Prims   { Prim prims[]; };
@@ -511,6 +515,21 @@ void main_body() {
             if (uTestStage == 9) { oColor = (slot == 0xffffu) ? vec4(1, 0, 1, 1) : vec4(0, 1, 1, 1); return; }   // diag: slot path
         }
         if (uTestStage == 10 && ((fl >> 8) & 1u) != 0u) { oColor = vec4(1, 1, 0, 1); return; }            // diag: microtextured
+        uint hdFmt = (fl >> 16) & 0xffu;
+        if (hdFmt != 0u) {
+            // HD pack image already in colour (02/10/2026, m2_texpack.h): premultiplied RGBA (clean mips), lit by the
+            // formula of the pack's own shader for that format (uTexPack, read from its mode_N.ps by the renderer).
+            vec4 P = uTexPack[min(hdFmt, 19u)];
+            float light = float(vPB.y >> 16) / 256.0;
+            float lit = (P.y > 1.5) ? 1.0
+                      : ((P.y > 0.5) ? float(lumaram8((vPB.y & 0xffffu) + min(uint(light * 128.0), 127u))) / 64.0 : light);
+            rgb = c.rgb / max(c.a, 1.0 / 255.0) * (lit * P.x);
+#ifdef LEAN_CUT
+            float ha = clamp(c.a * P.z, 0.0, 1.0);
+            acov = clamp((ha - 0.5) / max(fwidth(ha), 1.0 / 255.0) + 0.5, 0.0, 1.0);
+            if (acov <= 0.0) discard;
+#endif
+        } else {
 #ifdef LEAN_CUT
         // Cut-out: t premultiplied by opacity (G) over the filtered opacity (B), sharpened to a ~1 px
         // ramp around 0.5 so mips cannot thin sparse foliage away; alpha-to-coverage does the edge.
@@ -535,6 +554,7 @@ void main_body() {
         uint t8 = min(uint(t * 16.0 + 0.5), 0xf0u);
         uint luma = min((lumaram8((vPB.y & 0xffffu) + (t8 >> 1)) * (vPB.y >> 16)) / 256u, 0x3fu);
         rgb = shade_c(vColor & 0x7fffu, luma);
+        }
     }
     oColor = vec4(clamp((rgb - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0), 1.0);
 #ifdef LEAN_CUT
@@ -631,6 +651,24 @@ void main_body() {
             } else {
                 c = region_sample(vSlot & 0xffffu, smp + uint(uSmpBase), tc, size, dx, dy, bias);
             }
+            uint hdFmt = (vPA.w >> 16) & 0xffu;
+            if (hdFmt != 0u) {
+                // HD pack image already in colour (02/10/2026): same formula as the LEAN shader (see uTexPack).
+                vec4 P = uTexPack[min(hdFmt, 19u)];
+                float light = float(p.luma) / 256.0;
+                float lit = (P.y > 1.5) ? 1.0
+                          : ((P.y > 0.5) ? float(lumaram8(p.lumabase + min(uint(light * 128.0), 127u))) / 64.0 : light);
+                oColor = vec4(c.rgb / max(c.a, 1.0 / 255.0) * (lit * P.x), outAlpha);
+#ifndef NO_DISCARD
+                if (translucent) {
+                    float ha = clamp(c.a * P.z, 0.0, 1.0);
+                    float a = clamp((ha - 0.5) / max(fwidth(ha), 1.0 / 255.0) + 0.5, 0.0, 1.0);
+                    if (a <= 0.0) discard;
+                    if (uAlphaCoverage == 0 && a < 0.5) discard;
+                    oColor.a = (uAlphaCoverage != 0) ? a : 1.0;
+                }
+#endif
+            } else {
             vec2 ts = translucent ? vec2(c.g * 15.0, c.b) : vec2(c.r * 15.0, 1.0);
             uint ms = vSlot >> 16;
             if (!translucent && p.utex != 0u && ms != 0xffffu) {
@@ -657,6 +695,7 @@ void main_body() {
                 oColor.a = (uAlphaCoverage != 0) ? a : 1.0;
             }
 #endif
+            }
         } else if (uFilterMode == 5 && mainView) {
             float lx = dot(dx, dx), ly = dot(dy, dy);
             vec2 maj = (lx >= ly) ? dx : dy;

@@ -61,6 +61,7 @@ layout(set = 0, binding = 0, std140) uniform M2Uniforms {
     float uClipNearW;       // immersive: a near clip plane at this distance (metres), 0 = none -- see main()
     mat4 uMvpCyc;       // near comfort: this eye's projection seen from the CYCLOPEAN eye (between the two)
     vec4 uCycArc;       // near comfort: the cyclopean eye in the board camera's space
+    vec4 uTexPack[20];  // HD texture packs: per colour format, x = rgb factor, y = light (0 polygon, 1 game's luma table, 2 none), z = alpha factor
 };
 
 struct Prim {
@@ -79,6 +80,8 @@ struct Prim {
     uint rgb;                 // tcvr_m2_prim::rgb: bit 24 = direct colour 0xRRGGBB (Model 1)
     uint window;              // tcvr_m2_prim::window: the board draws the last window first (25/09)
     uint motion_addr, motion_poly, motion_serial;   // tcvr_m2_prim: smooth motion identity (CPU only, keeps the layout)
+    uint texheader0, texheader2;   // tcvr_m2_prim: raw texture header words, HD packs (CPU only, keeps the layout)
+    uint texpack_format;           // tcvr_m2_prim: written by the renderer, 0 = no coloured HD image (see uTexPack)
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Prims { Prim prims[]; };
@@ -133,7 +136,8 @@ void main() {
         uint flags = (q.texsheet & 1u) | ((q.texwrapx & 1u) << 1) | ((q.texwrapy & 1u) << 2) |
                      ((q.texmirrorx & 1u) << 3) | ((q.texmirrory & 1u) << 4) | ((q.translucent != 0u ? 1u : 0u) << 5) |
                      ((q.textured != 0u ? 1u : 0u) << 6) | ((q.checker != 0u ? 1u : 0u) << 7) | ((q.utex != 0u ? 1u : 0u) << 8) |
-                     ((q.utexminlod & 15u) << 9);
+                     ((q.utexminlod & 15u) << 9) |
+                     ((q.texpack_format & 0xffu) << 16);   // HD pack image in colour: its format (02/10)
         vPA = uvec4(q.texx, q.texy, (q.texwidth & 0xffffu) | (q.texheight << 16), flags);
         vPB = uvec4((q.utexx & 0xffffu) | (q.utexy << 16), (q.lumabase & 0xffffu) | (q.luma << 16), q.colorbase, uint(q.texlod));
         vPC = ivec4(q.clip_l, q.clip_t, q.clip_r, q.clip_b);

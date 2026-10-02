@@ -112,6 +112,7 @@ public:
         for (auto& e : m_slots) DestroyEntry(e);
         m_slots.clear();
         m_map.clear();
+        m_hdMap.clear(); m_hdBytes = 0;
         m_layerMap.clear();
         m_layerCount = 0;
         m_pendingLayers.clear();
@@ -162,6 +163,37 @@ public:
         m_stagingUsed += (bytes + 255) & ~size_t(255);
         return slot;
     }
+
+    // ---- HD texture packs (02/10/2026, m2_texpack.h): a replacement image, already in the encoding above (grey
+    // format) or premultiplied colour, gets its own mipmapped image in the SAME descriptor array. Kept in m_hdMap,
+    // never in m_map: Validate / InvalidateRows / ProcessRefills decode m_map keys as sheet regions and would refill
+    // it from the board's texels (and a key read as a region can be 16383 texels wide). kNone while the staging budget
+    // of this frame is spent: the next frame takes it.
+    uint32_t HdSlot(uint64_t key) const {
+        const auto it = m_hdMap.find(key);
+        return it == m_hdMap.end() ? kNone : it->second;
+    }
+    uint32_t SlotPixels(uint64_t key, uint32_t w, uint32_t h, const uint8_t* rgba) {
+        const auto it = m_hdMap.find(key);
+        if (it != m_hdMap.end()) return it->second;
+        if (w < 1 || h < 1 || w > 4096 || h > 4096 || m_slots.size() >= kMaxSlots) return kNone;
+        const size_t bytes = size_t(w) * h * 4;
+        if (bytes > kHalfBytes || m_stagingUsed + bytes > kHalfBytes) return kNone;
+        std::memcpy(m_stagingPtr + Base() + m_stagingUsed, rgba, bytes);
+        uint32_t levels = 1;
+        while ((std::max(w, h) >> levels) > 0) ++levels;
+        Entry e = CreateImage(w, h, levels);
+        const uint32_t slot = uint32_t(m_slots.size());
+        m_slots.push_back(e);
+        m_hdMap.emplace(key, slot);
+        m_hdBytes += bytes + bytes / 3;
+        m_pending.push_back({slot, Base() + m_stagingUsed});
+        m_dirtySlots.push_back(slot);
+        m_stagingUsed += (bytes + 255) & ~size_t(255);
+        return slot;
+    }
+    uint32_t HdCount() const { return uint32_t(m_hdMap.size()); }
+    size_t HdBytes() const { return m_hdBytes; }
 
     // ---- Texture ARRAY path (opus55, second step). The descriptor-indexed images above cost ~3 ms
     // per frame for the texture INSTRUCTION itself (measured on a frozen scene: a constant-coordinate
@@ -656,6 +688,8 @@ private:
     bool m_dummyPending = false;
     std::vector<Entry> m_slots;
     std::unordered_map<uint64_t, uint32_t> m_map;
+    std::unordered_map<uint64_t, uint32_t> m_hdMap;   // HD pack images: key -> slot (outside m_map, see SlotPixels)
+    size_t m_hdBytes = 0;                             // their GPU size, mips included
     std::vector<Pending> m_pending;
     std::vector<uint32_t> m_dirtySlots;
     std::set<uint64_t> m_refillSlots, m_refillLayers;

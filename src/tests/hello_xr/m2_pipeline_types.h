@@ -55,7 +55,10 @@ struct M2UniformBufferObject {
     float uClipNearW;        // 4 bytes, offset 332: immersive near clip plane, metres (0 = none), see m2_vert.glsl
     float uMvpCyc[16];       // 64 bytes, offset 336: near comfort, this eye's projection from the cyclopean eye
     float uCycArc[4];        // 16 bytes, offset 400: near comfort, the cyclopean eye in the board camera's space
+    float uTexPack[20][4];   // 320 bytes, offset 416: HD texture packs, per colour format of the pack (02/10/2026):
+                             // x = rgb factor, y = light (0 polygon, 1 game's luma table, 2 none), z = alpha factor
 };
+static_assert(sizeof(M2UniformBufferObject) == 736, "M2UniformBufferObject must match the std140 block of m2_*.glsl");
 
 struct VoidPushConstants {
     float uInvMvp[16];
